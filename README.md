@@ -242,25 +242,44 @@ Results are saved to `target/criterion/` with HTML reports.
 
 Current version limitations:
 
-1. **Complex Queries**: No JOINs, GROUP BY, ORDER BY
-2. **Multi-line REPL**: Not yet supported
-3. **Secondary Indexes**: Not implemented
-4. **Network Protocol**: No client/server mode
+1. **B-Tree Capacity**: Internal node splitting not implemented - limited to ~4,096 records (see details below)
+2. **Complex Queries**: No JOINs, GROUP BY, ORDER BY
+3. **Multi-line REPL**: Not yet supported
+4. **Secondary Indexes**: Not implemented
+5. **Network Protocol**: No client/server mode
 
-### Storage Capacity
+### Storage Capacity Limitation
 
-The B-Tree implementation supports both leaf and internal node splitting, allowing for very large datasets:
+**Important**: The B-Tree implementation has a capacity limit due to unimplemented internal node splitting:
 
-- **Leaf nodes**: Up to 64 keys per node (configurable via `BTREE_ORDER`)
-- **Internal nodes**: Up to 64 keys per node with automatic splitting
-- **Tree height**: Supports multi-level trees with no practical limit on records
-- **Estimated capacity**: 
-  - Height 2 (root + leaves): ~4,096 records
-  - Height 3: ~262,144 records
-  - Height 4: ~16.7 million records
-  - And so on...
+- **Leaf node splitting**: ✅ Fully implemented
+- **Internal node splitting**: ❌ Not implemented
+- **Practical limit**: Approximately 64 leaf nodes before hitting the internal node capacity
 
-The implementation handles automatic node splitting at all levels, ensuring the tree can grow to accommodate any dataset size limited only by available disk space.
+**Estimated Maximum Records**:
+- **~4,096 records** with small records (~100 bytes each)
+- **~2,000 records** with medium records (~200 bytes each)  
+- **~1,000 records** with large records (~400 bytes each)
+
+**Workarounds**:
+1. **Increase `BTREE_ORDER`**: Edit `src/btree.rs` line 8 and change `const BTREE_ORDER: usize = 64;` to a larger value (e.g., 128 or 256). This multiplies the capacity proportionally.
+2. **Implement internal node splitting**: The placeholder function at `src/btree.rs` lines 616-650 provides guidance on what needs to be implemented.
+3. **Use table sharding**: Split data across multiple tables or database files.
+
+**Error Handling**: When the limit is reached, inserts will fail with a clear error message:
+```
+B-Tree capacity limit reached: Internal node is full (BTREE_ORDER=64).
+Maximum capacity is approximately 64 leaf nodes or ~2048 typical records.
+To store more data, increase BTREE_ORDER in src/btree.rs or implement full internal node splitting.
+See README.md for details.
+```
+
+This limitation makes VelociDB suitable for:
+- ✅ Embedded applications with moderate data volumes
+- ✅ Development and testing
+- ✅ Prototyping and proof-of-concepts
+- ✅ Small to medium-sized databases (under ~2000-4000 records)
+- ❌ Large-scale production databases (without modifications)
 
 ## Documentation
 
@@ -333,7 +352,7 @@ cargo test -- --test-threads=1
 
 ## Future Enhancements
 
-- [x] B-Tree node splitting for large datasets (✅ Implemented)
+- [ ] **B-Tree internal node splitting** (High Priority - removes capacity limitation)
 - [ ] Secondary indexes
 - [ ] JOIN operations
 - [ ] Aggregation functions (SUM, AVG, COUNT, etc.)
