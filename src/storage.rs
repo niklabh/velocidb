@@ -276,7 +276,23 @@ impl Database {
                 });
 
                 // Create B-Tree for this table
-                let btree = crate::btree::BTree::from_root(root_page, Arc::clone(&self.pager));
+                let btree_root = if root_page == 0 {
+                    // Root page is invalid, create a new properly initialized B-Tree
+                    let mut pager = self.pager.write();
+                    let new_root_page = pager.allocate_page()?;
+
+                    // Initialize as B-Tree leaf node
+                    let mut page = crate::storage::Page::new();
+                    let header = crate::btree::NodeHeader::new_leaf();
+                    header.serialize(page.data_mut());
+                    pager.write_page(new_root_page, &page)?;
+
+                    new_root_page
+                } else {
+                    root_page
+                };
+
+                let btree = crate::btree::BTree::from_root(btree_root, Arc::clone(&self.pager));
                 self.btrees.write().insert(table_name.clone(), Arc::new(RwLock::new(btree)));
             }
 
@@ -341,9 +357,18 @@ impl Database {
 
                     // Root page - get from B-Tree
                     let root_page = if let Some(btree_arc) = self.btrees.read().get(&table_name) {
-                        btree_arc.read().root_page()
+                        let rp = btree_arc.read().root_page();
+                        if rp == 0 {
+                            // This shouldn't happen for properly initialized B-Trees
+                            eprintln!("Warning: Table '{}' has invalid root page 0", table_name);
+                            0u64
+                        } else {
+                            rp
+                        }
                     } else {
-                        0u64 // Fallback
+                        // This shouldn't happen - B-Tree should exist for created tables
+                        eprintln!("Warning: No B-Tree found for table '{}'", table_name);
+                        0u64
                     };
                     buffer.extend_from_slice(&root_page.to_le_bytes());
                 }
