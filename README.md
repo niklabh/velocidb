@@ -140,7 +140,7 @@ velocidb/
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/velocidb.git
+git clone https://github.com/niklabh/velocidb.git
 cd velocidb
 
 # Debug build
@@ -344,8 +344,8 @@ MIT License
 
 ## Contact & Support
 
-- Issues: [GitHub Issues](https://github.com/yourusername/velocidb/issues)
-- Discussions: [GitHub Discussions](https://github.com/yourusername/velocidb/discussions)
+- Issues: [GitHub Issues](https://github.com/niklabh/velocidb/issues)
+- Discussions: [GitHub Discussions](https://github.com/niklabh/velocidb/discussions)
 
 ---
 
