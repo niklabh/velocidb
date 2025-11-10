@@ -355,9 +355,14 @@ impl BTree {
         if end_offset + required_space > PAGE_SIZE {
             // Node is full, split it
             let (sibling_page_id, split_key) = self.split_leaf_node(pager, page_id)?;
-            let _new_root = self.insert_into_parent(pager, page_id, sibling_page_id, split_key)?;
+            let new_root = self.insert_into_parent(pager, page_id, sibling_page_id, split_key)?;
 
-            // Now insert into the appropriate leaf (could be original or sibling)
+            // If a new root was created, return it immediately
+            if let Some(root_page_id) = new_root {
+                return Ok(Some(root_page_id));
+            }
+
+            // Otherwise, insert into the appropriate leaf (could be original or sibling)
             if key < split_key {
                 return self.insert_into_leaf(pager, page_id, key, data);
             } else {
