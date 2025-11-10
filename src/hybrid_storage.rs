@@ -133,7 +133,10 @@ impl ColumnStorage {
                     self.null_bitmap[index] = false;
                 }
             }
-            _ => return Err(VelociError::TypeMismatch("Unsupported type".to_string())),
+            _ => return Err(VelociError::TypeMismatch {
+                expected: "Integer, Real, or Text".to_string(),
+                actual: format!("{:?}", value),
+            }),
         }
 
         Ok(())
@@ -301,7 +304,10 @@ impl HybridTable {
                 
                 ColumnStorage::from_text(column_name.to_string(), values, nulls)
             }
-            _ => return Err(VelociError::TypeMismatch("Unsupported column type".to_string())),
+            _ => return Err(VelociError::TypeMismatch {
+                expected: "Integer, Real, or Text".to_string(),
+                actual: format!("{:?}", first_value),
+            }),
         };
 
         // Cache the projection

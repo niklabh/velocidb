@@ -136,7 +136,7 @@ impl CacheOptimizedNode {
 
     /// Binary search using SIMD when available
     /// Optimized for cache-line sequential access
-    pub fn search_key(&self, key: i64) -> Result<usize, usize> {
+    pub fn search_key(&self, key: i64) -> std::result::Result<usize, usize> {
         let num_keys = self.header.num_keys() as usize;
         
         // Use SIMD-accelerated search for larger ranges
@@ -154,7 +154,7 @@ impl CacheOptimizedNode {
     /// SIMD-accelerated key search
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    unsafe fn search_key_simd(&self, key: i64) -> Result<usize, usize> {
+    unsafe fn search_key_simd(&self, key: i64) -> std::result::Result<usize, usize> {
         use std::arch::x86_64::*;
 
         let num_keys = self.header.num_keys() as usize;

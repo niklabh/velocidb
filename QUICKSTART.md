@@ -7,7 +7,7 @@ This guide shows you how to use VelociDB's modern architecture features includin
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/velocidb.git
+git clone https://github.com/niklabh/velocidb.git
 cd velocidb
 cargo build --release --all-features
 ```

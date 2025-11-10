@@ -15,7 +15,7 @@ Be respectful, constructive, and professional in all interactions.
 
 ### Clone the Repository
 ```bash
-git clone https://github.com/yourusername/velocidb.git
+git clone https://github.com/niklabh/velocidb.git
 cd velocidb
 ```
 

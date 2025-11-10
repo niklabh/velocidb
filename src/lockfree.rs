@@ -259,7 +259,7 @@ impl LockFreeCounter {
     }
 
     /// Compare and swap
-    pub fn compare_and_swap(&self, current: u64, new: u64) -> Result<u64, u64> {
+    pub fn compare_and_swap(&self, current: u64, new: u64) -> std::result::Result<u64, u64> {
         self.value
             .compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst)
     }
@@ -284,7 +284,7 @@ impl<T> LockFreeRingBuffer<T> {
     }
 
     /// Try to push an item (fails if buffer is full)
-    pub fn try_push(&self, item: T) -> Result<(), T> {
+    pub fn try_push(&self, item: T) -> std::result::Result<(), T> {
         self.buffer.push(item)
     }
 

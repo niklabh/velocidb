@@ -1,6 +1,7 @@
 // Type definitions for VelociDB
 
 use std::fmt;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub type PageId = u64;
@@ -10,6 +11,9 @@ pub type TransactionId = u64;
 pub enum VelociError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    
+    #[error("IO error: {0}")]
+    IoError(String),
     
     #[error("Database corruption: {0}")]
     Corruption(String),
@@ -34,15 +38,19 @@ pub enum VelociError {
     
     #[error("Storage error: {0}")]
     StorageError(String),
+    
+    #[error("Not implemented: {0}")]
+    NotImplemented(String),
 }
 
 pub type Result<T> = std::result::Result<T, VelociError>;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Integer(i64),
     Float(f64),
+    Real(f64), // Alias for Float
     Text(String),
     Blob(Vec<u8>),
 }
@@ -71,11 +79,23 @@ impl Value {
     pub fn as_float(&self) -> Result<f64> {
         match self {
             Value::Float(f) => Ok(*f),
+            Value::Real(f) => Ok(*f),
             Value::Integer(i) => Ok(*i as f64),
             _ => Err(VelociError::TypeMismatch {
                 expected: "Float".to_string(),
                 actual: format!("{:?}", self),
             }),
+        }
+    }
+    
+    pub fn size_bytes(&self) -> usize {
+        match self {
+            Value::Null => 1,
+            Value::Integer(_) => 9, // 1 byte type + 8 bytes data
+            Value::Float(_) => 9,   // 1 byte type + 8 bytes data
+            Value::Real(_) => 9,    // 1 byte type + 8 bytes data
+            Value::Text(s) => 1 + 4 + s.len(), // 1 byte type + 4 bytes length + data
+            Value::Blob(b) => 1 + 4 + b.len(), // 1 byte type + 4 bytes length + data
         }
     }
 }
@@ -86,6 +106,7 @@ impl fmt::Display for Value {
             Value::Null => write!(f, "NULL"),
             Value::Integer(i) => write!(f, "{}", i),
             Value::Float(fl) => write!(f, "{}", fl),
+            Value::Real(fl) => write!(f, "{}", fl),
             Value::Text(s) => write!(f, "{}", s),
             Value::Blob(b) => write!(f, "<blob {} bytes>", b.len()),
         }

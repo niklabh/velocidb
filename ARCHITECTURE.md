@@ -484,5 +484,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on contributing to VelociD
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) file for details.
+Apache 2.0 License - See [LICENSE](LICENSE) file for details.
 

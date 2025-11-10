@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::RwLock as TokioRwLock;
 
 /// Asynchronous Virtual File System trait
 /// Abstracts different I/O backends (standard async, io_uring, cloud storage)
@@ -37,7 +38,7 @@ pub trait AsyncVfs: Send + Sync {
 /// Standard Tokio-based async file system
 pub struct TokioVfs {
     file_path: PathBuf,
-    file: Arc<RwLock<Option<File>>>,
+    file: Arc<TokioRwLock<Option<File>>>,
     num_pages: Arc<RwLock<u64>>,
 }
 
@@ -63,16 +64,16 @@ impl TokioVfs {
 
         Ok(Self {
             file_path: path,
-            file: Arc::new(RwLock::new(Some(file))),
+            file: Arc::new(TokioRwLock::new(Some(file))),
             num_pages: Arc::new(RwLock::new(num_pages)),
         })
     }
 
     /// Helper to get file handle
     async fn get_file(&self) -> Result<File> {
-        let file_opt = self.file.read().clone();
+        let has_file = self.file.read().await.is_some();
         
-        if file_opt.is_none() {
+        if !has_file {
             // Reopen file if needed
             let file = tokio::fs::OpenOptions::new()
                 .read(true)
@@ -80,11 +81,13 @@ impl TokioVfs {
                 .open(&self.file_path)
                 .await?;
             
-            *self.file.write() = Some(file.try_clone().await?);
-            Ok(file)
+            let file_clone = file.try_clone().await?;
+            *self.file.write().await = Some(file);
+            Ok(file_clone)
         } else {
             // Clone the file descriptor
-            file_opt.unwrap().try_clone().await.map_err(|e| e.into())
+            let guard = self.file.read().await;
+            guard.as_ref().unwrap().try_clone().await.map_err(|e| e.into())
         }
     }
 }
@@ -128,14 +131,15 @@ impl AsyncVfs for TokioVfs {
     }
 
     async fn allocate_page(&self) -> Result<PageId> {
-        let mut num_pages = self.num_pages.write();
-        let page_id = *num_pages;
-        *num_pages += 1;
+        let page_id = {
+            let mut num_pages = self.num_pages.write();
+            let page_id = *num_pages;
+            *num_pages += 1;
+            page_id
+        }; // Lock is dropped here before async operation
 
         // Initialize the page
         let page = Page::new();
-        drop(num_pages); // Release lock before async operation
-        
         self.write_page(page_id, &page).await?;
 
         Ok(page_id)

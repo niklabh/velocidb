@@ -16,7 +16,7 @@ pub const PAGE_SIZE: usize = 4096;
 pub const CACHE_SIZE: usize = 1024; // Number of pages to cache
 
 #[repr(C, align(4096))]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Page {
     data: [u8; PAGE_SIZE],
 }

@@ -635,7 +635,7 @@ impl BTree {
                     buffer.push(1);
                     buffer.extend_from_slice(&i.to_le_bytes());
                 }
-                Value::Float(f) => {
+                Value::Float(f) | Value::Real(f) => {
                     buffer.push(2);
                     buffer.extend_from_slice(&f.to_le_bytes());
                 }

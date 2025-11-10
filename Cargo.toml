@@ -47,7 +47,7 @@ automerge = { version = "0.5", optional = true }
 object_store = { version = "0.9", optional = true }
 
 # Persistent memory
-pmem = { version = "0.3", optional = true }
+pmem = { version = "0.1.0", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

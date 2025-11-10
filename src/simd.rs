@@ -2,7 +2,11 @@
 // Leverages CPU vector units (AVX, SSE) for data parallelism
 
 use crate::types::{Result, Value, VelociError};
+
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 
 /// Vectorized batch size - process this many elements at once
 pub const VECTOR_BATCH_SIZE: usize = 256;
@@ -70,6 +74,14 @@ impl VectorizedFilter {
         for (i, &value) in values.iter().enumerate() {
             result[i] = value > threshold;
         }
+    }
+    
+    /// Generic fallback for non-x86_64 architectures
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn filter_integers_greater_than(values: &[i64], threshold: i64) -> Vec<bool> {
+        let mut result = vec![false; values.len()];
+        Self::filter_integers_greater_than_scalar(values, threshold, &mut result);
+        result
     }
 
     /// Filter for equality comparison
@@ -291,6 +303,7 @@ pub struct VectorBatch {
 }
 
 /// A column of vectorized data
+#[derive(Debug, Clone)]
 pub enum VectorColumn {
     Integer(Vec<i64>),
     Real(Vec<f64>),
