@@ -242,11 +242,25 @@ Results are saved to `target/criterion/` with HTML reports.
 
 Current version limitations:
 
-1. **B-Tree Node Splitting**: Not implemented (limited to ~100 rows per table)
-2. **Complex Queries**: No JOINs, GROUP BY, ORDER BY
-3. **Multi-line REPL**: Not yet supported
-4. **Secondary Indexes**: Not implemented
-5. **Network Protocol**: No client/server mode
+1. **Complex Queries**: No JOINs, GROUP BY, ORDER BY
+2. **Multi-line REPL**: Not yet supported
+3. **Secondary Indexes**: Not implemented
+4. **Network Protocol**: No client/server mode
+
+### Storage Capacity
+
+The B-Tree implementation supports both leaf and internal node splitting, allowing for very large datasets:
+
+- **Leaf nodes**: Up to 64 keys per node (configurable via `BTREE_ORDER`)
+- **Internal nodes**: Up to 64 keys per node with automatic splitting
+- **Tree height**: Supports multi-level trees with no practical limit on records
+- **Estimated capacity**: 
+  - Height 2 (root + leaves): ~4,096 records
+  - Height 3: ~262,144 records
+  - Height 4: ~16.7 million records
+  - And so on...
+
+The implementation handles automatic node splitting at all levels, ensuring the tree can grow to accommodate any dataset size limited only by available disk space.
 
 ## Documentation
 
@@ -319,7 +333,7 @@ cargo test -- --test-threads=1
 
 ## Future Enhancements
 
-- [ ] B-Tree node splitting for large datasets
+- [x] B-Tree node splitting for large datasets (✅ Implemented)
 - [ ] Secondary indexes
 - [ ] JOIN operations
 - [ ] Aggregation functions (SUM, AVG, COUNT, etc.)

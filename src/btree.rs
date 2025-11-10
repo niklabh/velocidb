@@ -502,18 +502,19 @@ impl BTree {
             // Left page is root, create new root
             Some(self.create_new_root(pager, left_page, right_page, split_key)?)
         } else {
-            // Insert into existing parent
-            self.insert_into_internal(pager, left_header.parent as u64, left_page, right_page, split_key)?;
-            None
+            // Insert into existing parent (may cause recursive splits and new root)
+            let result = self.insert_into_internal(pager, left_header.parent as u64, left_page, right_page, split_key)?;
+            
+            // Update right page parent pointer if no new root was created
+            if result.is_none() {
+                let right_page_data = pager.read_page(right_page)?;
+                let mut right_header = NodeHeader::deserialize(right_page_data.read().data())?;
+                right_header.parent = left_header.parent;
+                right_header.serialize(right_page_data.write().data_mut());
+            }
+            
+            result
         };
-
-        // Update parent pointers (only if not creating new root)
-        if new_root.is_none() {
-            let right_page_data = pager.read_page(right_page)?;
-            let mut right_header = NodeHeader::deserialize(right_page_data.read().data())?;
-            right_header.parent = left_header.parent;
-            right_header.serialize(right_page_data.write().data_mut());
-        }
 
         Ok(new_root)
     }
@@ -561,7 +562,7 @@ impl BTree {
         Ok(root_page_id)
     }
 
-    fn insert_into_internal(&self, pager: &mut Pager, page_id: PageId, left_page: PageId, right_page: PageId, key: i64) -> Result<()> {
+    fn insert_into_internal(&self, pager: &mut Pager, page_id: PageId, left_page: PageId, right_page: PageId, key: i64) -> Result<Option<PageId>> {
         let page_arc = pager.read_page(page_id)?;
         let mut page = page_arc.read().clone();
         let mut header = NodeHeader::deserialize(page.data())?;
@@ -611,13 +612,144 @@ impl BTree {
 
         pager.write_page(page_id, &page)?;
 
-        Ok(())
+        Ok(None)
     }
 
-    fn split_internal_node(&self, _pager: &mut Pager, _page_id: PageId, _left_page: PageId, _right_page: PageId, _key: i64) -> Result<()> {
-        // For now, just create a simple split - this is complex and would need more implementation
-        // This is a placeholder that needs full implementation
-        Err(VelociError::Corruption("Internal node splitting not fully implemented".to_string()))
+    fn split_internal_node(&self, pager: &mut Pager, page_id: PageId, left_page: PageId, right_page: PageId, key: i64) -> Result<Option<PageId>> {
+        // Read the current internal node
+        let page_arc = pager.read_page(page_id)?;
+        let page = page_arc.read().clone();
+        let header = NodeHeader::deserialize(page.data())?;
+        
+        // Create new sibling internal node
+        let sibling_page_id = pager.allocate_page()?;
+        let mut sibling_page = Page::new();
+        
+        // Calculate split point (middle of keys)
+        let split_index = (header.num_keys as usize + 1) / 2;  // +1 because we're adding a key
+        
+        // Collect all keys and child pointers (including the one we're trying to insert)
+        let mut keys = Vec::new();
+        let mut children = Vec::new();
+        
+        // Read existing data from the node
+        let mut offset = NodeHeader::SIZE;
+        
+        // First child pointer
+        children.push(u64::from_le_bytes(
+            page.data()[offset..offset + 8]
+                .try_into()
+                .map_err(|_| VelociError::Corruption("Invalid child pointer".to_string()))?,
+        ) as PageId);
+        offset += 8;
+        
+        // Read all existing keys and children
+        let mut inserted = false;
+        for i in 0..header.num_keys {
+            let stored_key = i64::from_le_bytes(
+                page.data()[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+            );
+            
+            let child = u64::from_le_bytes(
+                page.data()[offset + 8..offset + 16]
+                    .try_into()
+                    .map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
+            ) as PageId;
+            
+            // Insert new key/child at the correct position
+            if !inserted && key < stored_key {
+                keys.push(key);
+                children.push(right_page);
+                inserted = true;
+            }
+            
+            keys.push(stored_key);
+            children.push(child);
+            offset += 16;
+        }
+        
+        // If not inserted yet, append at the end
+        if !inserted {
+            keys.push(key);
+            children.push(right_page);
+        }
+        
+        // Split the keys and children
+        let median_key = keys[split_index];
+        let left_keys: Vec<_> = keys[..split_index].to_vec();
+        let right_keys: Vec<_> = keys[split_index + 1..].to_vec();
+        let left_children: Vec<_> = children[..=split_index].to_vec();
+        let right_children: Vec<_> = children[split_index + 1..].to_vec();
+        
+        // Write left node (reuse existing page)
+        let mut left_page_data = Page::new();
+        let mut left_header = NodeHeader::new(NodeType::Internal);
+        left_header.num_keys = left_keys.len() as u16;
+        left_header.parent = header.parent;
+        left_header.serialize(left_page_data.data_mut());
+        
+        let mut left_offset = NodeHeader::SIZE;
+        left_page_data.data_mut()[left_offset..left_offset + 8]
+            .copy_from_slice(&(left_children[0] as u64).to_le_bytes());
+        left_offset += 8;
+        
+        for (i, &k) in left_keys.iter().enumerate() {
+            left_page_data.data_mut()[left_offset..left_offset + 8]
+                .copy_from_slice(&k.to_le_bytes());
+            left_page_data.data_mut()[left_offset + 8..left_offset + 16]
+                .copy_from_slice(&(left_children[i + 1] as u64).to_le_bytes());
+            left_offset += 16;
+        }
+        
+        pager.write_page(page_id, &left_page_data)?;
+        
+        // Write right node (sibling)
+        let mut right_header = NodeHeader::new(NodeType::Internal);
+        right_header.num_keys = right_keys.len() as u16;
+        right_header.parent = header.parent;
+        right_header.serialize(sibling_page.data_mut());
+        
+        let mut right_offset = NodeHeader::SIZE;
+        sibling_page.data_mut()[right_offset..right_offset + 8]
+            .copy_from_slice(&(right_children[0] as u64).to_le_bytes());
+        right_offset += 8;
+        
+        for (i, &k) in right_keys.iter().enumerate() {
+            sibling_page.data_mut()[right_offset..right_offset + 8]
+                .copy_from_slice(&k.to_le_bytes());
+            sibling_page.data_mut()[right_offset + 8..right_offset + 16]
+                .copy_from_slice(&(right_children[i + 1] as u64).to_le_bytes());
+            right_offset += 16;
+        }
+        
+        pager.write_page(sibling_page_id, &sibling_page)?;
+        
+        // Update parent pointers for all children of both nodes
+        for &child in left_children.iter() {
+            let child_page_arc = pager.read_page(child)?;
+            let mut child_header = NodeHeader::deserialize(child_page_arc.read().data())?;
+            child_header.parent = page_id as u32;
+            child_header.serialize(child_page_arc.write().data_mut());
+        }
+        
+        for &child in right_children.iter() {
+            let child_page_arc = pager.read_page(child)?;
+            let mut child_header = NodeHeader::deserialize(child_page_arc.read().data())?;
+            child_header.parent = sibling_page_id as u32;
+            child_header.serialize(child_page_arc.write().data_mut());
+        }
+        
+        // Insert median key into parent (or create new root if at root)
+        if header.parent == 0 {
+            // This node is the root, create a new root
+            let new_root_id = self.create_new_root(pager, page_id, sibling_page_id, median_key)?;
+            Ok(Some(new_root_id))
+        } else {
+            // Recursively insert into parent (may create new root up the chain)
+            self.insert_into_internal(pager, header.parent as u64, page_id, sibling_page_id, median_key)
+        }
     }
 
     fn serialize_row(&self, row: &Row) -> Result<Vec<u8>> {
