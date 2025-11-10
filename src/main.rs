@@ -10,7 +10,7 @@ mod types;
 
 use anyhow::Result;
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use tracing::{info, error, Level};
 use tracing_subscriber;
 
@@ -157,21 +157,11 @@ fn main() -> Result<()> {
     let db = Database::open(&db_filename)?;
     info!("Database opened: {}", db_filename);
 
-    // Check if stdin is available (for non-interactive environments)
-    let mut test_input = String::new();
-    match io::stdin().read_line(&mut test_input) {
-        Ok(0) | Err(_) => {
-            // EOF or error - likely non-interactive environment
-            info!("Non-interactive environment detected, exiting cleanly");
-            return Ok(());
-        }
-        Ok(_) => {
-            // Input available - process the first line we just read
-            let trimmed_input = test_input.trim();
-            if !trimmed_input.is_empty() {
-                process_command(&db, trimmed_input)?;
-            }
-        }
+    // Check if stdin is a TTY (for non-interactive environments)
+    if !io::stdin().is_terminal() {
+        // Non-interactive environment - exit cleanly
+        info!("Non-interactive environment detected, exiting cleanly");
+        return Ok(());
     }
 
     // REPL loop

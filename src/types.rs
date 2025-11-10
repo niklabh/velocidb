@@ -31,6 +31,9 @@ pub enum VelociError {
     
     #[error("Type mismatch: expected {expected}, got {actual}")]
     TypeMismatch { expected: String, actual: String },
+    
+    #[error("Storage error: {0}")]
+    StorageError(String),
 }
 
 pub type Result<T> = std::result::Result<T, VelociError>;

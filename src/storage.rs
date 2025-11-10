@@ -408,6 +408,13 @@ impl Database {
 
         let mut page = crate::storage::Page::new();
         let copy_len = std::cmp::min(buffer.len(), crate::storage::PAGE_SIZE);
+        if buffer.len() > crate::storage::PAGE_SIZE {
+            return Err(VelociError::StorageError(format!(
+                "Schema size ({} bytes) exceeds page size ({} bytes). Consider multi-page schema storage.",
+                buffer.len(),
+                crate::storage::PAGE_SIZE
+            )));
+        }
         page.data_mut()[0..copy_len].copy_from_slice(&buffer[0..copy_len]);
         pager.write_page(1, &page)?;
 

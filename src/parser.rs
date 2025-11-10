@@ -447,7 +447,7 @@ impl Parser {
         let s = s.trim();
 
         // Quoted identifier
-        if (s.starts_with('"') || s.starts_with('`') || s.starts_with('[')) {
+        if s.starts_with('"') || s.starts_with('`') || s.starts_with('[') {
             let quote_char = s.chars().next().unwrap();
             let end_quote = match quote_char {
                 '"' => '"',
@@ -456,21 +456,24 @@ impl Parser {
                 _ => return Err(VelociError::ParseError("Invalid quote character".to_string())),
             };
 
-            let mut chars = s.chars();
-            chars.next(); // skip opening quote
-
             let mut identifier = String::new();
             let mut escaped = false;
 
-            for ch in chars {
+            // Iterate over chars with their byte positions
+            let mut chars_iter = s.char_indices();
+            
+            // Skip the opening quote
+            chars_iter.next();
+
+            for (pos, ch) in chars_iter {
                 if escaped {
                     identifier.push(ch);
                     escaped = false;
                 } else if ch == '\\' {
                     escaped = true;
                 } else if ch == end_quote {
-                    // Find the remainder after the closing quote
-                    let rest_start = s.find(end_quote).unwrap() + 1;
+                    // Calculate the remainder starting after the closing quote
+                    let rest_start = pos + ch.len_utf8();
                     return Ok((identifier, &s[rest_start..]));
                 } else {
                     identifier.push(ch);
