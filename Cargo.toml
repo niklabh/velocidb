@@ -1,0 +1,46 @@
+[package]
+name = "velocidb"
+version = "0.1.0"
+edition = "2021"
+authors = ["VelociDB Contributors"]
+description = "A high-performance SQLite reimplementation in Rust optimized for modern hardware"
+license = "MIT"
+
+[dependencies]
+parking_lot = "0.12"
+crossbeam-epoch = "0.9"
+memmap2 = "0.9"
+rand = "0.8"
+aho-corasick = "1.1"
+rayon = "1.8"
+libc = "0.2"
+thiserror = "1.0"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+lru = "0.12"
+dashmap = "5.5"
+num_cpus = "1.16"
+regex = "1.10"
+lazy_static = "1.4"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.8"
+proptest = "1.4"
+quickcheck = "1.0"
+
+[[bench]]
+name = "benchmarks"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
