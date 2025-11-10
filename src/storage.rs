@@ -143,6 +143,13 @@ impl Pager {
     }
 }
 
+impl Drop for Pager {
+    fn drop(&mut self) {
+        // Ensure file is flushed before closing
+        let _ = self.file.sync_all();
+    }
+}
+
 pub struct Database {
     pager: Arc<RwLock<Pager>>,
     btrees: Arc<RwLock<HashMap<String, Arc<RwLock<BTree>>>>>,
@@ -171,14 +178,20 @@ impl Database {
     }
 
     fn initialize(&self) -> Result<()> {
-        let mut pager = self.pager.write();
+        let num_pages = {
+            let mut pager = self.pager.write();
 
-        // If empty database, create root page and schema page
-        if pager.num_pages() == 0 {
-            pager.allocate_page()?; // Page 0 - root
-            pager.allocate_page()?; // Page 1 - schema
-        } else {
-            // Load existing schema
+            // If empty database, create root page and schema page
+            if pager.num_pages() == 0 {
+                pager.allocate_page()?; // Page 0 - root
+                pager.allocate_page()?; // Page 1 - schema
+            }
+            
+            pager.num_pages()
+        }; // Drop the write lock here
+        
+        // Load existing schema if database already exists
+        if num_pages > 0 {
             self.load_schema()?;
         }
 
@@ -192,14 +205,26 @@ impl Database {
         }
         drop(pager_read);
 
-        let mut pager = self.pager.write();
-        let page_arc = pager.read_page(1)?;
-        let page = page_arc.read();
-        let data = page.data();
+        // Read schema data without holding the lock for too long
+        let data_copy: Vec<u8> = {
+            let mut pager = self.pager.write();
+            let page_arc = pager.read_page(1)?;
+            let page = page_arc.read();
+            let data = page.data();
 
-        // Simple schema format: number of tables, then each table
+            // Simple schema format: number of tables, then each table
+            if data.len() < 4 {
+                return Ok(()); // Empty schema
+            }
+
+            // Copy data to avoid holding locks while parsing
+            data.to_vec()
+        };
+
+        // Parse schema without holding pager lock
+        let data = &data_copy[..];
         if data.len() < 4 {
-            return Ok(()); // Empty schema
+            return Ok(());
         }
 
         let num_tables = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0, 0, 0, 0]));
@@ -435,6 +460,13 @@ impl Database {
 
     pub fn list_tables(&self) -> Vec<String> {
         self.schema.read().list_tables()
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        // Ensure data is flushed to disk when database is dropped
+        let _ = self.pager.write().flush();
     }
 }
 

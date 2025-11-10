@@ -21,6 +21,10 @@ fn process_command(db: &Database, input: &str) -> Result<bool> {
     match input.to_lowercase().as_str() {
         "" => return Ok(true), // Continue
         "exit" | "quit" | ".exit" | ".quit" => {
+            // Close database before exiting
+            if let Err(e) = db.close() {
+                error!("Error closing database: {}", e);
+            }
             println!("Goodbye!");
             return Ok(false); // Exit
         }
@@ -196,6 +200,12 @@ fn main() -> Result<()> {
                 break;
             }
         }
+    }
+
+    // Ensure database is properly closed before exiting
+    if let Err(e) = db.close() {
+        error!("Error closing database: {}", e);
+        eprintln!("Warning: Failed to properly close database: {}", e);
     }
 
     Ok(())
