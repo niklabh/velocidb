@@ -5,27 +5,13 @@ use crate::types::{Result, Value, VelociError};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Lamport timestamp for causality tracking
 pub type LamportTimestamp = u64;
 
 /// Node/replica identifier
 pub type NodeId = String;
-
-/// Global Lamport clock
-static LAMPORT_CLOCK: AtomicU64 = AtomicU64::new(1);
-
-/// Get the next Lamport timestamp
-pub fn next_timestamp() -> LamportTimestamp {
-    LAMPORT_CLOCK.fetch_add(1, Ordering::SeqCst)
-}
-
-/// Update Lamport clock based on received timestamp
-pub fn update_timestamp(received: LamportTimestamp) {
-    let current = LAMPORT_CLOCK.load(Ordering::SeqCst);
-    let new_timestamp = received.max(current) + 1;
-    LAMPORT_CLOCK.store(new_timestamp, Ordering::SeqCst);
-}
 
 /// CRDT operation types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -146,6 +132,8 @@ pub struct CrdtStore {
     operation_log: Vec<CrdtOperation>,
     /// Vector clock for causality tracking
     vector_clock: HashMap<NodeId, LamportTimestamp>,
+    /// Instance-scoped Lamport clock for this store
+    lamport_clock: Arc<AtomicU64>,
 }
 
 impl CrdtStore {
@@ -158,12 +146,25 @@ impl CrdtStore {
             state: HashMap::new(),
             operation_log: Vec::new(),
             vector_clock,
+            lamport_clock: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// Get the next Lamport timestamp for this instance
+    fn next_timestamp(&self) -> LamportTimestamp {
+        self.lamport_clock.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Update Lamport clock based on received timestamp
+    fn update_timestamp(&self, received: LamportTimestamp) {
+        let current = self.lamport_clock.load(Ordering::SeqCst);
+        let new_timestamp = received.max(current) + 1;
+        self.lamport_clock.store(new_timestamp, Ordering::SeqCst);
     }
 
     /// Insert a new record
     pub fn insert(&mut self, table: &str, key: i64, values: Vec<Value>) -> Result<()> {
-        let timestamp = next_timestamp();
+        let timestamp = self.next_timestamp();
         
         let operation = CrdtOperation::Insert {
             table: table.to_string(),
@@ -182,7 +183,7 @@ impl CrdtStore {
 
     /// Update an existing record
     pub fn update(&mut self, table: &str, key: i64, values: Vec<Value>) -> Result<()> {
-        let timestamp = next_timestamp();
+        let timestamp = self.next_timestamp();
         
         let operation = CrdtOperation::Update {
             table: table.to_string(),
@@ -201,7 +202,7 @@ impl CrdtStore {
 
     /// Delete a record
     pub fn delete(&mut self, table: &str, key: i64) -> Result<()> {
-        let timestamp = next_timestamp();
+        let timestamp = self.next_timestamp();
         
         let operation = CrdtOperation::Delete {
             table: table.to_string(),
@@ -254,7 +255,7 @@ impl CrdtStore {
     pub fn merge_operations(&mut self, operations: Vec<CrdtOperation>) -> Result<()> {
         for op in operations {
             // Update our clock
-            update_timestamp(op.timestamp());
+            self.update_timestamp(op.timestamp());
             
             // Apply operation
             self.apply_operation(&op)?;
