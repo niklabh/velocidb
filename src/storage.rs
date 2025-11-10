@@ -2,9 +2,9 @@
 
 use crate::btree::BTree;
 use crate::executor::Executor;
-use crate::parser::Parser;
+use crate::parser::{Parser, Statement};
 use crate::transaction::TransactionManager;
-use crate::types::{PageId, QueryResult, Result, VelociError};
+use crate::types::{DataType, PageId, QueryResult, Result, VelociError};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -172,27 +172,220 @@ impl Database {
 
     fn initialize(&self) -> Result<()> {
         let mut pager = self.pager.write();
-        
-        // If empty database, create root page
+
+        // If empty database, create root page and schema page
         if pager.num_pages() == 0 {
-            pager.allocate_page()?;
+            pager.allocate_page()?; // Page 0 - root
+            pager.allocate_page()?; // Page 1 - schema
+        } else {
+            // Load existing schema
+            self.load_schema()?;
         }
-        
+
+        Ok(())
+    }
+
+    fn load_schema(&self) -> Result<()> {
+        let pager_read = self.pager.read();
+        if pager_read.num_pages() < 2 {
+            return Ok(()); // No schema page yet
+        }
+        drop(pager_read);
+
+        let mut pager = self.pager.write();
+        let page_arc = pager.read_page(1)?;
+        let page = page_arc.read();
+        let data = page.data();
+
+        // Simple schema format: number of tables, then each table
+        if data.len() < 4 {
+            return Ok(()); // Empty schema
+        }
+
+        let num_tables = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0, 0, 0, 0]));
+        let mut offset = 4;
+
+        for _ in 0..num_tables {
+            if offset + 8 > data.len() {
+                break; // Corrupted data
+            }
+
+            // Table name length and name
+            let name_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or([0, 0, 0, 0])) as usize;
+            offset += 4;
+
+            if offset + name_len > data.len() {
+                break;
+            }
+
+            let table_name = String::from_utf8(data[offset..offset + name_len].to_vec())
+                .unwrap_or_default();
+            offset += name_len;
+
+            // Number of columns
+            if offset + 4 > data.len() {
+                break;
+            }
+
+            let num_cols = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or([0, 0, 0, 0])) as usize;
+            offset += 4;
+
+            let mut columns = Vec::new();
+            for _ in 0..num_cols {
+                if offset + 13 > data.len() {
+                    break;
+                }
+
+                // Column data: name_len(4) + name + data_type(1) + flags(1) + root_page(8)
+                let col_name_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or([0, 0, 0, 0])) as usize;
+                offset += 4;
+
+                if offset + col_name_len + 10 > data.len() {
+                    break;
+                }
+
+                let col_name = String::from_utf8(data[offset..offset + col_name_len].to_vec())
+                    .unwrap_or_default();
+                offset += col_name_len;
+
+                let data_type_byte = data[offset];
+                let data_type = match data_type_byte {
+                    0 => DataType::Integer,
+                    1 => DataType::Real,
+                    2 => DataType::Text,
+                    3 => DataType::Blob,
+                    _ => DataType::Text,
+                };
+                offset += 1;
+
+                let flags = data[offset];
+                let primary_key = (flags & 1) != 0;
+                let not_null = (flags & 2) != 0;
+                let unique = (flags & 4) != 0;
+                offset += 1;
+
+                let root_page = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap_or([0, 0, 0, 0, 0, 0, 0, 0]));
+                offset += 8;
+
+                columns.push(crate::types::Column {
+                    name: col_name,
+                    data_type,
+                    primary_key,
+                    not_null,
+                    unique,
+                });
+
+                // Create B-Tree for this table
+                let btree = crate::btree::BTree::from_root(root_page, Arc::clone(&self.pager));
+                self.btrees.write().insert(table_name.clone(), Arc::new(RwLock::new(btree)));
+            }
+
+            // Add table to schema
+            let table_schema = TableSchema {
+                name: table_name,
+                columns,
+                root_page: 0, // Will be set by individual columns
+            };
+            self.schema.write().create_table(table_schema)?;
+        }
+
+        Ok(())
+    }
+
+    fn save_schema(&self) -> Result<()> {
+        let schema = self.schema.read();
+        let mut buffer = Vec::new();
+
+        // Number of tables
+        let tables = schema.list_tables();
+        buffer.extend_from_slice(&(tables.len() as u32).to_le_bytes());
+
+        for table_name in tables {
+            if let Ok(table_schema) = schema.get_table(&table_name) {
+                // Table name
+                let name_bytes = table_name.as_bytes();
+                buffer.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+                buffer.extend_from_slice(name_bytes);
+
+                // Number of columns
+                buffer.extend_from_slice(&(table_schema.columns.len() as u32).to_le_bytes());
+
+                for column in &table_schema.columns {
+                    // Column name
+                    let col_name_bytes = column.name.as_bytes();
+                    buffer.extend_from_slice(&(col_name_bytes.len() as u32).to_le_bytes());
+                    buffer.extend_from_slice(col_name_bytes);
+
+                    // Data type
+                    let data_type_byte = match column.data_type {
+                        DataType::Integer => 0u8,
+                        DataType::Real => 1u8,
+                        DataType::Text => 2u8,
+                        DataType::Blob => 3u8,
+                        DataType::Null => 4u8,
+                    };
+                    buffer.push(data_type_byte);
+
+                    // Flags
+                    let mut flags = 0u8;
+                    if column.primary_key {
+                        flags |= 1;
+                    }
+                    if column.not_null {
+                        flags |= 2;
+                    }
+                    if column.unique {
+                        flags |= 4;
+                    }
+                    buffer.push(flags);
+
+                    // Root page - get from B-Tree
+                    let root_page = if let Some(btree_arc) = self.btrees.read().get(&table_name) {
+                        btree_arc.read().root_page()
+                    } else {
+                        0u64 // Fallback
+                    };
+                    buffer.extend_from_slice(&root_page.to_le_bytes());
+                }
+            }
+        }
+
+        // Write to schema page (page 1)
+        let mut pager = self.pager.write();
+        if pager.num_pages() < 2 {
+            pager.allocate_page()?; // Ensure schema page exists
+        }
+
+        let mut page = crate::storage::Page::new();
+        let copy_len = std::cmp::min(buffer.len(), crate::storage::PAGE_SIZE);
+        page.data_mut()[0..copy_len].copy_from_slice(&buffer[0..copy_len]);
+        pager.write_page(1, &page)?;
+
         Ok(())
     }
 
     pub fn execute(&self, sql: &str) -> Result<()> {
         let parser = Parser::new();
         let statement = parser.parse(sql)?;
-        
+
         let executor = Executor::new(
             Arc::clone(&self.pager),
             Arc::clone(&self.btrees),
             Arc::clone(&self.schema),
             Arc::clone(&self.transaction_manager),
         );
-        
-        executor.execute(statement)?;
+
+        executor.execute(statement.clone())?;
+
+        // Save schema if this was a DDL statement
+        match statement {
+            Statement::CreateTable { .. } |
+            Statement::DropTable { .. } => {
+                self.save_schema()?;
+            }
+            _ => {}
+        }
+
         Ok(())
     }
 
@@ -213,6 +406,10 @@ impl Database {
     pub fn close(&self) -> Result<()> {
         self.pager.write().flush()?;
         Ok(())
+    }
+
+    pub fn list_tables(&self) -> Vec<String> {
+        self.schema.read().list_tables()
     }
 }
 

@@ -9,13 +9,135 @@ mod transaction;
 mod types;
 
 use anyhow::Result;
+use std::env;
 use std::io::{self, Write};
 use tracing::{info, error, Level};
 use tracing_subscriber;
 
 use crate::storage::Database;
 
+fn process_command(db: &Database, input: &str) -> Result<bool> {
+    // Handle special commands
+    match input.to_lowercase().as_str() {
+        "" => return Ok(true), // Continue
+        "exit" | "quit" | ".exit" | ".quit" => {
+            println!("Goodbye!");
+            return Ok(false); // Exit
+        }
+        "help" | ".help" => {
+            print_help();
+            return Ok(true); // Continue
+        }
+        ".tables" => {
+            let tables = db.list_tables();
+            if tables.is_empty() {
+                println!("No tables found.");
+            } else {
+                println!("Tables:");
+                for table in tables {
+                    println!("  {}", table);
+                }
+            }
+            return Ok(true); // Continue
+        }
+        _ => {}
+    }
+
+    // Execute SQL
+    if input.to_uppercase().starts_with("SELECT") {
+        // Query
+        match db.query(input) {
+            Ok(result) => {
+                println!("Columns: {}", result.columns.len());
+                println!("Rows: {}", result.rows.len());
+
+                // Print column headers
+                for (i, col) in result.columns.iter().enumerate() {
+                    if i > 0 { print!(" | "); }
+                    print!("{}", col.name);
+                }
+                println!();
+
+                // Print separator
+                for (i, col) in result.columns.iter().enumerate() {
+                    if i > 0 { print!("-+-"); }
+                    print!("{}", "-".repeat(col.name.len().max(10)));
+                }
+                println!();
+
+                // Print rows
+                for row in &result.rows {
+                    for (i, value) in row.values.iter().enumerate() {
+                        if i > 0 { print!(" | "); }
+                        print!("{}", value);
+                    }
+                    println!();
+                }
+
+                println!("\n{} row(s) returned", result.rows.len());
+            }
+            Err(e) => {
+                error!("Query error: {}", e);
+                println!("Error: {}", e);
+            }
+        }
+    } else {
+        // Execute command
+        match db.execute(input) {
+            Ok(_) => {
+                println!("OK");
+            }
+            Err(e) => {
+                error!("Execution error: {}", e);
+                println!("Error: {}", e);
+            }
+        }
+    }
+
+    Ok(true) // Continue
+}
+
 fn main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+
+    // Parse command line arguments
+    let mut db_filename = "veloci.db".to_string();
+    let mut i = 1;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                print_help();
+                return Ok(());
+            }
+            "--version" | "-v" => {
+                println!("VelociDB v0.1.0");
+                return Ok(());
+            }
+            "--db" | "-d" => {
+                // Next argument should be the database filename
+                if i + 1 < args.len() {
+                    db_filename = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    eprintln!("Error: --db/-d requires a filename argument");
+                    eprintln!("Usage: {} [--help|-h] [--version|-v] [--db|-d <filename>] [database_file]", args[0]);
+                    return Ok(());
+                }
+            }
+            arg if arg.starts_with('-') => {
+                eprintln!("Unknown option: {}", arg);
+                eprintln!("Usage: {} [--help|-h] [--version|-v] [--db|-d <filename>] [database_file]", args[0]);
+                return Ok(());
+            }
+            _ => {
+                // Treat as database filename
+                db_filename = args[i].clone();
+                i += 1;
+            }
+        }
+    }
+
     // Initialize logging
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
@@ -23,12 +145,30 @@ fn main() -> Result<()> {
 
     info!("VelociDB v0.1.0 - Interactive SQL Shell");
     println!("VelociDB v0.1.0");
+    println!("Database: {}", db_filename);
     println!("Type 'help' for help, 'exit' or 'quit' to exit");
     println!();
 
     // Open or create database
-    let db = Database::open("veloci.db")?;
-    info!("Database opened: veloci.db");
+    let db = Database::open(&db_filename)?;
+    info!("Database opened: {}", db_filename);
+
+    // Check if stdin is available (for non-interactive environments)
+    let mut test_input = String::new();
+    match io::stdin().read_line(&mut test_input) {
+        Ok(0) | Err(_) => {
+            // EOF or error - likely non-interactive environment
+            info!("Non-interactive environment detected, exiting cleanly");
+            return Ok(());
+        }
+        Ok(_) => {
+            // Input available - process the first line we just read
+            let trimmed_input = test_input.trim();
+            if !trimmed_input.is_empty() {
+                process_command(&db, trimmed_input)?;
+            }
+        }
+    }
 
     // REPL loop
     loop {
@@ -38,77 +178,22 @@ fn main() -> Result<()> {
 
         // Read line
         let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        
-        let input = input.trim();
-
-        // Handle special commands
-        match input.to_lowercase().as_str() {
-            "" => continue,
-            "exit" | "quit" | ".exit" | ".quit" => {
-                println!("Goodbye!");
+        match io::stdin().read_line(&mut input) {
+            Ok(0) => {
+                // EOF reached (Ctrl+D on Unix, Ctrl+Z on Windows)
+                println!("\nGoodbye!");
                 break;
             }
-            "help" | ".help" => {
-                print_help();
-                continue;
-            }
-            ".tables" => {
-                println!("Tables:");
-                println!("  (schema inspection not yet implemented)");
-                continue;
-            }
-            _ => {}
-        }
-
-        // Execute SQL
-        if input.to_uppercase().starts_with("SELECT") {
-            // Query
-            match db.query(input) {
-                Ok(result) => {
-                    println!("Columns: {}", result.columns.len());
-                    println!("Rows: {}", result.rows.len());
-                    
-                    // Print column headers
-                    for (i, col) in result.columns.iter().enumerate() {
-                        if i > 0 { print!(" | "); }
-                        print!("{}", col.name);
-                    }
-                    println!();
-                    
-                    // Print separator
-                    for (i, col) in result.columns.iter().enumerate() {
-                        if i > 0 { print!("-+-"); }
-                        print!("{}", "-".repeat(col.name.len().max(10)));
-                    }
-                    println!();
-                    
-                    // Print rows
-                    for row in &result.rows {
-                        for (i, value) in row.values.iter().enumerate() {
-                            if i > 0 { print!(" | "); }
-                            print!("{}", value);
-                        }
-                        println!();
-                    }
-                    
-                    println!("\n{} row(s) returned", result.rows.len());
-                }
-                Err(e) => {
-                    error!("Query error: {}", e);
-                    println!("Error: {}", e);
+            Ok(_) => {
+                let input = input.trim();
+                if !process_command(&db, input)? {
+                    break; // Exit requested
                 }
             }
-        } else {
-            // Execute command
-            match db.execute(input) {
-                Ok(_) => {
-                    println!("OK");
-                }
-                Err(e) => {
-                    error!("Execution error: {}", e);
-                    println!("Error: {}", e);
-                }
+            Err(e) => {
+                error!("Failed to read input: {}", e);
+                println!("Error reading input: {}", e);
+                break;
             }
         }
     }
@@ -117,7 +202,18 @@ fn main() -> Result<()> {
 }
 
 fn print_help() {
-    println!("VelociDB Commands:");
+    println!("VelociDB v0.1.0 - SQLite-compatible database");
+    println!();
+    println!("USAGE:");
+    println!("    velocidb [OPTIONS] [DATABASE]");
+    println!();
+    println!("OPTIONS:");
+    println!("    -h, --help       Show this help message");
+    println!("    -v, --version    Show version information");
+    println!("    -d, --db <FILE>  Specify database file (alternative syntax)");
+    println!();
+    println!("ARGUMENTS:");
+    println!("    <DATABASE>       Database file path (default: veloci.db)");
     println!();
     println!("SQL Commands:");
     println!("  CREATE TABLE <name> (<columns>)  - Create a new table");

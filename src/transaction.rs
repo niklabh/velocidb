@@ -128,26 +128,43 @@ impl LockManager {
 
     pub fn acquire_lock(&self, resource: &str, txn_id: TransactionId, lock_type: LockType) -> Result<()> {
         let mut locks = self.locks.write();
-        
+
         if let Some(entry) = locks.get(resource) {
-            // Check for conflicts
-            match (lock_type, entry.lock_type) {
-                (LockType::Shared, LockType::Shared) => {
-                    // Allow multiple shared locks
+            // Check if same transaction already holds a lock
+            if entry.txn_id == txn_id {
+                // Same transaction can upgrade shared to exclusive, but not downgrade
+                match (entry.lock_type, lock_type) {
+                    (LockType::Shared, LockType::Exclusive) => {
+                        // Allow upgrade from shared to exclusive
+                    }
+                    (LockType::Exclusive, LockType::Shared) => {
+                        return Err(VelociError::ConstraintViolation(
+                            "Cannot downgrade exclusive lock to shared".to_string()
+                        ));
+                    }
+                    (LockType::Shared, LockType::Shared) | (LockType::Exclusive, LockType::Exclusive) => {
+                        // Same lock type, allow
+                        return Ok(());
+                    }
                 }
-                (LockType::Exclusive, _) | (_, LockType::Exclusive) => {
-                    if entry.txn_id != txn_id {
+            } else {
+                // Different transaction - check for conflicts
+                match (lock_type, entry.lock_type) {
+                    (LockType::Shared, LockType::Shared) => {
+                        // Allow multiple shared locks from different transactions
+                    }
+                    (LockType::Exclusive, _) | (_, LockType::Exclusive) => {
                         return Err(VelociError::Busy);
                     }
                 }
             }
         }
-        
+
         locks.insert(
             resource.to_string(),
             LockEntry { txn_id, lock_type },
         );
-        
+
         Ok(())
     }
 

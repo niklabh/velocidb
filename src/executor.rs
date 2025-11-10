@@ -159,6 +159,34 @@ impl Executor {
 
         let pk_value = values[pk_value_index].as_integer()?;
 
+        // Check for primary key uniqueness
+        let btrees = self.btrees.read();
+        let btree_arc = btrees.get(table).ok_or_else(|| {
+            VelociError::NotFound(format!("Table '{}' not initialized", table))
+        })?;
+        let btree = btree_arc.read();
+
+        if btree.search(pk_value)?.is_some() {
+            return Err(VelociError::ConstraintViolation(format!(
+                "Primary key {} already exists in table '{}'",
+                pk_value, table
+            )));
+        }
+        drop(btree);
+        drop(btrees);
+
+        // Validate NOT NULL constraints
+        for (i, value) in values.iter().enumerate() {
+            let col_name = &column_names[i];
+            if let Some(col) = table_schema.columns.iter().find(|c| &c.name == col_name) {
+                if col.not_null && matches!(value, Value::Null) {
+                    return Err(VelociError::ConstraintViolation(format!(
+                        "Column '{}' cannot be NULL", col_name
+                    )));
+                }
+            }
+        }
+
         // Create a row with all columns (fill missing with NULL)
         let mut row_values = vec![Value::Null; table_schema.columns.len()];
         for (i, col_name) in column_names.iter().enumerate() {
@@ -301,16 +329,53 @@ impl Executor {
         };
 
         // Update each row
-        for (key, mut row) in rows_to_update {
+        for (key, row) in &rows_to_update {
+            let mut updated_row = row.clone();
+
+            // Find primary key column
+            let pk_index = table_schema
+                .columns
+                .iter()
+                .position(|c| c.primary_key)
+                .ok_or_else(|| VelociError::ConstraintViolation("No primary key defined".to_string()))?;
+
+            let mut new_pk_value = *key; // Default to existing key
+            let mut pk_being_updated = false;
+
+            // Apply updates to the row
             for (col_name, new_value) in &assignments {
                 if let Some(col_index) = table_schema.columns.iter().position(|c| &c.name == col_name) {
-                    row.values[col_index] = new_value.clone();
+                    // Check NOT NULL constraint
+                    let col = &table_schema.columns[col_index];
+                    if col.not_null && matches!(new_value, Value::Null) {
+                        return Err(VelociError::ConstraintViolation(format!(
+                            "Column '{}' cannot be NULL", col_name
+                        )));
+                    }
+
+                    updated_row.values[col_index] = new_value.clone();
+
+                    // Check if primary key is being updated
+                    if col_index == pk_index {
+                        new_pk_value = new_value.as_integer()?;
+                        pk_being_updated = true;
+                    }
+                }
+            }
+
+            // If primary key is being updated, check for uniqueness
+            if pk_being_updated && new_pk_value != *key {
+                if btree.search(new_pk_value)?.is_some() {
+                    return Err(VelociError::ConstraintViolation(format!(
+                        "Primary key {} already exists in table '{}'",
+                        new_pk_value, table
+                    )));
                 }
             }
 
             // Delete old row and insert updated row
-            btree.delete(key)?;
-            btree.insert(key, &row)?;
+            btree.delete(*key)?;
+            btree.insert(new_pk_value, &updated_row)?;
         }
 
         // Commit transaction

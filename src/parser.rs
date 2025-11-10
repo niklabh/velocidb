@@ -148,16 +148,33 @@ impl Parser {
 
         let mut columns = Vec::new();
         for col_def in columns_str.split(',') {
-            let parts: Vec<&str> = col_def.trim().split_whitespace().collect();
-            if parts.len() < 2 {
+            let col_def = col_def.trim();
+            if col_def.is_empty() {
+                continue;
+            }
+
+            // Parse column name (handle quoted identifiers)
+            let (col_name, remainder) = self.parse_identifier(col_def)?;
+
+            // Parse data type and constraints
+            let remainder = remainder.trim();
+            if remainder.is_empty() {
+                return Err(VelociError::ParseError(format!(
+                    "Missing data type for column '{}'",
+                    col_name
+                )));
+            }
+
+            // Split remainder into parts, handling quoted strings
+            let parts = self.split_sql_parts(remainder);
+            if parts.is_empty() {
                 return Err(VelociError::ParseError(format!(
                     "Invalid column definition: {}",
                     col_def
                 )));
             }
 
-            let col_name = parts[0].to_string();
-            let data_type = DataType::from_str(parts[1]);
+            let data_type = DataType::from_str(&parts[0]);
             let mut primary_key = false;
             let mut not_null = false;
             let mut unique = false;
@@ -380,12 +397,18 @@ impl Parser {
             return Ok(Value::Null);
         }
 
-        // String (quoted)
+        // String (quoted) - handle escaped quotes
         if (s.starts_with('\'') && s.ends_with('\''))
             || (s.starts_with('"') && s.ends_with('"'))
         {
-            let text = s[1..s.len() - 1].to_string();
-            return Ok(Value::Text(text));
+            let quote_char = s.chars().next().unwrap();
+            let content = &s[1..s.len() - 1];
+
+            // Handle escaped quotes
+            let unescaped = content.replace(&format!("\\{}", quote_char), &quote_char.to_string())
+                                   .replace("\\\\", "\\");
+
+            return Ok(Value::Text(unescaped));
         }
 
         // Try integer
@@ -398,8 +421,110 @@ impl Parser {
             return Ok(Value::Float(f));
         }
 
+        // BLOB literal (X'hexdigits' or x'hexdigits')
+        if s.len() >= 3 && (s.starts_with("X'") || s.starts_with("x'")) && s.ends_with('\'') {
+            let hex_part = &s[2..s.len() - 1];
+            if hex_part.len() % 2 != 0 {
+                return Err(VelociError::ParseError("Invalid BLOB literal: odd number of hex digits".to_string()));
+            }
+
+            let mut blob = Vec::new();
+            for i in (0..hex_part.len()).step_by(2) {
+                let byte_str = &hex_part[i..i + 2];
+                match u8::from_str_radix(byte_str, 16) {
+                    Ok(byte) => blob.push(byte),
+                    Err(_) => return Err(VelociError::ParseError(format!("Invalid hex digit in BLOB: {}", byte_str))),
+                }
+            }
+            return Ok(Value::Blob(blob));
+        }
+
         // Default to text without quotes
         Ok(Value::Text(s.to_string()))
+    }
+
+    fn parse_identifier<'a>(&self, s: &'a str) -> Result<(String, &'a str)> {
+        let s = s.trim();
+
+        // Quoted identifier
+        if (s.starts_with('"') || s.starts_with('`') || s.starts_with('[')) {
+            let quote_char = s.chars().next().unwrap();
+            let end_quote = match quote_char {
+                '"' => '"',
+                '`' => '`',
+                '[' => ']',
+                _ => return Err(VelociError::ParseError("Invalid quote character".to_string())),
+            };
+
+            let mut chars = s.chars();
+            chars.next(); // skip opening quote
+
+            let mut identifier = String::new();
+            let mut escaped = false;
+
+            for ch in chars {
+                if escaped {
+                    identifier.push(ch);
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == end_quote {
+                    // Find the remainder after the closing quote
+                    let rest_start = s.find(end_quote).unwrap() + 1;
+                    return Ok((identifier, &s[rest_start..]));
+                } else {
+                    identifier.push(ch);
+                }
+            }
+
+            return Err(VelociError::ParseError("Unterminated quoted identifier".to_string()));
+        }
+
+        // Unquoted identifier (stops at first whitespace)
+        if let Some(space_pos) = s.find(char::is_whitespace) {
+            let (ident, rest) = s.split_at(space_pos);
+            Ok((ident.to_string(), rest))
+        } else {
+            Ok((s.to_string(), ""))
+        }
+    }
+
+    fn split_sql_parts(&self, s: &str) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut in_string = false;
+        let mut string_char = '"';
+        let mut escaped = false;
+
+        for ch in s.chars() {
+            if escaped {
+                current.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+                current.push(ch);
+            } else if !in_string && (ch == '"' || ch == '\'') {
+                in_string = true;
+                string_char = ch;
+                current.push(ch);
+            } else if in_string && ch == string_char {
+                in_string = false;
+                current.push(ch);
+            } else if !in_string && ch.is_whitespace() {
+                if !current.is_empty() {
+                    parts.push(current);
+                    current = String::new();
+                }
+            } else {
+                current.push(ch);
+            }
+        }
+
+        if !current.is_empty() {
+            parts.push(current);
+        }
+
+        parts
     }
 }
 
