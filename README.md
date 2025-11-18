@@ -7,6 +7,7 @@ A next-generation embedded database with modern architecture: MVCC, async I/O, S
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Architecture](https://img.shields.io/badge/architecture-modern-green.svg)](docs/architecture.md)
+[![Docs](https://img.shields.io/badge/docs-online-blue.svg)](https://niklabh.github.io/velocidb/)
 
 ## 📚 Documentation
 
