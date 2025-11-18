@@ -116,17 +116,26 @@ impl DaxVfs {
     }
 
     /// Persist data using cache line flushes (clflush/clflushopt/clwb)
-    #[cfg(target_arch = "x86_64")]
     pub fn persist_page(&self, page_id: PageId) -> Result<()> {
         let ptr = self.get_page_ptr(page_id)?;
 
-        // Use CLWB (Cache Line Write Back) if available, otherwise CLFLUSHOPT
-        if is_x86_feature_detected!("clwb") {
-            unsafe { Self::persist_with_clwb(ptr, PAGE_SIZE) };
-        } else if is_x86_feature_detected!("clflushopt") {
-            unsafe { Self::persist_with_clflushopt(ptr, PAGE_SIZE) };
-        } else {
-            unsafe { Self::persist_with_clflush(ptr, PAGE_SIZE) };
+        #[cfg(all(target_arch = "x86_64", not(doc)))]
+        {
+            // Use CLWB (Cache Line Write Back) if available, otherwise CLFLUSHOPT
+            if is_x86_feature_detected!("clwb") {
+                unsafe { Self::persist_with_clwb(ptr, PAGE_SIZE) };
+            } else if is_x86_feature_detected!("clflushopt") {
+                unsafe { Self::persist_with_clflushopt(ptr, PAGE_SIZE) };
+            } else {
+                unsafe { Self::persist_with_clflush(ptr, PAGE_SIZE) };
+            }
+        }
+
+        #[cfg(any(not(target_arch = "x86_64"), doc))]
+        {
+            // Fallback for non-x86 or documentation builds
+            // In a real implementation, we might use msync() here
+            std::sync::atomic::fence(Ordering::SeqCst);
         }
 
         // Memory fence to ensure persistence
@@ -136,7 +145,7 @@ impl DaxVfs {
     }
 
     /// Persist using CLWB (most efficient - doesn't invalidate cache line)
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(doc)))]
     #[target_feature(enable = "clwb")]
     unsafe fn persist_with_clwb(ptr: *const u8, size: usize) {
         use std::arch::x86_64::*;
@@ -148,7 +157,7 @@ impl DaxVfs {
     }
 
     /// Persist using CLFLUSHOPT (optimized flush)
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(doc)))]
     #[target_feature(enable = "clflushopt")]
     unsafe fn persist_with_clflushopt(ptr: *const u8, size: usize) {
         use std::arch::x86_64::*;
@@ -160,7 +169,7 @@ impl DaxVfs {
     }
 
     /// Persist using CLFLUSH (standard flush)
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(doc)))]
     unsafe fn persist_with_clflush(ptr: *const u8, size: usize) {
         use std::arch::x86_64::*;
         
@@ -171,12 +180,17 @@ impl DaxVfs {
     }
 
     /// Non-temporal store (bypass cache)
-    #[cfg(target_arch = "x86_64")]
     pub fn non_temporal_store(&self, page_id: PageId, data: &[u8]) -> Result<()> {
         let ptr = self.get_page_ptr_mut(page_id)?;
 
+        #[cfg(all(target_arch = "x86_64", not(doc)))]
         unsafe {
             Self::non_temporal_memcpy(ptr, data.as_ptr(), data.len().min(PAGE_SIZE));
+        }
+
+        #[cfg(any(not(target_arch = "x86_64"), doc))]
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len().min(PAGE_SIZE));
         }
 
         self.persist_page(page_id)?;
@@ -185,7 +199,7 @@ impl DaxVfs {
     }
 
     /// Non-temporal memcpy (uses streaming stores)
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(doc)))]
     #[target_feature(enable = "sse2")]
     unsafe fn non_temporal_memcpy(dst: *mut u8, src: *const u8, len: usize) {
         use std::arch::x86_64::*;
@@ -255,10 +269,7 @@ impl AsyncVfs for DaxVfs {
         }
 
         // Persist to PMEM
-        #[cfg(target_arch = "x86_64")]
-        {
-            self.persist_page(page_id)?;
-        }
+        self.persist_page(page_id)?;
 
         Ok(())
     }
@@ -333,10 +344,7 @@ impl PmemTransactionLog {
         }
 
         // Persist just the written cache lines
-        #[cfg(target_arch = "x86_64")]
-        {
-            self.dax_vfs.persist_page(self.log_page)?;
-        }
+        self.dax_vfs.persist_page(self.log_page)?;
 
         Ok(offset)
     }
