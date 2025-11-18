@@ -361,7 +361,7 @@ impl Parser {
         // age > 25
         // name = 'Alice'
         
-        let re = Regex::new(r"(\w+)\s*(=|!=|<>|>|<|>=|<=|LIKE)\s*(.+)")
+        let re = Regex::new(r"(\w+)\s*(>=|<=|!=|<>|LIKE|=|>|<)\s*(.+)")
             .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
 
         let captures = re

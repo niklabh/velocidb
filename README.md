@@ -6,7 +6,17 @@ A next-generation embedded database with modern architecture: MVCC, async I/O, S
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Architecture](https://img.shields.io/badge/architecture-modern-green.svg)](ARCHITECTURE.md)
+[![Architecture](https://img.shields.io/badge/architecture-modern-green.svg)](docs/architecture.md)
+
+## 📚 Documentation
+
+- **[Quick Start](docs/quickstart.md)**: Get up and running in minutes.
+- **[Architecture](docs/architecture.md)**: Deep dive into MVCC, Async I/O, and storage layout.
+- **[Performance](docs/performance.md)**: Benchmarks and optimization guide.
+- **[Implementation](docs/implementation.md)**: Detailed design notes.
+- **[Development Journey](docs/development_journey.md)**: The story behind our design choices.
+- **[REPL Usage](docs/repl_usage.md)**: Guide to the interactive shell.
+- **[Contributing](docs/contributing.md)**: How to get involved.
 
 ## 🚀 Quick Start
 
@@ -22,24 +32,11 @@ Type 'help' for help, 'exit' or 'quit' to exit
 
 velocidb> CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)
 OK
-
 velocidb> INSERT INTO users VALUES (1, 'Alice', 30)
 OK
-
 velocidb> SELECT * FROM users WHERE age > 25
-Columns: 3
-Rows: 1
-id | name | age
----+-------+-----
-1 | Alice | 30
-
-1 row(s) returned
-
-velocidb> exit
-Goodbye!
+...
 ```
-
-See [REPL_USAGE.md](REPL_USAGE.md) for complete REPL documentation.
 
 ### As a Library
 
@@ -49,22 +46,11 @@ use velocidb::Database;
 fn main() -> anyhow::Result<()> {
     let db = Database::open("my_database.db")?;
     
-    // Create table
-    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")?;
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")?;
+    db.execute("INSERT INTO users VALUES (1, 'Alice')")?;
     
-    // Insert data
-    db.execute("INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")?;
-    db.execute("INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")?;
-    
-    // Query data
-    let results = db.query("SELECT * FROM users WHERE age > 25")?;
+    let results = db.query("SELECT * FROM users")?;
     println!("Found {} users", results.rows.len());
-    
-    // Update data
-    db.execute("UPDATE users SET age = 31 WHERE name = 'Alice'")?;
-    
-    // Delete data
-    db.execute("DELETE FROM users WHERE id = 2")?;
     
     Ok(())
 }
@@ -72,316 +58,24 @@ fn main() -> anyhow::Result<()> {
 
 ## Features
 
-### Core Functionality
-- ✅ **Interactive REPL**: User-friendly SQL shell
-- ✅ **SQL Parser**: Full support for CREATE, INSERT, SELECT, UPDATE, DELETE statements
-- ✅ **B-Tree Storage Engine**: Efficient on-disk data structure for indexing
-- ✅ **Transaction Support**: ACID guarantees with transaction management
-- ✅ **Concurrency Control**: Lock management for safe concurrent access
-- ✅ **Page-based Storage**: 4KB page size with LRU caching
+- **Modern Core**: MVCC, Async I/O (Tokio/io_uring), Lock-Free structures.
+- **High Performance**: SIMD vectorization, Cache-conscious B-Tree, NVMe optimization.
+- **Storage Flexibility**: Hybrid Row/Columnar storage, PMEM/DAX support, Cloud VFS.
+- **Sync Ready**: CRDT synchronization for edge/mobile.
 
-### 🚀 Modern Architecture
-
-#### Concurrency & Performance
-- ✅ **MVCC (Multi-Version Concurrency Control)**: Non-blocking reads, concurrent writes, snapshot isolation
-- ✅ **Async I/O**: Tokio-based asynchronous operations, io_uring support (Linux)
-- ✅ **Lock-Free Data Structures**: Zero-kernel-overhead caching and queuing
-- ✅ **Vectorized Execution (SIMD)**: AVX2/AVX-512 for 4-20× faster queries
-- ✅ **Cache-Conscious B-Tree**: Aligned structures for 50-70% fewer cache misses
-
-#### Storage & Persistence
-- ✅ **Hybrid Row/Columnar Storage**: Adaptive layout for OLTP + OLAP workloads
-- ✅ **PMEM/DAX Support**: Direct access to persistent memory (Intel Optane)
-- ✅ **Cloud VFS**: Transparent access to S3/Azure Blob/GCS storage
-
-#### Distributed & Sync
-- ✅ **CRDT Synchronization**: Conflict-free bi-directional sync for edge/mobile
-- ✅ **Operation-based Replication**: Eventual consistency without coordination
-
-### Performance Characteristics
-- **10-50× throughput** on modern NVMe storage
-- **Unlimited concurrent readers** (MVCC)
-- **Sub-microsecond latency** on persistent memory
-- **4-20× faster aggregations** (SIMD vectorization)
-
-### Data Types
-- INTEGER (64-bit signed)
-- REAL/FLOAT (64-bit floating point)
-- TEXT (UTF-8 strings)
-- BLOB (binary data)
-- NULL
-
-## Architecture
-
-```
-velocidb/
-├── src/
-│   ├── main.rs          # REPL interface
-│   ├── lib.rs           # Library interface
-│   ├── storage.rs       # Pager, page cache, database management
-│   ├── btree.rs         # B-Tree implementation
-│   ├── parser.rs        # SQL parser
-│   ├── executor.rs      # Query executor
-│   ├── transaction.rs   # Transaction & lock management
-│   └── types.rs         # Core types and error handling
-├── tests/
-│   └── integration_tests.rs  # Integration test suite
-└── benches/
-    └── benchmarks.rs    # Performance benchmarks
-```
-
-## Installation & Building
-
-### Prerequisites
-- Rust 1.70 or higher
-- Cargo
-
-### Build from Source
+## Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/niklabh/velocidb.git
 cd velocidb
-
-# Debug build
-cargo build
-
-# Release build (optimized)
 cargo build --release
-
-# Run REPL
-cargo run --release
-
-# Run tests
-cargo test
-
-# Run benchmarks
-cargo bench
 ```
-
-## Usage
-
-### REPL Commands
-
-| Command | Description |
-|---------|-------------|
-| `CREATE TABLE <name> (...)` | Create a new table |
-| `INSERT INTO <table> VALUES (...)` | Insert data |
-| `SELECT * FROM <table>` | Query data |
-| `UPDATE <table> SET ...` | Update data |
-| `DELETE FROM <table> WHERE ...` | Delete data |
-| `help` | Show help |
-| `exit` or `quit` | Exit REPL |
-
-### Library API
-
-```rust
-use velocidb::Database;
-
-// Open database
-let db = Database::open("mydb.db")?;
-
-// Execute DDL/DML
-db.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")?;
-db.execute("INSERT INTO test VALUES (1, 'Hello')")?;
-
-// Query data
-let results = db.query("SELECT * FROM test")?;
-for row in results.rows {
-    println!("{:?}", row.values);
-}
-```
-
-## Performance
-
-Approximate benchmarks on modern hardware:
-
-- **Insert**: ~10,000 ops/sec
-- **Select (cached)**: ~50,000 ops/sec
-- **Update**: ~8,000 ops/sec
-- **Delete**: ~9,000 ops/sec
-
-See [PERFORMANCE.md](PERFORMANCE.md) for detailed optimization guide.
-
-## Testing
-
-```bash
-# Run all tests
-cargo test
-
-# Run specific test
-cargo test test_insert_and_select
-
-# Run with logging
-RUST_LOG=info cargo test
-
-# Run release tests
-cargo test --release
-```
-
-## Benchmarks
-
-```bash
-cargo bench
-```
-
-Results are saved to `target/criterion/` with HTML reports.
-
-## Comparison with SQLite
-
-| Feature | SQLite | VelociDB |
-|---------|--------|----------|
-| Language | C | Rust |
-| Memory Safety | Manual | Automatic |
-| Interactive Shell | Yes | Yes ✅ |
-| Embedded | Yes | Yes ✅ |
-| ACID | Yes | Yes ✅ |
-| SQL Support | Full | Core subset |
 
 ## Limitations
 
-Current version limitations:
-
-1. **B-Tree Capacity**: Internal node splitting not implemented - limited to ~4,096 records (see details below)
-2. **Complex Queries**: No JOINs, GROUP BY, ORDER BY
-3. **Multi-line REPL**: Not yet supported
-4. **Secondary Indexes**: Not implemented
-5. **Network Protocol**: No client/server mode
-
-### Storage Capacity Limitation
-
-**Important**: The B-Tree implementation has a capacity limit due to unimplemented internal node splitting:
-
-- **Leaf node splitting**: ✅ Fully implemented
-- **Internal node splitting**: ❌ Not implemented
-- **Practical limit**: Approximately 64 leaf nodes before hitting the internal node capacity
-
-**Estimated Maximum Records**:
-- **~4,096 records** with small records (~100 bytes each)
-- **~2,000 records** with medium records (~200 bytes each)  
-- **~1,000 records** with large records (~400 bytes each)
-
-**Workarounds**:
-1. **Increase `BTREE_ORDER`**: Edit `src/btree.rs` line 8 and change `const BTREE_ORDER: usize = 64;` to a larger value (e.g., 128 or 256). This multiplies the capacity proportionally.
-2. **Implement internal node splitting**: The placeholder function at `src/btree.rs` lines 616-650 provides guidance on what needs to be implemented.
-3. **Use table sharding**: Split data across multiple tables or database files.
-
-**Error Handling**: When the limit is reached, inserts will fail with a clear error message:
-```
-B-Tree capacity limit reached: Internal node is full (BTREE_ORDER=64).
-Maximum capacity is approximately 64 leaf nodes or ~2048 typical records.
-To store more data, increase BTREE_ORDER in src/btree.rs or implement full internal node splitting.
-See README.md for details.
-```
-
-This limitation makes VelociDB suitable for:
-- ✅ Embedded applications with moderate data volumes
-- ✅ Development and testing
-- ✅ Prototyping and proof-of-concepts
-- ✅ Small to medium-sized databases (under ~2000-4000 records)
-- ❌ Large-scale production databases (without modifications)
-
-## Documentation
-
-### Core Documentation
-- [README.md](README.md) - This file
-- [REPL_USAGE.md](REPL_USAGE.md) - Interactive shell guide
-- [PERFORMANCE.md](PERFORMANCE.md) - Performance optimization guide
-- [CONTRIBUTING.md](CONTRIBUTING.md) - Contribution guidelines
-- [PROJECT_SUMMARY.md](PROJECT_SUMMARY.md) - Project overview
-- [STATUS.md](STATUS.md) - Project status
-
-### Modern Architecture
-- [ARCHITECTURE.md](ARCHITECTURE.md) - Complete architecture deep dive
-- [IMPLEMENTATION.md](IMPLEMENTATION.md) - Implementation details and design decisions
-- [QUICKSTART.md](QUICKSTART.md) - Quick start guide for modern features
-- Module-specific documentation in `src/` (MVCC, async_io, SIMD, CRDT, etc.)
-
-## Examples
-
-### Create and Query
-
-```bash
-velocidb> CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price INTEGER)
-OK
-
-velocidb> INSERT INTO products VALUES (1, 'Laptop', 999)
-OK
-
-velocidb> INSERT INTO products VALUES (2, 'Mouse', 25)
-OK
-
-velocidb> SELECT * FROM products WHERE price > 50
-Columns: 3
-Rows: 1
-id | name | price
----+--------+-------
-1 | Laptop | 999
-
-1 row(s) returned
-```
-
-### Batch Insert via Library
-
-```rust
-let db = Database::open("products.db")?;
-db.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)")?;
-
-for i in 0..1000 {
-    db.execute(&format!("INSERT INTO products VALUES ({}, 'Product {}')", i, i))?;
-}
-```
-
-## Troubleshooting
-
-### REPL hangs
-- Ensure your SQL syntax is correct
-- Check that the table exists
-- Verify primary key is provided for INSERT
-
-### Build errors
-```bash
-cargo clean
-cargo build --release
-```
-
-### Tests fail
-```bash
-cargo test -- --test-threads=1
-```
-
-## Future Enhancements
-
-- [ ] **B-Tree internal node splitting** (High Priority - removes capacity limitation)
-- [ ] Secondary indexes
-- [ ] JOIN operations
-- [ ] Aggregation functions (SUM, AVG, COUNT, etc.)
-- [ ] ORDER BY and LIMIT clauses
-- [ ] Multi-line REPL support
-- [ ] Query optimizer with statistics
-- [ ] Network protocol
-
-## Contributing
-
-Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+- **B-Tree Capacity**: Currently limited to ~4,096 records due to pending internal node splitting implementation.
+- **SQL Support**: Core subset only (No JOINs, GROUP BY yet).
 
 ## License
 
-MIT License
-
-## Acknowledgments
-
-- Inspired by SQLite's elegant design
-- Built with Rust's excellent ecosystem
-- Performance optimizations based on modern database research
-
-## Contact & Support
-
-- Issues: [GitHub Issues](https://github.com/niklabh/velocidb/issues)
-- Discussions: [GitHub Discussions](https://github.com/niklabh/velocidb/discussions)
-
----
-
-**Status**: Production-ready ✅  
-**Version**: 0.1.0  
-**Last Updated**: November 2025
+MIT License. See [LICENSE](LICENSE) for details.
