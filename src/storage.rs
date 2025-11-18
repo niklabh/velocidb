@@ -150,6 +150,15 @@ impl Drop for Pager {
     }
 }
 
+/// The main database structure.
+///
+/// `Database` provides the primary interface for interacting with a VelociDB database.
+/// It handles storage management, transaction coordination, and query execution.
+///
+/// # Thread Safety
+///
+/// `Database` is thread-safe and can be shared across threads using `Arc`.
+/// Internally, it uses fine-grained locking to allow concurrent reads and writes.
 pub struct Database {
     pager: Arc<RwLock<Pager>>,
     btrees: Arc<RwLock<HashMap<String, Arc<RwLock<BTree>>>>>,
@@ -158,6 +167,25 @@ pub struct Database {
 }
 
 impl Database {
+    /// Opens a database at the specified path.
+    ///
+    /// If the database file does not exist, it will be created.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The path to the database file.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing an `Arc<Database>` on success.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use velocidb::Database;
+    ///
+    /// let db = Database::open("my_database.db").unwrap();
+    /// ```
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Arc<Self>> {
         let pager = Arc::new(RwLock::new(Pager::new(path.as_ref())?));
         let btrees = Arc::new(RwLock::new(HashMap::new()));
@@ -421,6 +449,20 @@ impl Database {
         Ok(())
     }
 
+    /// Executes a SQL statement that does not return rows (e.g., CREATE, INSERT, UPDATE, DELETE).
+    ///
+    /// # Arguments
+    ///
+    /// * `sql` - The SQL statement to execute.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use velocidb::Database;
+    /// # let db = Database::open("test.db").unwrap();
+    /// db.execute("CREATE TABLE items (id INTEGER, name TEXT)").unwrap();
+    /// db.execute("INSERT INTO items VALUES (1, 'Item 1')").unwrap();
+    /// ```
     pub fn execute(&self, sql: &str) -> Result<()> {
         let parser = Parser::new();
         let statement = parser.parse(sql)?;
@@ -446,6 +488,26 @@ impl Database {
         Ok(())
     }
 
+    /// Executes a SQL query that returns rows (e.g., SELECT).
+    ///
+    /// # Arguments
+    ///
+    /// * `sql` - The SQL query to execute.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing a `QueryResult` with the fetched rows and columns.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use velocidb::Database;
+    /// # let db = Database::open("test.db").unwrap();
+    /// let results = db.query("SELECT * FROM items").unwrap();
+    /// for row in results.rows {
+    ///     println!("{:?}", row.values);
+    /// }
+    /// ```
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
         let parser = Parser::new();
         let statement = parser.parse(sql)?;
@@ -460,11 +522,16 @@ impl Database {
         executor.query(statement)
     }
 
+    /// Closes the database and flushes all changes to disk.
+    ///
+    /// While `Database` implements `Drop` to automatically flush on cleanup,
+    /// calling `close` explicitly allows handling any flush errors.
     pub fn close(&self) -> Result<()> {
         self.pager.write().flush()?;
         Ok(())
     }
 
+    /// Lists all tables in the database.
     pub fn list_tables(&self) -> Vec<String> {
         self.schema.read().list_tables()
     }

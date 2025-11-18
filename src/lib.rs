@@ -1,5 +1,40 @@
-// VelociDB library interface
-// Modern embedded database with MVCC, async I/O, and vectorized execution
+//! # VelociDB
+//!
+//! VelociDB is a high-performance, embedded database engine written in Rust.
+//! It features a modern architecture designed for NVMe storage and multi-core systems.
+//!
+//! ## Key Features
+//!
+//! - **MVCC**: Multi-Version Concurrency Control for non-blocking reads.
+//! - **Async I/O**: Built on `tokio` and `io_uring` (on Linux) for high throughput.
+//! - **SIMD Acceleration**: Vectorized execution for query processing.
+//! - **Persistent Memory**: Direct Access (DAX) support for PMEM.
+//!
+//! ## Quick Start
+//!
+//! ```rust,no_run
+//! use velocidb::Database;
+//!
+//! # fn main() -> anyhow::Result<()> {
+//! // Open a database (creates it if it doesn't exist)
+//! let db = Database::open("my_database.db")?;
+//!
+//! // Create a table
+//! db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")?;
+//!
+//! // Insert data
+//! db.execute("INSERT INTO users VALUES (1, 'Alice', 30)")?;
+//! db.execute("INSERT INTO users VALUES (2, 'Bob', 25)")?;
+//!
+//! // Query data
+//! let results = db.query("SELECT * FROM users WHERE age > 25")?;
+//!
+//! for row in results.rows {
+//!     println!("Found user: {:?}", row.values);
+//! }
+//! # Ok(())
+//! # }
+//! ```
 
 pub mod storage;
 pub mod btree;

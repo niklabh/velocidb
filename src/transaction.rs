@@ -13,11 +13,15 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Represents the state of a transaction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum TransactionState {
+    /// Transaction is active and can perform operations.
     Active = 0,
+    /// Transaction has been committed successfully.
     Committed = 1,
+    /// Transaction has been aborted/rolled back.
     Aborted = 2,
 }
 
@@ -32,6 +36,10 @@ impl From<u8> for TransactionState {
     }
 }
 
+/// A database transaction.
+///
+/// Transactions provide ACID guarantees for database operations.
+/// They are created by the `TransactionManager`.
 pub struct Transaction {
     id: TransactionId,
     // Use atomic instead of RwLock to eliminate lock contention
@@ -46,14 +54,19 @@ impl Transaction {
         }
     }
 
+    /// Returns the unique identifier of the transaction.
     pub fn id(&self) -> TransactionId {
         self.id
     }
 
+    /// Returns the current state of the transaction.
     pub fn state(&self) -> TransactionState {
         self.state.load(Ordering::Acquire).into()
     }
 
+    /// Commits the transaction.
+    ///
+    /// This makes all changes made by the transaction permanent.
     pub fn commit(&self) -> Result<()> {
         // Use compare-exchange to ensure atomic state transition
         match self.state.compare_exchange(
@@ -72,6 +85,9 @@ impl Transaction {
         }
     }
 
+    /// Aborts the transaction.
+    ///
+    /// This rolls back all changes made by the transaction.
     pub fn abort(&self) -> Result<()> {
         // Use compare-exchange to ensure atomic state transition
         match self.state.compare_exchange(
@@ -91,6 +107,7 @@ impl Transaction {
     }
 }
 
+/// Manages the lifecycle of transactions.
 pub struct TransactionManager {
     next_txn_id: AtomicU64,
     active_transactions: RwLock<HashMap<TransactionId, Arc<Transaction>>>,
@@ -104,6 +121,7 @@ impl TransactionManager {
         }
     }
 
+    /// Begins a new transaction.
     pub fn begin(&self) -> Arc<Transaction> {
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
         let txn = Arc::new(Transaction::new(txn_id));
@@ -117,6 +135,7 @@ impl TransactionManager {
         txn
     }
 
+    /// Commits a transaction.
     pub fn commit(&self, txn: &Transaction) -> Result<()> {
         // LOCK ORDERING: 
         // 1. Commit transaction state (atomic operation - no lock)
@@ -129,6 +148,7 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Aborts a transaction.
     pub fn abort(&self, txn: &Transaction) -> Result<()> {
         // LOCK ORDERING: Same as commit - state first (atomic), then active_transactions
         txn.abort()?;
@@ -138,10 +158,12 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Retrieves an active transaction by ID.
     pub fn get_transaction(&self, txn_id: TransactionId) -> Option<Arc<Transaction>> {
         self.active_transactions.read().get(&txn_id).cloned()
     }
 
+    /// Returns the number of currently active transactions.
     pub fn active_count(&self) -> usize {
         self.active_transactions.read().len()
     }
@@ -166,6 +188,7 @@ impl TransactionManager {
 
 use dashmap::DashMap;
 
+/// Manages locks on database resources (e.g., tables).
 pub struct LockManager {
     // Per-table lock entries using lock-free DashMap
     // This eliminates the single global lock bottleneck
@@ -178,9 +201,12 @@ struct LockEntry {
     lock_type: LockType,
 }
 
+/// Types of locks available.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LockType {
+    /// Shared lock (allows concurrent readers).
     Shared,
+    /// Exclusive lock (single writer, no readers).
     Exclusive,
 }
 

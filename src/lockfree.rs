@@ -17,7 +17,7 @@ pub struct LockFreePageCache {
     /// Current size
     size: AtomicUsize,
     /// Cache entries: page_id -> cached page
-    /// Using Arc<RwLock> for the HashMap as a pragmatic hybrid approach
+    /// Using `Arc<RwLock>` for the HashMap as a pragmatic hybrid approach
     /// The HashMap itself is behind a lock, but individual operations are fast
     entries: Arc<RwLock<HashMap<PageId, Arc<CachedPage>>>>,
     /// LRU tracking queue (lock-free)
