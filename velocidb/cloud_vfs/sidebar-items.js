@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["CloudPrefetcher","CloudVfs","CloudVfsConfig"]};

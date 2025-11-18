@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CACHE_SIZE","PAGE_SIZE"],"struct":["Database","Page","Pager","Schema","TableSchema"]};

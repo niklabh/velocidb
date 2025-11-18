@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"static":["GLOBAL_TXN_ID"],"struct":["MvccManager","MvccStats","RecordVersion","Snapshot","VersionInfo","VersionedRecord"],"type":["Timestamp"]};

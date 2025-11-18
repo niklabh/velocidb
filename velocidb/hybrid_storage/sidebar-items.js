@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["StorageLayout"],"struct":["ColumnStorage","HybridTable","RowRecord","TableStats"]};

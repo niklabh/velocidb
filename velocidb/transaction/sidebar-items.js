@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["LockType","TransactionState"],"struct":["LockEntry","LockManager","Transaction","TransactionManager"]};

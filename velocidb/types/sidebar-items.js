@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DataType","Value","VelociError"],"struct":["Column","QueryResult","Row"],"type":["PageId","Result","TransactionId"]};
