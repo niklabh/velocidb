@@ -2,9 +2,15 @@
 name = "velocidb"
 version = "0.1.0"
 edition = "2021"
-authors = ["VelociDB Contributors"]
+authors = ["Nikhil Ranjan <niklabh811@gmail.com>"]
 description = "A high-performance SQLite reimplementation in Rust optimized for modern hardware"
 license = "MIT"
+repository = "https://github.com/niklabh/velocidb"
+homepage = "https://niklabh.github.io/velocidb/"
+documentation = "https://docs.rs/velocidb"
+readme = "README.md"
+keywords = ["database", "sqlite", "embedded", "async", "mvcc"]
+categories = ["database-implementations", "embedded", "asynchronous"]
 
 [dependencies]
 parking_lot = "0.12"

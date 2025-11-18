@@ -18,6 +18,7 @@ A next-generation embedded database with modern architecture: MVCC, async I/O, S
 - **[Development Journey](docs/development_journey.md)**: The story behind our design choices.
 - **[REPL Usage](docs/repl_usage.md)**: Guide to the interactive shell.
 - **[Contributing](docs/contributing.md)**: How to get involved.
+- **[Publishing](docs/publishing.md)**: Guide to publishing on crates.io.
 
 ## 🚀 Quick Start
 
