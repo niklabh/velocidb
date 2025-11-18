@@ -116,14 +116,25 @@ impl Executor {
         columns: Option<Vec<String>>,
         values: Vec<Value>,
     ) -> Result<()> {
+        // LOCK ORDERING (Safe):
+        // 1. TransactionManager (begin - Level 1)
+        // 2. LockManager (table lock - Level 2)
+        // 3. Schema (read - Level 1, but released quickly)
+        // 4. BTree (write - Level 3, acquired once)
+        // 5. TransactionManager (commit - Level 1)
+        
         // Start transaction
         let txn = self.transaction_manager.begin();
+        
+        // Acquire table-level lock early
         self.lock_manager
             .acquire_lock(table, txn.id(), LockType::Exclusive)?;
 
-        // Get table schema
-        let schema = self.schema.read();
-        let table_schema = schema.get_table(table)?;
+        // Get table schema and immediately clone to release lock
+        let table_schema = {
+            let schema = self.schema.read();
+            schema.get_table(table)?.clone()
+        }; // schema lock released here
 
         // Validate columns and values
         let column_names = if let Some(ref cols) = columns {
@@ -137,6 +148,7 @@ impl Executor {
         };
 
         if column_names.len() != values.len() {
+            self.lock_manager.release_lock(table, txn.id())?;
             return Err(VelociError::ConstraintViolation(
                 "Column count doesn't match value count".to_string(),
             ));
@@ -159,27 +171,12 @@ impl Executor {
 
         let pk_value = values[pk_value_index].as_integer()?;
 
-        // Check for primary key uniqueness
-        let btrees = self.btrees.read();
-        let btree_arc = btrees.get(table).ok_or_else(|| {
-            VelociError::NotFound(format!("Table '{}' not initialized", table))
-        })?;
-        let btree = btree_arc.read();
-
-        if btree.search(pk_value)?.is_some() {
-            return Err(VelociError::ConstraintViolation(format!(
-                "Primary key {} already exists in table '{}'",
-                pk_value, table
-            )));
-        }
-        drop(btree);
-        drop(btrees);
-
-        // Validate NOT NULL constraints
+        // Validate NOT NULL constraints before acquiring BTree lock
         for (i, value) in values.iter().enumerate() {
             let col_name = &column_names[i];
             if let Some(col) = table_schema.columns.iter().find(|c| &c.name == col_name) {
                 if col.not_null && matches!(value, Value::Null) {
+                    self.lock_manager.release_lock(table, txn.id())?;
                     return Err(VelociError::ConstraintViolation(format!(
                         "Column '{}' cannot be NULL", col_name
                     )));
@@ -187,27 +184,46 @@ impl Executor {
             }
         }
 
-        // Create a row with all columns (fill missing with NULL)
+        // Create row data
         let mut row_values = vec![Value::Null; table_schema.columns.len()];
         for (i, col_name) in column_names.iter().enumerate() {
             if let Some(col_index) = table_schema.columns.iter().position(|c| &c.name == col_name) {
                 row_values[col_index] = values[i].clone();
             }
         }
-
         let row = Row::new(row_values);
 
-        // Get or create B-Tree
-        let btrees = self.btrees.read();
-        let btree_arc = btrees.get(table).ok_or_else(|| {
-            VelociError::NotFound(format!("Table '{}' not initialized", table))
-        })?;
-        let mut btree = btree_arc.write();
+        // Single acquisition of btrees collection and btree with write intent
+        // No lock upgrade, no multiple acquisitions
+        let result = {
+            let btrees = self.btrees.read();
+            let btree_arc = btrees.get(table).ok_or_else(|| {
+                VelociError::NotFound(format!("Table '{}' not initialized", table))
+            })?;
+            
+            // Acquire write lock directly (no upgrade from read)
+            let mut btree = btree_arc.write();
+            
+            // Check for primary key uniqueness
+            if btree.search(pk_value)?.is_some() {
+                return Err(VelociError::ConstraintViolation(format!(
+                    "Primary key {} already exists in table '{}'",
+                    pk_value, table
+                )));
+            }
 
-        // Insert into B-Tree
-        btree.insert(pk_value, &row)?;
+            // Insert into B-Tree
+            btree.insert(pk_value, &row)
+        }; // btrees and btree locks released here
 
-        // Commit transaction
+        // Handle result
+        if let Err(e) = result {
+            self.lock_manager.release_lock(table, txn.id())?;
+            self.transaction_manager.abort(&txn)?;
+            return Err(e);
+        }
+
+        // Commit transaction and release locks
         self.transaction_manager.commit(&txn)?;
         self.lock_manager.release_lock(table, txn.id())?;
 
@@ -220,30 +236,38 @@ impl Executor {
         columns: Vec<String>,
         where_clause: Option<WhereClause>,
     ) -> Result<QueryResult> {
-        // Start transaction
+        // LOCK ORDERING (Safe):
+        // 1. TransactionManager (begin)
+        // 2. LockManager (shared lock on table)
+        // 3. Schema (read, then release)
+        // 4. BTree (read, single acquisition)
+        // 5. TransactionManager (commit)
+        
         let txn = self.transaction_manager.begin();
         self.lock_manager
             .acquire_lock(table, txn.id(), LockType::Shared)?;
 
-        // Get table schema
-        let schema = self.schema.read();
-        let table_schema = schema.get_table(table)?;
+        // Get table schema and release lock immediately
+        let table_schema = {
+            let schema = self.schema.read();
+            schema.get_table(table)?.clone()
+        }; // schema lock released
 
-        // Get B-Tree
-        let btrees = self.btrees.read();
-        let btree_arc = btrees.get(table).ok_or_else(|| {
-            VelociError::NotFound(format!("Table '{}' not initialized", table))
-        })?;
-        let btree = btree_arc.read();
+        // Scan rows with minimal lock scope
+        let all_rows = {
+            let btrees = self.btrees.read();
+            let btree_arc = btrees.get(table).ok_or_else(|| {
+                VelociError::NotFound(format!("Table '{}' not initialized", table))
+            })?;
+            let btree = btree_arc.read();
+            btree.scan()?
+        }; // btrees and btree locks released
 
-        // Scan all rows
-        let all_rows = btree.scan()?;
-
-        // Filter rows based on WHERE clause
+        // Process data without holding any locks
         let filtered_rows: Vec<(i64, Row)> = if let Some(ref where_clause) = where_clause {
             all_rows
                 .into_iter()
-                .filter(|(_, row)| self.evaluate_where_clause(row, where_clause, table_schema).unwrap_or(false))
+                .filter(|(_, row)| self.evaluate_where_clause(row, where_clause, &table_schema).unwrap_or(false))
                 .collect()
         } else {
             all_rows
@@ -286,7 +310,7 @@ impl Executor {
             })
             .collect();
 
-        // Commit transaction
+        // Commit transaction and release locks
         self.transaction_manager.commit(&txn)?;
         self.lock_manager.release_lock(table, txn.id())?;
 
@@ -299,38 +323,39 @@ impl Executor {
         assignments: HashMap<String, Value>,
         where_clause: Option<WhereClause>,
     ) -> Result<()> {
-        // Start transaction
+        // LOCK ORDERING (Safe):
+        // Similar to execute_insert - acquire locks in order, release early
+        
         let txn = self.transaction_manager.begin();
         self.lock_manager
             .acquire_lock(table, txn.id(), LockType::Exclusive)?;
 
-        // Get table schema
-        let schema = self.schema.read();
-        let table_schema = schema.get_table(table)?;
+        // Get table schema and release lock
+        let table_schema = {
+            let schema = self.schema.read();
+            schema.get_table(table)?.clone()
+        }; // schema lock released
 
-        // Get B-Tree
-        let btrees = self.btrees.read();
-        let btree_arc = btrees.get(table).ok_or_else(|| {
-            VelociError::NotFound(format!("Table '{}' not initialized", table))
-        })?;
-        let mut btree = btree_arc.write();
+        // Perform update with single btree lock acquisition
+        let result = {
+            let btrees = self.btrees.read();
+            let btree_arc = btrees.get(table).ok_or_else(|| {
+                VelociError::NotFound(format!("Table '{}' not initialized", table))
+            })?;
+            let mut btree = btree_arc.write();
 
-        // Scan all rows
-        let all_rows = btree.scan()?;
+            // Scan all rows
+            let all_rows = btree.scan()?;
 
-        // Find rows to update
-        let rows_to_update: Vec<(i64, Row)> = if let Some(ref where_clause) = where_clause {
-            all_rows
-                .into_iter()
-                .filter(|(_, row)| self.evaluate_where_clause(row, where_clause, table_schema).unwrap_or(false))
-                .collect()
-        } else {
-            all_rows
-        };
-
-        // Update each row
-        for (key, row) in &rows_to_update {
-            let mut updated_row = row.clone();
+            // Find rows to update
+            let rows_to_update: Vec<(i64, Row)> = if let Some(ref where_clause) = where_clause {
+                all_rows
+                    .into_iter()
+                    .filter(|(_, row)| self.evaluate_where_clause(row, where_clause, &table_schema).unwrap_or(false))
+                    .collect()
+            } else {
+                all_rows
+            };
 
             // Find primary key column
             let pk_index = table_schema
@@ -339,46 +364,59 @@ impl Executor {
                 .position(|c| c.primary_key)
                 .ok_or_else(|| VelociError::ConstraintViolation("No primary key defined".to_string()))?;
 
-            let mut new_pk_value = *key; // Default to existing key
-            let mut pk_being_updated = false;
+            // Update each row
+            for (key, row) in &rows_to_update {
+                let mut updated_row = row.clone();
+                let mut new_pk_value = *key; // Default to existing key
+                let mut pk_being_updated = false;
 
-            // Apply updates to the row
-            for (col_name, new_value) in &assignments {
-                if let Some(col_index) = table_schema.columns.iter().position(|c| &c.name == col_name) {
-                    // Check NOT NULL constraint
-                    let col = &table_schema.columns[col_index];
-                    if col.not_null && matches!(new_value, Value::Null) {
+                // Apply updates to the row
+                for (col_name, new_value) in &assignments {
+                    if let Some(col_index) = table_schema.columns.iter().position(|c| &c.name == col_name) {
+                        // Check NOT NULL constraint
+                        let col = &table_schema.columns[col_index];
+                        if col.not_null && matches!(new_value, Value::Null) {
+                            return Err(VelociError::ConstraintViolation(format!(
+                                "Column '{}' cannot be NULL", col_name
+                            )));
+                        }
+
+                        updated_row.values[col_index] = new_value.clone();
+
+                        // Check if primary key is being updated
+                        if col_index == pk_index {
+                            new_pk_value = new_value.as_integer()?;
+                            pk_being_updated = true;
+                        }
+                    }
+                }
+
+                // If primary key is being updated, check for uniqueness
+                if pk_being_updated && new_pk_value != *key {
+                    if btree.search(new_pk_value)?.is_some() {
                         return Err(VelociError::ConstraintViolation(format!(
-                            "Column '{}' cannot be NULL", col_name
+                            "Primary key {} already exists in table '{}'",
+                            new_pk_value, table
                         )));
                     }
-
-                    updated_row.values[col_index] = new_value.clone();
-
-                    // Check if primary key is being updated
-                    if col_index == pk_index {
-                        new_pk_value = new_value.as_integer()?;
-                        pk_being_updated = true;
-                    }
                 }
-            }
 
-            // If primary key is being updated, check for uniqueness
-            if pk_being_updated && new_pk_value != *key {
-                if btree.search(new_pk_value)?.is_some() {
-                    return Err(VelociError::ConstraintViolation(format!(
-                        "Primary key {} already exists in table '{}'",
-                        new_pk_value, table
-                    )));
-                }
+                // Delete old row and insert updated row
+                btree.delete(*key)?;
+                btree.insert(new_pk_value, &updated_row)?;
             }
+            
+            Ok::<(), VelociError>(())
+        }; // btrees and btree locks released
 
-            // Delete old row and insert updated row
-            btree.delete(*key)?;
-            btree.insert(new_pk_value, &updated_row)?;
+        // Handle errors
+        if let Err(e) = result {
+            self.lock_manager.release_lock(table, txn.id())?;
+            self.transaction_manager.abort(&txn)?;
+            return Err(e);
         }
 
-        // Commit transaction
+        // Commit transaction and release locks
         self.transaction_manager.commit(&txn)?;
         self.lock_manager.release_lock(table, txn.id())?;
 
@@ -386,42 +424,57 @@ impl Executor {
     }
 
     fn execute_delete(&self, table: &str, where_clause: Option<WhereClause>) -> Result<()> {
-        // Start transaction
+        // LOCK ORDERING (Safe):
+        // Same pattern as other operations
+        
         let txn = self.transaction_manager.begin();
         self.lock_manager
             .acquire_lock(table, txn.id(), LockType::Exclusive)?;
 
-        // Get table schema
-        let schema = self.schema.read();
-        let table_schema = schema.get_table(table)?;
+        // Get table schema and release lock
+        let table_schema = {
+            let schema = self.schema.read();
+            schema.get_table(table)?.clone()
+        }; // schema lock released
 
-        // Get B-Tree
-        let btrees = self.btrees.read();
-        let btree_arc = btrees.get(table).ok_or_else(|| {
-            VelociError::NotFound(format!("Table '{}' not initialized", table))
-        })?;
-        let mut btree = btree_arc.write();
+        // Perform delete with single btree lock acquisition
+        let result = {
+            let btrees = self.btrees.read();
+            let btree_arc = btrees.get(table).ok_or_else(|| {
+                VelociError::NotFound(format!("Table '{}' not initialized", table))
+            })?;
+            let mut btree = btree_arc.write();
 
-        // Scan all rows
-        let all_rows = btree.scan()?;
+            // Scan all rows
+            let all_rows = btree.scan()?;
 
-        // Find rows to delete
-        let rows_to_delete: Vec<i64> = if let Some(ref where_clause) = where_clause {
-            all_rows
-                .into_iter()
-                .filter(|(_, row)| self.evaluate_where_clause(row, where_clause, table_schema).unwrap_or(false))
-                .map(|(key, _)| key)
-                .collect()
-        } else {
-            all_rows.into_iter().map(|(key, _)| key).collect()
-        };
+            // Find rows to delete
+            let rows_to_delete: Vec<i64> = if let Some(ref where_clause) = where_clause {
+                all_rows
+                    .into_iter()
+                    .filter(|(_, row)| self.evaluate_where_clause(row, where_clause, &table_schema).unwrap_or(false))
+                    .map(|(key, _)| key)
+                    .collect()
+            } else {
+                all_rows.into_iter().map(|(key, _)| key).collect()
+            };
 
-        // Delete each row
-        for key in rows_to_delete {
-            btree.delete(key)?;
+            // Delete each row
+            for key in rows_to_delete {
+                btree.delete(key)?;
+            }
+            
+            Ok::<(), VelociError>(())
+        }; // btrees and btree locks released
+
+        // Handle errors
+        if let Err(e) = result {
+            self.lock_manager.release_lock(table, txn.id())?;
+            self.transaction_manager.abort(&txn)?;
+            return Err(e);
         }
 
-        // Commit transaction
+        // Commit transaction and release locks
         self.transaction_manager.commit(&txn)?;
         self.lock_manager.release_lock(table, txn.id())?;
 

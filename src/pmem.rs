@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Bypasses kernel page cache for direct memory access
 pub struct DaxVfs {
     /// Memory-mapped file
-    mmap: Arc<RwLock<MmapMut>>,
+    mmap: Arc<RwLock<Option<MmapMut>>>,
     /// File path
     path: PathBuf,
     /// Number of pages
@@ -43,37 +43,39 @@ impl DaxVfs {
 
         let metadata = file.metadata()?;
         let file_size = metadata.len();
-
-        // Ensure minimum size
-        let min_size = PAGE_SIZE as u64;
-        if file_size < min_size {
-            file.set_len(min_size)?;
-        }
-
-        let actual_size = file.metadata()?.len();
+        let actual_size = file_size;
         let num_pages = (actual_size + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64;
 
-        // Create memory mapping
-        let mut mmap = unsafe {
-            MmapOptions::new()
-                .len(actual_size as usize)
-                .map_mut(&file)?
+        // Create memory mapping if file is not empty
+        let mmap = if actual_size > 0 {
+            let mut mmap = unsafe {
+                MmapOptions::new()
+                    .len(actual_size as usize)
+                    .map_mut(&file)?
+            };
+
+            // Advise kernel about usage pattern
+            #[cfg(target_os = "linux")]
+            {
+                use libc::{madvise, MADV_SEQUENTIAL, MADV_WILLNEED};
+                unsafe {
+                    madvise(
+                        mmap.as_mut_ptr() as *mut libc::c_void,
+                        mmap.len(),
+                        MADV_SEQUENTIAL | MADV_WILLNEED,
+                    );
+                }
+            }
+            Some(mmap)
+        } else {
+            None
         };
 
-        // Advise kernel about usage pattern
-        #[cfg(target_os = "linux")]
-        {
-            use libc::{madvise, MADV_SEQUENTIAL, MADV_WILLNEED};
-            unsafe {
-                madvise(
-                    mmap.as_mut_ptr() as *mut libc::c_void,
-                    mmap.len(),
-                    MADV_SEQUENTIAL | MADV_WILLNEED,
-                );
-            }
-        }
-
-        let base_addr = mmap.as_ptr() as u64;
+        let base_addr = if let Some(ref m) = mmap {
+            m.as_ptr() as u64
+        } else {
+            0
+        };
 
         Ok(Self {
             mmap: Arc::new(RwLock::new(mmap)),
@@ -91,7 +93,8 @@ impl DaxVfs {
             return Err(VelociError::NotFound(format!("Page {} out of bounds", page_id)));
         }
 
-        let mmap = self.mmap.read();
+        let mmap_guard = self.mmap.read();
+        let mmap = mmap_guard.as_ref().ok_or_else(|| VelociError::StorageError("Memory map not initialized".to_string()))?;
         let offset = page_id as usize * PAGE_SIZE;
         
         Ok(unsafe { mmap.as_ptr().add(offset) })
@@ -105,7 +108,8 @@ impl DaxVfs {
             return Err(VelociError::NotFound(format!("Page {} out of bounds", page_id)));
         }
 
-        let mut mmap = self.mmap.write();
+        let mut mmap_guard = self.mmap.write();
+        let mmap = mmap_guard.as_mut().ok_or_else(|| VelociError::StorageError("Memory map not initialized".to_string()))?;
         let offset = page_id as usize * PAGE_SIZE;
         
         Ok(unsafe { mmap.as_mut_ptr().add(offset) })
@@ -223,7 +227,7 @@ impl DaxVfs {
                 .map_mut(&file)?
         };
 
-        *self.mmap.write() = new_mmap;
+        *self.mmap.write() = Some(new_mmap);
         self.num_pages.store(new_size / PAGE_SIZE as u64, Ordering::Release);
 
         Ok(())
@@ -286,8 +290,10 @@ impl AsyncVfs for DaxVfs {
     }
 
     async fn sync(&self) -> Result<()> {
-        let mmap = self.mmap.read();
-        mmap.flush()?;
+        let mmap_guard = self.mmap.read();
+        if let Some(mmap) = mmap_guard.as_ref() {
+            mmap.flush()?;
+        }
         Ok(())
     }
 }

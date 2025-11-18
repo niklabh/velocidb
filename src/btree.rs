@@ -358,17 +358,14 @@ impl BTree {
             let (sibling_page_id, split_key) = self.split_leaf_node(pager, page_id)?;
             let new_root = self.insert_into_parent(pager, page_id, sibling_page_id, split_key)?;
 
-            // If a new root was created, return it immediately
-            if let Some(root_page_id) = new_root {
-                return Ok(Some(root_page_id));
+            // Insert into the appropriate leaf (could be original or sibling)
+            if key < split_key {
+                self.insert_into_leaf(pager, page_id, key, data)?;
+            } else {
+                self.insert_into_leaf(pager, sibling_page_id, key, data)?;
             }
 
-            // Otherwise, insert into the appropriate leaf (could be original or sibling)
-            if key < split_key {
-                return self.insert_into_leaf(pager, page_id, key, data);
-            } else {
-                return self.insert_into_leaf(pager, sibling_page_id, key, data);
-            }
+            return Ok(new_root);
         }
         
         // Make room for new entry
@@ -504,17 +501,7 @@ impl BTree {
             Some(self.create_new_root(pager, left_page, right_page, split_key)?)
         } else {
             // Insert into existing parent (may cause recursive splits and new root)
-            let result = self.insert_into_internal(pager, left_header.parent as u64, left_page, right_page, split_key)?;
-            
-            // Update right page parent pointer if no new root was created
-            if result.is_none() {
-                let right_page_data = pager.read_page(right_page)?;
-                let mut right_header = NodeHeader::deserialize(right_page_data.read().data())?;
-                right_header.parent = left_header.parent;
-                right_header.serialize(right_page_data.write().data_mut());
-            }
-            
-            result
+            self.insert_into_internal(pager, left_header.parent as u64, left_page, right_page, split_key)?
         };
 
         Ok(new_root)
@@ -564,6 +551,16 @@ impl BTree {
     }
 
     fn insert_into_internal(&self, pager: &mut Pager, page_id: PageId, left_page: PageId, right_page: PageId, key: i64) -> Result<Option<PageId>> {
+        // Update right_page parent pointer to this page
+        // We do this first so that if we split, the child already points to us (the left node),
+        // and if it moves to the sibling, the split logic will update it to the sibling.
+        {
+            let right_page_data = pager.read_page(right_page)?;
+            let mut right_header = NodeHeader::deserialize(right_page_data.read().data())?;
+            right_header.parent = page_id as u32;
+            right_header.serialize(right_page_data.write().data_mut());
+        }
+
         let page_arc = pager.read_page(page_id)?;
         let mut page = page_arc.read().clone();
         let mut header = NodeHeader::deserialize(page.data())?;
@@ -613,40 +610,110 @@ impl BTree {
         Ok(None)
     }
 
-    fn split_internal_node(&self, _pager: &mut Pager, _page_id: PageId, _left_page: PageId, _right_page: PageId, _key: i64) -> Result<Option<PageId>> {
-        // LIMITATION: Internal node splitting not fully implemented
-        //
-        // Internal node splitting is complex and requires careful handling of:
-        // 1. Child pointer redistribution across split nodes
-        // 2. Median key promotion to parent  
-        // 3. Recursive parent updates potentially creating new root
-        // 4. Maintaining B-tree invariants at all levels
-        //
-        // Current capacity: The tree can grow to BTREE_ORDER leaf nodes (64 leaves)
-        // before hitting this limit. With typical record sizes, this supports:
-        //
-        // Estimated capacity before hitting this limit:
-        // - ~4,096 records with small records (~100 bytes each)
-        // - ~2,000 records with medium records (~200 bytes each)
-        // - ~1,000 records with large records (~400 bytes each)
-        //
-        // For production use with larger datasets, consider:
-        // 1. Increasing BTREE_ORDER (e.g., to 128 or 256) in src/btree.rs:8
-        // 2. Implementing full internal node split support
-        // 3. Using an external index or sharding strategy
+    fn split_internal_node(&self, pager: &mut Pager, page_id: PageId, _left_page: PageId, right_page: PageId, key: i64) -> Result<Option<PageId>> {
+        // Read the current page
+        let page_arc = pager.read_page(page_id)?;
+        let page = page_arc.read().clone();
+        let header = NodeHeader::deserialize(page.data())?;
+
+        // Collect all keys and children
+        let mut keys = Vec::with_capacity(BTREE_ORDER + 1);
+        let mut children = Vec::with_capacity(BTREE_ORDER + 2);
+
+        let mut offset = NodeHeader::SIZE;
         
-        Err(VelociError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "B-Tree capacity limit reached: Internal node is full (BTREE_ORDER={}). \
-                 Maximum capacity is approximately {} leaf nodes or ~{} typical records. \
-                 To store more data, increase BTREE_ORDER in src/btree.rs or implement full internal node splitting. \
-                 See README.md for details.",
-                BTREE_ORDER,
-                BTREE_ORDER,
-                BTREE_ORDER * BTREE_ORDER / 2
-            )
-        )))
+        // First child
+        let first_child = u64::from_le_bytes(
+            page.data()[offset..offset + 8].try_into().map_err(|_| VelociError::Corruption("Invalid child".to_string()))?
+        ) as PageId;
+        children.push(first_child);
+        offset += 8;
+
+        for _ in 0..header.num_keys {
+            let k = i64::from_le_bytes(
+                page.data()[offset..offset + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?
+            );
+            keys.push(k);
+            
+            let c = u64::from_le_bytes(
+                page.data()[offset + 8..offset + 16].try_into().map_err(|_| VelociError::Corruption("Invalid child".to_string()))?
+            ) as PageId;
+            children.push(c);
+            
+            offset += 16;
+        }
+
+        // Find insertion point
+        let mut insert_idx = 0;
+        while insert_idx < keys.len() && keys[insert_idx] < key {
+            insert_idx += 1;
+        }
+
+        // Insert new key and child
+        keys.insert(insert_idx, key);
+        children.insert(insert_idx + 1, right_page);
+
+        // Split
+        let split_idx = keys.len() / 2;
+        let promoted_key = keys[split_idx];
+
+        // Create sibling page
+        let sibling_page_id = pager.allocate_page()?;
+        let mut sibling_page = Page::new();
+        let mut sibling_header = NodeHeader::new(NodeType::Internal);
+
+        // Right node data
+        let right_keys = &keys[split_idx + 1..];
+        let right_children = &children[split_idx + 1..];
+
+        sibling_header.num_keys = right_keys.len() as u16;
+        sibling_header.serialize(sibling_page.data_mut());
+
+        let mut offset = NodeHeader::SIZE;
+        sibling_page.data_mut()[offset..offset + 8].copy_from_slice(&(right_children[0] as u64).to_le_bytes());
+        offset += 8;
+
+        for i in 0..right_keys.len() {
+            sibling_page.data_mut()[offset..offset + 8].copy_from_slice(&right_keys[i].to_le_bytes());
+            sibling_page.data_mut()[offset + 8..offset + 16].copy_from_slice(&(right_children[i + 1] as u64).to_le_bytes());
+            offset += 16;
+        }
+
+        // Update parent pointers for children moved to sibling
+        for &child_id in right_children {
+            let child_page_arc = pager.read_page(child_id)?;
+            // We need to acquire a write lock on the child page to update its parent pointer
+            let mut child_page = child_page_arc.write();
+            let mut child_header = NodeHeader::deserialize(child_page.data())?;
+            child_header.parent = sibling_page_id as u32;
+            child_header.serialize(child_page.data_mut());
+        }
+
+        pager.write_page(sibling_page_id, &sibling_page)?;
+
+        // Update current (left) page
+        let left_keys = &keys[0..split_idx];
+        let left_children = &children[0..split_idx + 1];
+
+        let mut new_left_page = Page::new();
+        let mut new_left_header = header.clone();
+        new_left_header.num_keys = left_keys.len() as u16;
+        new_left_header.serialize(new_left_page.data_mut());
+
+        let mut offset = NodeHeader::SIZE;
+        new_left_page.data_mut()[offset..offset + 8].copy_from_slice(&(left_children[0] as u64).to_le_bytes());
+        offset += 8;
+
+        for i in 0..left_keys.len() {
+            new_left_page.data_mut()[offset..offset + 8].copy_from_slice(&left_keys[i].to_le_bytes());
+            new_left_page.data_mut()[offset + 8..offset + 16].copy_from_slice(&(left_children[i + 1] as u64).to_le_bytes());
+            offset += 16;
+        }
+
+        pager.write_page(page_id, &new_left_page)?;
+
+        // Insert promoted key into parent
+        self.insert_into_parent(pager, page_id, sibling_page_id, promoted_key)
     }
 
     fn serialize_row(&self, row: &Row) -> Result<Vec<u8>> {
@@ -801,39 +868,28 @@ mod tests {
     }
 
     #[test]
-    fn test_capacity_limit_error() {
-        // Test that we get a clear error when hitting the capacity limit
+    fn test_large_dataset() {
+        // Test that we can insert a large number of records (triggering multiple splits)
         let temp_file = NamedTempFile::new().unwrap();
         let pager = Arc::new(RwLock::new(Pager::new(temp_file.path()).unwrap()));
         let mut btree = BTree::new(pager).unwrap();
         
-        // Insert records until we hit the limit
-        // With BTREE_ORDER=64, we should be able to insert quite a few records
-        // before hitting the internal node split limit
-        let mut last_successful = 0;
-        for i in 0..200 {
+        // Insert 1000 records
+        for i in 0..1000 {
             let row = Row::new(vec![
                 Value::Integer(i),
                 Value::Text(format!("Record {}", i))
             ]);
-            match btree.insert(i, &row) {
-                Ok(_) => {
-                    last_successful = i;
-                }
-                Err(e) => {
-                    // Should get a clear error message about capacity limit
-                    let error_msg = format!("{:?}", e);
-                    assert!(error_msg.contains("capacity limit") || error_msg.contains("BTREE_ORDER"),
-                        "Expected clear capacity limit error, got: {}", error_msg);
-                    assert!(i > 50, "Should be able to insert more than 50 records");
-                    println!("Hit capacity limit after {} records (expected behavior)", last_successful);
-                    return;
-                }
-            }
+            btree.insert(i, &row).unwrap();
         }
         
-        // If we got here, we inserted 200 records successfully
-        assert!(last_successful >= 100, "Should support at least 100 records");
+        // Verify all records can be retrieved
+        for i in 0..1000 {
+            let result = btree.search(i).unwrap();
+            assert!(result.is_some(), "Failed to find record {}", i);
+            let row = result.unwrap();
+            assert_eq!(row.values.len(), 2);
+        }
     }
 
     #[test]

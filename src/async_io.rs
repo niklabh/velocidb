@@ -120,6 +120,7 @@ impl AsyncVfs for TokioVfs {
 
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         file.write_all(page.data()).await?;
+        file.flush().await?;
 
         // Update page count
         let mut num_pages = self.num_pages.write();

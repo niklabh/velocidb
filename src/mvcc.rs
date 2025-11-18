@@ -187,14 +187,29 @@ impl Snapshot {
 }
 
 /// MVCC Manager coordinates snapshot isolation and version management
+///
+/// LOCK ORDERING (STRICT):
+/// 1. active_snapshots (Level 1 - Transaction metadata)
+/// 2. committed_transactions (Level 2 - Transaction history)
+/// 3. version_store (Level 3 - Data)
+///
+/// NEVER acquire in reverse order to prevent deadlocks
+///
+/// IMPROVEMENTS:
+/// - Use DashMap for version_store to enable per-table concurrency
+/// - Atomic timestamp management
+/// - Consistent lock ordering enforced throughout
 pub struct MvccManager {
     /// Current timestamp (monotonically increasing)
     current_timestamp: AtomicU64,
     /// Active transactions and their snapshots
+    /// LOCK LEVEL 1: Acquire this first if needed with other locks
     active_snapshots: Arc<RwLock<HashMap<TransactionId, Snapshot>>>,
     /// Version store: maps table_name -> key -> versioned record
-    version_store: Arc<RwLock<HashMap<String, BTreeMap<i64, VersionedRecord>>>>,
+    /// LOCK LEVEL 3: Acquire this last, per-table locking via DashMap
+    version_store: Arc<dashmap::DashMap<String, Arc<RwLock<BTreeMap<i64, VersionedRecord>>>>>,
     /// Committed transaction timestamps for visibility
+    /// LOCK LEVEL 2: Acquire after active_snapshots, before version_store
     committed_transactions: Arc<RwLock<BTreeMap<TransactionId, Timestamp>>>,
 }
 
@@ -203,7 +218,7 @@ impl MvccManager {
         Self {
             current_timestamp: AtomicU64::new(1),
             active_snapshots: Arc::new(RwLock::new(HashMap::new())),
-            version_store: Arc::new(RwLock::new(HashMap::new())),
+            version_store: Arc::new(dashmap::DashMap::new()),
             committed_transactions: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
@@ -213,15 +228,13 @@ impl MvccManager {
         let txn_id = GLOBAL_TXN_ID.fetch_add(1, Ordering::SeqCst);
         let timestamp = self.current_timestamp.fetch_add(1, Ordering::SeqCst);
 
+        // LOCK ORDERING: Only acquire active_snapshots (Level 1)
         // Get list of currently active transactions
-        let active_transactions: Vec<TransactionId> = self
-            .active_snapshots
-            .read()
-            .keys()
-            .copied()
-            .collect();
-
-        let snapshot = Snapshot::new(timestamp, txn_id, active_transactions);
+        let snapshot = {
+            let snapshots = self.active_snapshots.read();
+            let active_transactions: Vec<TransactionId> = snapshots.keys().copied().collect();
+            Snapshot::new(timestamp, txn_id, active_transactions)
+        }; // Release read lock
 
         // Register this snapshot as active
         self.active_snapshots.write().insert(txn_id, snapshot.clone());
@@ -233,12 +246,15 @@ impl MvccManager {
     pub fn commit_transaction(&self, snapshot: &Snapshot) -> Result<()> {
         let commit_timestamp = self.current_timestamp.fetch_add(1, Ordering::SeqCst);
 
-        // Record commit timestamp
+        // LOCK ORDERING: Level 1 (active_snapshots) → Level 2 (committed_transactions)
+        // This is consistent and safe
+        
+        // First update committed_transactions (Level 2)
         self.committed_transactions
             .write()
             .insert(snapshot.txn_id, commit_timestamp);
 
-        // Remove from active snapshots
+        // Then update active_snapshots (Level 1)
         self.active_snapshots.write().remove(&snapshot.txn_id);
 
         Ok(())
@@ -246,7 +262,7 @@ impl MvccManager {
 
     /// Abort a transaction
     pub fn abort_transaction(&self, snapshot: &Snapshot) -> Result<()> {
-        // Remove from active snapshots
+        // LOCK ORDERING: Only acquire active_snapshots (Level 1)
         self.active_snapshots.write().remove(&snapshot.txn_id);
 
         // TODO: Rollback any changes made by this transaction
@@ -266,10 +282,14 @@ impl MvccManager {
         let created_at = self.current_timestamp.load(Ordering::SeqCst);
         let version = RecordVersion::new(snapshot.txn_id, created_at, data);
 
-        let mut store = self.version_store.write();
-        let table_store = store.entry(table_name.to_string()).or_insert_with(BTreeMap::new);
-
-        let record = table_store.entry(key).or_insert_with(|| VersionedRecord::new(key));
+        // LOCK ORDERING: Only acquire version_store (Level 3 - Data)
+        // Per-table locking via DashMap reduces contention
+        let table_store = self.version_store
+            .entry(table_name.to_string())
+            .or_insert_with(|| Arc::new(RwLock::new(BTreeMap::new())));
+        
+        let mut table_map = table_store.write();
+        let record = table_map.entry(key).or_insert_with(|| VersionedRecord::new(key));
         record.add_version(version);
 
         Ok(())
@@ -282,11 +302,10 @@ impl MvccManager {
         key: i64,
         snapshot: &Snapshot,
     ) -> Result<Option<Vec<Value>>> {
-        let store = self.version_store.read();
-        let table_store = store.get(table_name);
-
-        if let Some(table_store) = table_store {
-            if let Some(record) = table_store.get(&key) {
+        // LOCK ORDERING: Only acquire version_store (Level 3)
+        if let Some(table_store) = self.version_store.get(table_name) {
+            let table_map = table_store.read();
+            if let Some(record) = table_map.get(&key) {
                 if let Some(version) = record.get_visible_version(snapshot) {
                     return Ok(Some(version.data.clone()));
                 }
@@ -305,11 +324,10 @@ impl MvccManager {
     ) -> Result<()> {
         let deleted_at = self.current_timestamp.fetch_add(1, Ordering::SeqCst);
 
-        let mut store = self.version_store.write();
-        let table_store = store.get_mut(table_name);
-
-        if let Some(table_store) = table_store {
-            if let Some(record) = table_store.get_mut(&key) {
+        // LOCK ORDERING: Only acquire version_store (Level 3)
+        if let Some(table_store) = self.version_store.get(table_name) {
+            let mut table_map = table_store.write();
+            if let Some(record) = table_map.get_mut(&key) {
                 record.mark_deleted(snapshot.txn_id, deleted_at)?;
                 return Ok(());
             }
@@ -324,13 +342,12 @@ impl MvccManager {
         table_name: &str,
         snapshot: &Snapshot,
     ) -> Result<Vec<(i64, Vec<Value>)>> {
-        let store = self.version_store.read();
-        let table_store = store.get(table_name);
-
-        if let Some(table_store) = table_store {
+        // LOCK ORDERING: Only acquire version_store (Level 3)
+        if let Some(table_store) = self.version_store.get(table_name) {
+            let table_map = table_store.read();
             let mut results = Vec::new();
 
-            for (key, record) in table_store.iter() {
+            for (key, record) in table_map.iter() {
                 if let Some(version) = record.get_visible_version(snapshot) {
                     results.push((*key, version.data.clone()));
                 }
@@ -344,40 +361,51 @@ impl MvccManager {
 
     /// Vacuum old versions (garbage collection)
     /// Should be called periodically by a background thread
+    /// 
+    /// LOCK ORDERING (STRICT):
+    /// 1. active_snapshots (read) - Level 1
+    /// 2. committed_transactions (write) - Level 2  
+    /// 3. version_store (write per table) - Level 3
     pub fn vacuum(&self) {
-        // Find the oldest active transaction timestamp
-        let min_active_timestamp = self
-            .active_snapshots
-            .read()
-            .values()
-            .map(|s| s.timestamp)
-            .min()
-            .unwrap_or(self.current_timestamp.load(Ordering::SeqCst));
+        // STEP 1: Get minimum active timestamp (Level 1 - read only)
+        let min_active_timestamp = {
+            let snapshots = self.active_snapshots.read();
+            snapshots
+                .values()
+                .map(|s| s.timestamp)
+                .min()
+                .unwrap_or(self.current_timestamp.load(Ordering::SeqCst))
+        }; // Release Level 1 lock
 
-        // Clean up old versions in all tables
-        let mut store = self.version_store.write();
-        for table_store in store.values_mut() {
-            for record in table_store.values_mut() {
+        // STEP 2: Clean up committed transactions (Level 2)
+        {
+            let mut committed = self.committed_transactions.write();
+            committed.retain(|_, &mut ts| ts >= min_active_timestamp);
+        } // Release Level 2 lock
+
+        // STEP 3: Clean up version store (Level 3) - per-table locking
+        for table_entry in self.version_store.iter() {
+            let mut table_map = table_entry.value().write();
+            for record in table_map.values_mut() {
                 record.vacuum(min_active_timestamp);
             }
-        }
-
-        // Clean up old committed transaction records
-        let mut committed = self.committed_transactions.write();
-        committed.retain(|_, &mut ts| ts >= min_active_timestamp);
+        } // Locks released automatically per table
     }
 
     /// Get statistics about the MVCC system
+    /// LOCK ORDERING: Level 1 (active_snapshots) → Level 3 (version_store)
     pub fn get_stats(&self) -> MvccStats {
+        // Level 1: Active snapshots
         let active_snapshots = self.active_snapshots.read().len();
-        let store = self.version_store.read();
 
+        // Level 3: Version store (per-table)
         let mut total_records = 0;
         let mut total_versions = 0;
 
-        for table_store in store.values() {
-            total_records += table_store.len();
-            for record in table_store.values() {
+        for table_entry in self.version_store.iter() {
+            let table_map = table_entry.value().read();
+            total_records += table_map.len();
+            for record in table_map.values() {
                 total_versions += record.versions.len();
             }
         }

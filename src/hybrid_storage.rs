@@ -227,7 +227,8 @@ impl HybridTable {
             .ok_or_else(|| VelociError::NotFound(format!("Column {} not found", column_name)))?;
 
         let row_store = self.row_store.read();
-        let rows: Vec<_> = row_store.values().collect();
+        let mut rows: Vec<_> = row_store.values().collect();
+        rows.sort_by_key(|r| r.key);
 
         // Determine column type from first non-null value
         let first_value = rows.iter()
