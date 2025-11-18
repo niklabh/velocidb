@@ -13,13 +13,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Prepare custom header
-        run: echo '<meta http-equiv="refresh" content="0;url=velocidb/index.html">' > header.html
-
       - name: Build Documentation
         run: cargo doc --no-deps --document-private-items
-        env:
-          RUSTDOCFLAGS: --html-in-header header.html
         
       - name: Create Root Redirect
         run: echo '<meta http-equiv="refresh" content="0;url=velocidb/index.html">' > target/doc/index.html
