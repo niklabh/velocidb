@@ -500,7 +500,7 @@ async-trait = "0.1"
 ```toml
 crossbeam-queue = "0.3"
 crossbeam-utils = "0.8"
-lockfree = "0.5"
+lock_freedom = "0.1"
 ```
 
 ### SIMD & Performance
