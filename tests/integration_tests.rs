@@ -2,7 +2,7 @@
 
 use tempfile::NamedTempFile;
 use velocidb::storage::Database;
-use velocidb::types::QueryResult;
+use velocidb::types::{QueryResult, Value};
 use std::sync::Arc;
 
 struct TestDb {
@@ -247,6 +247,70 @@ fn test_error_handling() {
     // Table not found
     let result = db.db.query("SELECT * FROM non_existent_table");
     assert!(result.is_err());
+}
+
+#[test]
+fn test_where_with_and() {
+    let db = TestDb::new();
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)");
+    db.execute("INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)");
+    db.execute("INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)");
+    db.execute("INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 35)");
+    db.execute("INSERT INTO users (id, name, age) VALUES (4, 'Diana', 28)");
+
+    // Multiple conditions with AND
+    let result = db.query("SELECT * FROM users WHERE age > 25 AND age < 35");
+    assert_eq!(result.rows.len(), 2); // Alice (30) and Diana (28)
+}
+
+#[test]
+fn test_count_star() {
+    let db = TestDb::new();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, val INTEGER)");
+    db.execute("INSERT INTO items (id, val) VALUES (1, 10)");
+    db.execute("INSERT INTO items (id, val) VALUES (2, 20)");
+    db.execute("INSERT INTO items (id, val) VALUES (3, 30)");
+
+    let result = db.query("SELECT COUNT(*) FROM items");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].values[0], Value::Integer(3));
+
+    // COUNT with WHERE
+    let result = db.query("SELECT COUNT(*) FROM items WHERE val > 15");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].values[0], Value::Integer(2));
+}
+
+#[test]
+fn test_insert_text_with_commas() {
+    let db = TestDb::new();
+    db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, content TEXT)");
+    db.execute("INSERT INTO notes (id, content) VALUES (1, 'Hello, World')");
+
+    let result = db.query("SELECT * FROM notes WHERE id = 1");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].values[1], Value::Text("Hello, World".to_string()));
+}
+
+#[test]
+fn test_large_dataset_with_splits() {
+    // Test that scan works correctly after B-Tree splits
+    let db = TestDb::new();
+    db.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, val INTEGER)");
+
+    for i in 0..200 {
+        db.execute(&format!("INSERT INTO data (id, val) VALUES ({}, {})", i, i * 3));
+    }
+
+    let result = db.query("SELECT * FROM data");
+    assert_eq!(result.rows.len(), 200);
+
+    let result = db.query("SELECT COUNT(*) FROM data");
+    assert_eq!(result.rows[0].values[0], Value::Integer(200));
+
+    let result = db.query("SELECT COUNT(*) FROM data WHERE val > 300");
+    // val > 300 means id > 100, so ids 101..199 = 99 rows
+    assert_eq!(result.rows[0].values[0], Value::Integer(99));
 }
 
 

@@ -200,20 +200,20 @@ impl Executor {
             let btree_arc = btrees.get(table).ok_or_else(|| {
                 VelociError::NotFound(format!("Table '{}' not initialized", table))
             })?;
-            
+
             // Acquire write lock directly (no upgrade from read)
             let mut btree = btree_arc.write();
-            
+
             // Check for primary key uniqueness
             if btree.search(pk_value)?.is_some() {
-                return Err(VelociError::ConstraintViolation(format!(
+                Err(VelociError::ConstraintViolation(format!(
                     "Primary key {} already exists in table '{}'",
                     pk_value, table
-                )));
+                )))
+            } else {
+                // Insert into B-Tree
+                btree.insert(pk_value, &row)
             }
-
-            // Insert into B-Tree
-            btree.insert(pk_value, &row)
         }; // btrees and btree locks released here
 
         // Handle result
@@ -272,6 +272,27 @@ impl Executor {
         } else {
             all_rows
         };
+
+        // Check for aggregate functions (COUNT)
+        let is_count = columns.len() == 1
+            && columns[0].to_uppercase().starts_with("COUNT(");
+
+        if is_count {
+            let count = filtered_rows.len() as i64;
+            let result_columns = vec![Column {
+                name: columns[0].clone(),
+                data_type: crate::types::DataType::Integer,
+                primary_key: false,
+                not_null: true,
+                unique: false,
+            }];
+            let result_rows = vec![Row::new(vec![Value::Integer(count)])];
+
+            self.transaction_manager.commit(&txn)?;
+            self.lock_manager.release_lock(table, txn.id())?;
+
+            return Ok(QueryResult::new(result_columns, result_rows));
+        }
 
         // Project columns
         let result_columns = if columns.len() == 1 && columns[0] == "*" {

@@ -284,6 +284,7 @@ impl Database {
             offset += 4;
 
             let mut columns = Vec::new();
+            let mut table_root_page: u64 = 0;
             for _ in 0..num_cols {
                 if offset + 13 > data.len() {
                     break;
@@ -320,6 +321,11 @@ impl Database {
                 let root_page = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap_or([0, 0, 0, 0, 0, 0, 0, 0]));
                 offset += 8;
 
+                // Use the first non-zero root_page as the table's root page
+                if table_root_page == 0 && root_page != 0 {
+                    table_root_page = root_page;
+                }
+
                 columns.push(crate::types::Column {
                     name: col_name,
                     data_type,
@@ -327,33 +333,33 @@ impl Database {
                     not_null,
                     unique,
                 });
-
-                // Create B-Tree for this table
-                let btree_root = if root_page == 0 {
-                    // Root page is invalid, create a new properly initialized B-Tree
-                    let mut pager = self.pager.write();
-                    let new_root_page = pager.allocate_page()?;
-
-                    // Initialize as B-Tree leaf node
-                    let mut page = crate::storage::Page::new();
-                    let header = crate::btree::NodeHeader::new_leaf();
-                    header.serialize(page.data_mut());
-                    pager.write_page(new_root_page, &page)?;
-
-                    new_root_page
-                } else {
-                    root_page
-                };
-
-                let btree = crate::btree::BTree::from_root(btree_root, Arc::clone(&self.pager));
-                self.btrees.write().insert(table_name.clone(), Arc::new(RwLock::new(btree)));
             }
+
+            // Create B-Tree for this table (once per table, not per column)
+            let btree_root = if table_root_page == 0 {
+                // Root page is invalid, create a new properly initialized B-Tree
+                let mut pager = self.pager.write();
+                let new_root_page = pager.allocate_page()?;
+
+                // Initialize as B-Tree leaf node
+                let mut page = crate::storage::Page::new();
+                let header = crate::btree::NodeHeader::new_leaf();
+                header.serialize(page.data_mut());
+                pager.write_page(new_root_page, &page)?;
+
+                new_root_page
+            } else {
+                table_root_page
+            };
+
+            let btree = crate::btree::BTree::from_root(btree_root, Arc::clone(&self.pager));
+            self.btrees.write().insert(table_name.clone(), Arc::new(RwLock::new(btree)));
 
             // Add table to schema
             let table_schema = TableSchema {
                 name: table_name,
                 columns,
-                root_page: 0, // Will be set by individual columns
+                root_page: btree_root,
             };
             self.schema.write().create_table(table_schema)?;
         }
