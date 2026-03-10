@@ -72,27 +72,71 @@ impl Operator {
     }
 
     pub fn evaluate(&self, left: &Value, right: &Value) -> Result<bool> {
+        // SQL NULL semantics: any comparison involving NULL returns false
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(false);
+        }
+
         match (self, left, right) {
+            // Integer comparisons
             (Operator::Equal, Value::Integer(a), Value::Integer(b)) => Ok(a == b),
             (Operator::NotEqual, Value::Integer(a), Value::Integer(b)) => Ok(a != b),
             (Operator::GreaterThan, Value::Integer(a), Value::Integer(b)) => Ok(a > b),
             (Operator::LessThan, Value::Integer(a), Value::Integer(b)) => Ok(a < b),
             (Operator::GreaterThanOrEqual, Value::Integer(a), Value::Integer(b)) => Ok(a >= b),
             (Operator::LessThanOrEqual, Value::Integer(a), Value::Integer(b)) => Ok(a <= b),
-            
+
+            // Float/Real comparisons (at least one operand is Float/Real)
+            (op, left, right) if matches!((left, right),
+                (Value::Float(_) | Value::Real(_) | Value::Integer(_),
+                 Value::Float(_) | Value::Real(_) | Value::Integer(_))
+            ) && (!matches!(left, Value::Integer(_)) || !matches!(right, Value::Integer(_))) => {
+                let a = left.as_float().map_err(|_| VelociError::TypeMismatch {
+                    expected: "numeric".to_string(), actual: format!("{:?}", left),
+                })?;
+                let b = right.as_float().map_err(|_| VelociError::TypeMismatch {
+                    expected: "numeric".to_string(), actual: format!("{:?}", right),
+                })?;
+                match op {
+                    Operator::Equal => Ok(a == b),
+                    Operator::NotEqual => Ok(a != b),
+                    Operator::GreaterThan => Ok(a > b),
+                    Operator::LessThan => Ok(a < b),
+                    Operator::GreaterThanOrEqual => Ok(a >= b),
+                    Operator::LessThanOrEqual => Ok(a <= b),
+                    Operator::Like => Err(VelociError::ParseError("LIKE not supported for numeric types".to_string())),
+                }
+            }
+
+            // Text comparisons
             (Operator::Equal, Value::Text(a), Value::Text(b)) => Ok(a == b),
             (Operator::NotEqual, Value::Text(a), Value::Text(b)) => Ok(a != b),
+            (Operator::GreaterThan, Value::Text(a), Value::Text(b)) => Ok(a > b),
+            (Operator::LessThan, Value::Text(a), Value::Text(b)) => Ok(a < b),
+            (Operator::GreaterThanOrEqual, Value::Text(a), Value::Text(b)) => Ok(a >= b),
+            (Operator::LessThanOrEqual, Value::Text(a), Value::Text(b)) => Ok(a <= b),
             (Operator::Like, Value::Text(a), Value::Text(pattern)) => {
-                let regex_pattern = pattern
-                    .replace("%", ".*")
-                    .replace("_", ".");
-                let regex = Regex::new(&format!("^{}$", regex_pattern))
+                // Convert SQL LIKE pattern to regex character by character
+                let mut regex_pattern = String::from("^");
+                for ch in pattern.chars() {
+                    match ch {
+                        '%' => regex_pattern.push_str(".*"),
+                        '_' => regex_pattern.push('.'),
+                        // Escape regex metacharacters
+                        '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']'
+                        | '{' | '}' | '|' | '^' | '$' | '\\' => {
+                            regex_pattern.push('\\');
+                            regex_pattern.push(ch);
+                        }
+                        _ => regex_pattern.push(ch),
+                    }
+                }
+                regex_pattern.push('$');
+                let regex = Regex::new(&regex_pattern)
                     .map_err(|e| VelociError::ParseError(format!("Invalid LIKE pattern: {}", e)))?;
                 Ok(regex.is_match(a))
             }
-            
-            (Operator::Equal, Value::Null, Value::Null) => Ok(true),
-            (Operator::NotEqual, Value::Null, _) | (Operator::NotEqual, _, Value::Null) => Ok(true),
+
             _ => Err(VelociError::TypeMismatch {
                 expected: format!("{:?}", right),
                 actual: format!("{:?}", left),
@@ -258,7 +302,8 @@ impl Parser {
     fn parse_select(&self, sql: &str) -> Result<Statement> {
         // SELECT * FROM users WHERE age > 25
         // SELECT id, name FROM users
-        
+        // SELECT COUNT(*) FROM users
+
         let re = Regex::new(r"(?i)SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?")
             .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
 
@@ -269,6 +314,8 @@ impl Parser {
         let columns_str = captures.get(1).unwrap().as_str().trim();
         let columns = if columns_str == "*" {
             vec!["*".to_string()]
+        } else if columns_str.to_uppercase().starts_with("COUNT(") {
+            vec![columns_str.to_string()]
         } else {
             columns_str
                 .split(',')
@@ -357,36 +404,115 @@ impl Parser {
     }
 
     fn parse_where_clause(&self, clause: &str) -> Result<WhereClause> {
-        // Simple WHERE clause parser - supports single conditions for now
-        // age > 25
-        // name = 'Alice'
-        
+        // Split on AND (case-insensitive), respecting quoted strings
+        let parts = self.split_on_and(clause);
+        let mut conditions = Vec::new();
+
         let re = Regex::new(r"(\w+)\s*(>=|<=|!=|<>|LIKE|=|>|<)\s*(.+)")
             .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
 
-        let captures = re
-            .captures(clause)
-            .ok_or_else(|| VelociError::ParseError(format!("Invalid WHERE clause: {}", clause)))?;
+        for part in &parts {
+            let part = part.trim();
+            let captures = re
+                .captures(part)
+                .ok_or_else(|| VelociError::ParseError(format!("Invalid WHERE condition: {}", part)))?;
 
-        let column = captures.get(1).unwrap().as_str().to_string();
-        let operator_str = captures.get(2).unwrap().as_str();
-        let operator = Operator::from_str(operator_str)?;
-        let value = self.parse_value(captures.get(3).unwrap().as_str())?;
+            let column = captures.get(1).unwrap().as_str().to_string();
+            let operator_str = captures.get(2).unwrap().as_str();
+            let operator = Operator::from_str(operator_str)?;
+            let value = self.parse_value(captures.get(3).unwrap().as_str().trim())?;
 
-        Ok(WhereClause {
-            conditions: vec![Condition {
+            conditions.push(Condition {
                 column,
                 operator,
                 value,
-            }],
-        })
+            });
+        }
+
+        if conditions.is_empty() {
+            return Err(VelociError::ParseError(format!("Empty WHERE clause: {}", clause)));
+        }
+
+        Ok(WhereClause { conditions })
+    }
+
+    fn split_on_and(&self, clause: &str) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut in_string = false;
+        let mut string_char = '\'';
+        let chars: Vec<char> = clause.chars().collect();
+        let mut i = 0;
+
+        while i < chars.len() {
+            if in_string {
+                if chars[i] == string_char {
+                    in_string = false;
+                }
+                current.push(chars[i]);
+                i += 1;
+            } else if chars[i] == '\'' || chars[i] == '"' {
+                in_string = true;
+                string_char = chars[i];
+                current.push(chars[i]);
+                i += 1;
+            } else if i + 4 < chars.len()
+                && chars[i].is_whitespace()
+                && (chars[i + 1] == 'A' || chars[i + 1] == 'a')
+                && (chars[i + 2] == 'N' || chars[i + 2] == 'n')
+                && (chars[i + 3] == 'D' || chars[i + 3] == 'd')
+                && chars[i + 4].is_whitespace()
+            {
+                parts.push(current);
+                current = String::new();
+                i += 5; // skip " AND "
+            } else {
+                current.push(chars[i]);
+                i += 1;
+            }
+        }
+
+        if !current.trim().is_empty() {
+            parts.push(current);
+        }
+
+        parts
     }
 
     fn parse_values(&self, values_str: &str) -> Result<Vec<Value>> {
-        values_str
-            .split(',')
-            .map(|s| self.parse_value(s.trim()))
-            .collect()
+        let mut values = Vec::new();
+        let mut current = String::new();
+        let mut in_string = false;
+        let mut string_char = '\'';
+        let mut escaped = false;
+
+        for ch in values_str.chars() {
+            if escaped {
+                current.push(ch);
+                escaped = false;
+            } else if ch == '\\' && in_string {
+                escaped = true;
+                current.push(ch);
+            } else if !in_string && (ch == '\'' || ch == '"') {
+                in_string = true;
+                string_char = ch;
+                current.push(ch);
+            } else if in_string && ch == string_char {
+                in_string = false;
+                current.push(ch);
+            } else if !in_string && ch == ',' {
+                values.push(self.parse_value(current.trim())?);
+                current = String::new();
+            } else {
+                current.push(ch);
+            }
+        }
+
+        if !current.trim().is_empty() {
+            values.push(self.parse_value(current.trim())?);
+        }
+
+        Ok(values)
     }
 
     fn parse_value(&self, s: &str) -> Result<Value> {

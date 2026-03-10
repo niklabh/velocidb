@@ -150,54 +150,77 @@ impl BTree {
         let mut results = Vec::new();
         let root_page = *self.root_page.read();
 
-        // Find the leftmost leaf
-        let mut page_id = root_page;
-        loop {
-            let mut pager = self.pager.write();
-            let page_arc = pager.read_page(page_id)?;
-            let page_data = {
-                let page = page_arc.read();
-                page.data().to_vec()
-            };
-            drop(pager);
-            
-            let header = NodeHeader::deserialize(&page_data)?;
-            
-            if header.node_type == NodeType::Leaf as u8 {
-                // Read all entries from this leaf
-                let mut offset = NodeHeader::SIZE;
-                for _ in 0..header.num_keys {
-                    let key = i64::from_le_bytes(
-                        page_data[offset..offset + 8]
-                            .try_into()
-                            .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
-                    );
-                    
-                    let size = u32::from_le_bytes(
-                        page_data[offset + 8..offset + 12]
-                            .try_into()
-                            .map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
-                    ) as usize;
-                    
-                    let data = &page_data[offset + 12..offset + 12 + size];
-                    let row = self.deserialize_row(data)?;
-                    results.push((key, row));
-                    
-                    offset += 12 + size;
-                }
-                break;
-            } else {
-                // Internal node - go to first child (8 bytes)
+        // Recursively collect all entries from all leaf nodes
+        self.scan_node(root_page, &mut results)?;
+
+        Ok(results)
+    }
+
+    fn scan_node(&self, page_id: PageId, results: &mut Vec<(i64, Row)>) -> Result<()> {
+        let mut pager = self.pager.write();
+        let page_arc = pager.read_page(page_id)?;
+        let page_data = {
+            let page = page_arc.read();
+            page.data().to_vec()
+        };
+        drop(pager);
+
+        let header = NodeHeader::deserialize(&page_data)?;
+
+        if header.node_type == NodeType::Leaf as u8 {
+            // Read all entries from this leaf
+            let mut offset = NodeHeader::SIZE;
+            for _ in 0..header.num_keys {
+                let key = i64::from_le_bytes(
+                    page_data[offset..offset + 8]
+                        .try_into()
+                        .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+                );
+
+                let size = u32::from_le_bytes(
+                    page_data[offset + 8..offset + 12]
+                        .try_into()
+                        .map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
+                ) as usize;
+
+                let data = &page_data[offset + 12..offset + 12 + size];
+                let row = self.deserialize_row(data)?;
+                results.push((key, row));
+
+                offset += 12 + size;
+            }
+        } else {
+            // Internal node - visit all children
+            // Format: [child_0][key_0][child_1][key_1]...[key_{n-1}][child_n]
+            let mut offset = NodeHeader::SIZE;
+
+            // First child
+            let first_child = u64::from_le_bytes(
+                page_data[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| VelociError::Corruption("Invalid child pointer".to_string()))?,
+            ) as PageId;
+            offset += 8;
+
+            self.scan_node(first_child, results)?;
+
+            // Remaining key/child pairs
+            for _ in 0..header.num_keys {
+                // Skip the key (8 bytes)
+                offset += 8;
+
                 let child = u64::from_le_bytes(
-                    page_data[NodeHeader::SIZE..NodeHeader::SIZE + 8]
+                    page_data[offset..offset + 8]
                         .try_into()
                         .map_err(|_| VelociError::Corruption("Invalid child pointer".to_string()))?,
                 ) as PageId;
-                page_id = child;
+                offset += 8;
+
+                self.scan_node(child, results)?;
             }
         }
-        
-        Ok(results)
+
+        Ok(())
     }
 
     pub fn delete(&mut self, key: i64) -> Result<bool> {

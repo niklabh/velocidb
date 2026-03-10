@@ -141,11 +141,8 @@ impl VersionedRecord {
             v.version_info.deleted_at == 0 || v.version_info.deleted_at >= min_active_timestamp
         });
 
-        // Always keep at least one version
-        if self.versions.is_empty() && !self.versions.is_empty() {
-            // This shouldn't happen, but safeguard
-            self.versions.truncate(1);
-        }
+        // If all versions were removed by vacuum, this record is fully deleted
+        // No action needed - the caller should clean up empty records
     }
 }
 
