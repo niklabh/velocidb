@@ -195,19 +195,21 @@ impl AsyncPageCache {
         let page_arc = Arc::new(page);
 
         // Evict if needed
-        while self.size.load(Ordering::Relaxed) >= self.capacity {
+        while self.cache.len() >= self.capacity {
             let key_to_remove = self.cache.iter().next().map(|e| *e.key());
             if let Some(key) = key_to_remove {
-                self.cache.remove(&key);
-                self.size.fetch_sub(1, Ordering::Relaxed);
+                if self.cache.remove(&key).is_some() {
+                    self.size.fetch_sub(1, Ordering::Relaxed);
+                }
             } else {
                 break;
             }
         }
 
         // Add to cache
-        self.cache.insert(page_id, Arc::clone(&page_arc));
-        self.size.fetch_add(1, Ordering::Relaxed);
+        if self.cache.insert(page_id, Arc::clone(&page_arc)).is_none() {
+            self.size.fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(page_arc)
     }
@@ -217,9 +219,25 @@ impl AsyncPageCache {
         // Write to VFS first
         self.vfs.write_page(page_id, &page).await?;
 
-        // Update cache
+        // Update cache (evict if needed before inserting)
+        while self.cache.len() >= self.capacity {
+            let key_to_remove = self.cache.iter().next().map(|e| *e.key());
+            if let Some(key) = key_to_remove {
+                if key == page_id {
+                    break;
+                }
+                if self.cache.remove(&key).is_some() {
+                    self.size.fetch_sub(1, Ordering::Relaxed);
+                }
+            } else {
+                break;
+            }
+        }
+
         let page_arc = Arc::new(page);
-        self.cache.insert(page_id, page_arc);
+        if self.cache.insert(page_id, page_arc).is_none() {
+            self.size.fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(())
     }

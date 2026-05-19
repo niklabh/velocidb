@@ -306,7 +306,7 @@ impl BTree {
 
         let parent_id = header.parent as PageId;
         // Collect parent data, release lock, then find sibling
-        let (sibling_id, separator_key) = {
+        let (sibling_id, separator_key, sibling_is_left) = {
             let parent_arc = pager.read_page(parent_id)?;
             let parent_page = parent_arc.read();
             let parent_header = NodeHeader::deserialize(parent_page.data())?;
@@ -318,7 +318,10 @@ impl BTree {
         };
 
         if sibling_id == 0 {
-            return Ok(());
+            return Err(VelociError::Corruption(format!(
+                "Parent-child link corruption: page {} has no sibling in parent {}",
+                page_id, parent_id
+            )));
         }
 
         // Check if sibling can lend a key (has more than MIN_KEYS)
@@ -330,15 +333,15 @@ impl BTree {
         };
 
         if sibling_count > MIN_KEYS {
-            self.redistribute_from_sibling(pager, page_id, sibling_id, parent_id, separator_key)?;
+            self.redistribute_from_sibling(pager, page_id, sibling_id, parent_id, separator_key, sibling_is_left)?;
         } else {
-            self.merge_leaves(pager, page_id, sibling_id, parent_id, separator_key, root_page)?;
+            self.merge_leaves(pager, page_id, sibling_id, parent_id, separator_key, root_page, sibling_is_left)?;
         }
 
         Ok(())
     }
 
-    fn find_sibling_info(&self, parent_page: &Page, parent_header: &NodeHeader, child_id: PageId) -> Result<(PageId, i64)> {
+    fn find_sibling_info(&self, parent_page: &Page, parent_header: &NodeHeader, child_id: PageId) -> Result<(PageId, i64, bool)> {
         let data = parent_page.data();
 
         let mut offset = NodeHeader::SIZE;
@@ -354,7 +357,8 @@ impl BTree {
             let sibling = u64::from_le_bytes(
                 data[offset + 8..offset + 16].try_into().map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
             ) as PageId;
-            return Ok((sibling, separator));
+            // child is first, sibling is to the right
+            return Ok((sibling, separator, false));
         }
 
         let mut prev_child = first_child;
@@ -367,39 +371,48 @@ impl BTree {
             ) as PageId;
 
             if next_child == child_id {
-                return Ok((prev_child, key));
+                // child is after key, sibling (prev_child) is to the left
+                return Ok((prev_child, key, true));
             }
 
             prev_child = next_child;
             offset += 16;
         }
 
-        Ok((0, 0))
+        Ok((0, 0, false))
     }
 
-    fn redistribute_from_sibling(&self, pager: &mut Pager, page_id: PageId, sibling_id: PageId, parent_id: PageId, separator_key: i64) -> Result<()> {
-        // Move one entry from sibling to this page
+    fn redistribute_from_sibling(&self, pager: &mut Pager, page_id: PageId, sibling_id: PageId, parent_id: PageId, separator_key: i64, sibling_is_left: bool) -> Result<()> {
         let sibling_arc = pager.read_page(sibling_id)?;
         let (stolen_key, stolen_data) = {
             let sibling_page = sibling_arc.read();
             let sibling_header = NodeHeader::deserialize(sibling_page.data())?;
             let data = sibling_page.data();
 
-            // Take the first entry from sibling
-            let key = i64::from_le_bytes(
-                data[NodeHeader::SIZE..NodeHeader::SIZE + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
-            );
-            let size = u32::from_le_bytes(
-                data[NodeHeader::SIZE + 8..NodeHeader::SIZE + 12].try_into().map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
-            ) as usize;
-            let entry_data = data[NodeHeader::SIZE + 12..NodeHeader::SIZE + 12 + size].to_vec();
+            let (key_offset, key, size, entry_data) = if sibling_is_left {
+                // Steal the last entry from left sibling
+                let entry_count = sibling_header.num_keys as usize;
+                let (entry_key, entry_size, entry_data, entry_start) =
+                    self.read_entry_at_index(data, NodeHeader::SIZE, entry_count - 1)?;
+                (entry_start, entry_key, entry_size, entry_data)
+            } else {
+                // Steal the first entry from right sibling
+                let key = i64::from_le_bytes(
+                    data[NodeHeader::SIZE..NodeHeader::SIZE + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+                );
+                let size = u32::from_le_bytes(
+                    data[NodeHeader::SIZE + 8..NodeHeader::SIZE + 12].try_into().map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
+                ) as usize;
+                let entry_data = data[NodeHeader::SIZE + 12..NodeHeader::SIZE + 12 + size].to_vec();
+                (NodeHeader::SIZE, key, size, entry_data)
+            };
 
             // Remove the entry from sibling by shifting
             let end = self.find_data_end(&sibling_header, data)?;
             let entry_size = 12 + size;
             let mut sibling_clone = sibling_page.clone();
             let sib_data = sibling_clone.data_mut();
-            sib_data.copy_within(NodeHeader::SIZE + entry_size..end, NodeHeader::SIZE);
+            sib_data.copy_within(key_offset + entry_size..end, key_offset);
             let mut new_header = sibling_header.clone();
             new_header.num_keys -= 1;
             new_header.serialize(sib_data);
@@ -408,7 +421,7 @@ impl BTree {
             (key, entry_data)
         };
 
-        // Insert stolen entry into this page
+        // Insert stolen entry into target page
         {
             let page_arc = pager.read_page(page_id)?;
             let mut page_clone = page_arc.read().clone();
@@ -420,10 +433,22 @@ impl BTree {
                 return Err(VelociError::StorageError("Cannot redistribute: target page full".to_string()));
             }
 
-            let offset = end_offset;
-            page_clone.data_mut()[offset..offset + 8].copy_from_slice(&stolen_key.to_le_bytes());
-            page_clone.data_mut()[offset + 8..offset + 12].copy_from_slice(&(stolen_data.len() as u32).to_le_bytes());
-            page_clone.data_mut()[offset + 12..offset + 12 + stolen_data.len()].copy_from_slice(&stolen_data);
+            if sibling_is_left {
+                // Prepend: shift existing data right to make room at the beginning
+                let existing_start = NodeHeader::SIZE;
+                let existing_end = end_offset;
+                page_clone.data_mut().copy_within(existing_start..existing_end, existing_start + entry_size);
+                let offset = existing_start;
+                page_clone.data_mut()[offset..offset + 8].copy_from_slice(&stolen_key.to_le_bytes());
+                page_clone.data_mut()[offset + 8..offset + 12].copy_from_slice(&(stolen_data.len() as u32).to_le_bytes());
+                page_clone.data_mut()[offset + 12..offset + 12 + stolen_data.len()].copy_from_slice(&stolen_data);
+            } else {
+                // Append at end (current behavior)
+                let offset = end_offset;
+                page_clone.data_mut()[offset..offset + 8].copy_from_slice(&stolen_key.to_le_bytes());
+                page_clone.data_mut()[offset + 8..offset + 12].copy_from_slice(&(stolen_data.len() as u32).to_le_bytes());
+                page_clone.data_mut()[offset + 12..offset + 12 + stolen_data.len()].copy_from_slice(&stolen_data);
+            }
 
             let mut new_header = header;
             new_header.num_keys += 1;
@@ -431,20 +456,48 @@ impl BTree {
             pager.write_page(page_id, &page_clone)?;
         }
 
-        // Update separator in parent to the new first key of sibling
-        {
+        // Update separator in parent
+        if sibling_is_left {
+            // When borrowing from left, the parent separator becomes the new first key of target
+            let page_arc = pager.read_page(page_id)?;
+            let page_header = NodeHeader::deserialize(page_arc.read().data())?;
+            if page_header.num_keys > 0 {
+                let new_first = i64::from_le_bytes(
+                    page_arc.read().data()[NodeHeader::SIZE..NodeHeader::SIZE + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+                );
+                self.update_parent_key(pager, parent_id, separator_key, new_first)?;
+            }
+        } else {
+            // When borrowing from right, the parent separator becomes the new first key of sibling
             let sibling_arc = pager.read_page(sibling_id)?;
-            let sibling_page = sibling_arc.read();
-            let sibling_header = NodeHeader::deserialize(sibling_page.data())?;
+            let sibling_header = NodeHeader::deserialize(sibling_arc.read().data())?;
             if sibling_header.num_keys > 0 {
                 let new_separator = i64::from_le_bytes(
-                    sibling_page.data()[NodeHeader::SIZE..NodeHeader::SIZE + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+                    sibling_arc.read().data()[NodeHeader::SIZE..NodeHeader::SIZE + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
                 );
                 self.update_parent_key(pager, parent_id, separator_key, new_separator)?;
             }
         }
 
         Ok(())
+    }
+
+    fn read_entry_at_index(&self, data: &[u8], start_offset: usize, index: usize) -> Result<(i64, usize, Vec<u8>, usize)> {
+        let mut offset = start_offset;
+        for i in 0..=index {
+            let key = i64::from_le_bytes(
+                data[offset..offset + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+            );
+            let size = u32::from_le_bytes(
+                data[offset + 8..offset + 12].try_into().map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
+            ) as usize;
+            if i == index {
+                let entry_data = data[offset + 12..offset + 12 + size].to_vec();
+                return Ok((key, size, entry_data, offset));
+            }
+            offset += 12 + size;
+        }
+        Err(VelociError::Corruption("Entry index out of bounds".to_string()))
     }
 
     fn update_parent_key(&self, pager: &mut Pager, parent_id: PageId, old_key: i64, new_key: i64) -> Result<()> {
@@ -467,51 +520,58 @@ impl BTree {
         Ok(())
     }
 
-    fn merge_leaves(&self, pager: &mut Pager, page_id: PageId, sibling_id: PageId, parent_id: PageId, separator_key: i64, root_page: PageId) -> Result<()> {
-        // Move all entries from sibling into this page
-        let sibling_arc = pager.read_page(sibling_id)?;
-        let sibling_entries: Vec<(i64, Vec<u8>)> = {
-            let sibling_page = sibling_arc.read();
-            let sibling_header = NodeHeader::deserialize(sibling_page.data())?;
+    fn merge_leaves(&self, pager: &mut Pager, page_id: PageId, sibling_id: PageId, parent_id: PageId, _separator_key: i64, root_page: PageId, sibling_is_left: bool) -> Result<()> {
+        // Canonical merge: always merge right page into left page
+        let (left_id, right_id) = if sibling_is_left {
+            (sibling_id, page_id)
+        } else {
+            (page_id, sibling_id)
+        };
+
+        // Move all entries from right page into left page
+        let right_arc = pager.read_page(right_id)?;
+        let right_entries: Vec<(i64, Vec<u8>)> = {
+            let right_page = right_arc.read();
+            let right_header = NodeHeader::deserialize(right_page.data())?;
             let mut entries = Vec::new();
             let mut offset = NodeHeader::SIZE;
-            for _ in 0..sibling_header.num_keys {
+            for _ in 0..right_header.num_keys {
                 let key = i64::from_le_bytes(
-                    sibling_page.data()[offset..offset + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+                    right_page.data()[offset..offset + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
                 );
                 let size = u32::from_le_bytes(
-                    sibling_page.data()[offset + 8..offset + 12].try_into().map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
+                    right_page.data()[offset + 8..offset + 12].try_into().map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
                 ) as usize;
-                let data = sibling_page.data()[offset + 12..offset + 12 + size].to_vec();
+                let data = right_page.data()[offset + 12..offset + 12 + size].to_vec();
                 entries.push((key, data));
                 offset += 12 + size;
             }
             entries
         };
 
-        // Add entries to this page
+        // Add entries to left page
         {
-            let page_arc = pager.read_page(page_id)?;
-            let mut page_clone = page_arc.read().clone();
-            let mut header = NodeHeader::deserialize(page_clone.data())?;
+            let left_arc = pager.read_page(left_id)?;
+            let mut left_clone = left_arc.read().clone();
+            let mut header = NodeHeader::deserialize(left_clone.data())?;
 
-            for (key, data) in &sibling_entries {
-                let end_offset = self.find_data_end(&header, page_clone.data())?;
+            for (key, data) in &right_entries {
+                let end_offset = self.find_data_end(&header, left_clone.data())?;
                 let entry_size = 12 + data.len();
                 if end_offset + entry_size > PAGE_SIZE {
                     return Err(VelociError::StorageError("Cannot merge: target page full".to_string()));
                 }
-                page_clone.data_mut()[end_offset..end_offset + 8].copy_from_slice(&key.to_le_bytes());
-                page_clone.data_mut()[end_offset + 8..end_offset + 12].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                page_clone.data_mut()[end_offset + 12..end_offset + 12 + data.len()].copy_from_slice(data);
+                left_clone.data_mut()[end_offset..end_offset + 8].copy_from_slice(&key.to_le_bytes());
+                left_clone.data_mut()[end_offset + 8..end_offset + 12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                left_clone.data_mut()[end_offset + 12..end_offset + 12 + data.len()].copy_from_slice(data);
                 header.num_keys += 1;
             }
-            header.serialize(page_clone.data_mut());
-            pager.write_page(page_id, &page_clone)?;
+            header.serialize(left_clone.data_mut());
+            pager.write_page(left_id, &left_clone)?;
         }
 
-        // Remove sibling pointer and key from parent
-        self.remove_child_from_parent(pager, parent_id, sibling_id, root_page)?;
+        // Remove right page's pointer and key from parent
+        self.remove_child_from_parent(pager, parent_id, right_id, root_page)?;
 
         Ok(())
     }

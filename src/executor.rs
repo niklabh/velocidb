@@ -80,7 +80,7 @@ impl Executor {
         match active.take() {
             Some(txn) => {
                 if let Some(ref snapshot) = *snap {
-                    let _ = self.mvcc.commit_transaction(snapshot);
+                    self.mvcc.commit_transaction(snapshot)?;
                 }
                 *snap = None;
                 self.transaction_manager.commit(&txn)?;
@@ -97,7 +97,7 @@ impl Executor {
         match active.take() {
             Some(txn) => {
                 if let Some(ref snapshot) = *snap {
-                    let _ = self.mvcc.abort_transaction(snapshot);
+                    self.mvcc.abort_transaction(snapshot)?;
                 }
                 *snap = None;
                 self.transaction_manager.abort(&txn)?;
@@ -291,7 +291,12 @@ impl Executor {
         let mut mvcc_snap: Option<Snapshot> = None;
         self.get_snapshot(&mut mvcc_snap);
         if let Some(ref snap) = mvcc_snap {
-            let _ = self.mvcc.insert_version(table, pk_value, row.values.clone(), snap);
+            if let Err(e) = self.mvcc.insert_version(table, pk_value, row.values.clone(), snap) {
+                // MVCC insert failed - abort the B-tree write to maintain consistency
+                self.transaction_manager.abort(&txn)?;
+                self.lock_manager.release_lock(table, txn.id())?;
+                return Err(e);
+            }
             self.commit_snapshot(snap, auto_commit);
         }
 
@@ -340,15 +345,25 @@ impl Executor {
             Vec::new()
         };
 
-        let all_rows: Vec<(i64, Row)> = if !mvcc_rows.is_empty() {
-            mvcc_rows.into_iter().map(|(k, v)| (k, Row::new(v))).collect()
-        } else {
+        let all_rows: Vec<(i64, Row)> = {
+            // Always read B-tree first
             let btrees = self.btrees.read();
             let btree_arc = btrees.get(table).ok_or_else(|| {
                 VelociError::NotFound(format!("Table '{}' not initialized", table))
             })?;
             let btree = btree_arc.read();
-            btree.scan()?
+            let btree_rows = btree.scan()?;
+
+            // Overlay MVCC rows on top, preferring MVCC on key collision
+            if mvcc_rows.is_empty() {
+                btree_rows
+            } else {
+                let mut merged: HashMap<i64, Row> = btree_rows.into_iter().map(|(k, v)| (k, v)).collect();
+                for (k, v) in mvcc_rows {
+                    merged.insert(k, Row::new(v));
+                }
+                merged.into_iter().collect()
+            }
         };
 
         // Commit MVCC snapshot if auto-commit
@@ -609,7 +624,9 @@ impl Executor {
         self.get_snapshot(&mut mvcc_snap);
         if let Some(ref snap) = mvcc_snap {
             for key in &deleted_keys {
-                let _ = self.mvcc.delete_version(table, *key, snap);
+                if let Err(e) = self.mvcc.delete_version(table, *key, snap) {
+                    return Err(e);
+                }
             }
             self.commit_snapshot(snap, auto_commit);
         }

@@ -101,20 +101,22 @@ impl Pager {
         let page_arc = Arc::new(RwLock::new(page));
 
         // Evict if cache is full
-        while self.cache_size.load(Ordering::Relaxed) >= self.max_cache_size {
+        while self.cache.len() >= self.max_cache_size {
             // Evict the first entry we can remove
             let key_to_remove = self.cache.iter().next().map(|e| *e.key());
             if let Some(key) = key_to_remove {
-                self.cache.remove(&key);
-                self.cache_size.fetch_sub(1, Ordering::Relaxed);
+                if self.cache.remove(&key).is_some() {
+                    self.cache_size.fetch_sub(1, Ordering::Relaxed);
+                }
             } else {
                 break;
             }
         }
 
         // Add to cache
-        self.cache.insert(page_id, page_arc.clone());
-        self.cache_size.fetch_add(1, Ordering::Relaxed);
+        if self.cache.insert(page_id, page_arc.clone()).is_none() {
+            self.cache_size.fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(page_arc)
     }
@@ -125,8 +127,23 @@ impl Pager {
         self.file.write_all(&page.data)?;
         self.file.sync_data()?;
 
-        // Update cache
-        self.cache.insert(page_id, Arc::new(RwLock::new(page.clone())));
+        // Update cache (evict if needed before inserting)
+        while self.cache.len() >= self.max_cache_size {
+            let key_to_remove = self.cache.iter().next().map(|e| *e.key());
+            if let Some(key) = key_to_remove {
+                if key == page_id {
+                    break;
+                }
+                if self.cache.remove(&key).is_some() {
+                    self.cache_size.fetch_sub(1, Ordering::Relaxed);
+                }
+            } else {
+                break;
+            }
+        }
+        if self.cache.insert(page_id, Arc::new(RwLock::new(page.clone()))).is_none() {
+            self.cache_size.fetch_add(1, Ordering::Relaxed);
+        }
 
         if page_id >= self.num_pages {
             self.num_pages = page_id + 1;
