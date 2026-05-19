@@ -267,94 +267,118 @@
 <a href=#267 id=267 data-nosnippet>267</a>                </span><span class="kw">match </span>(existing.lock_type, lock_type) {
 <a href=#268 id=268 data-nosnippet>268</a>                    (LockType::Shared, LockType::Exclusive) =&gt; {
 <a href=#269 id=269 data-nosnippet>269</a>                        <span class="comment">// Allow upgrade from shared to exclusive
-<a href=#270 id=270 data-nosnippet>270</a>                        // Remove shared lock, will add exclusive below
-<a href=#271 id=271 data-nosnippet>271</a>                        </span>entries.retain(|e| e.txn_id != txn_id);
-<a href=#272 id=272 data-nosnippet>272</a>                        <span class="kw">break</span>;
-<a href=#273 id=273 data-nosnippet>273</a>                    }
-<a href=#274 id=274 data-nosnippet>274</a>                    (LockType::Exclusive, LockType::Shared) =&gt; {
-<a href=#275 id=275 data-nosnippet>275</a>                        <span class="kw">return </span><span class="prelude-val">Err</span>(VelociError::ConstraintViolation(
-<a href=#276 id=276 data-nosnippet>276</a>                            <span class="string">"Cannot downgrade exclusive lock to shared"</span>.to_string()
-<a href=#277 id=277 data-nosnippet>277</a>                        ));
+<a href=#270 id=270 data-nosnippet>270</a>                        // Check if there are other transactions holding locks on this resource
+<a href=#271 id=271 data-nosnippet>271</a>                        </span><span class="kw">let </span>other_locks_exist = entries.iter().any(|e| e.txn_id != txn_id);
+<a href=#272 id=272 data-nosnippet>272</a>                        <span class="kw">if </span>other_locks_exist {
+<a href=#273 id=273 data-nosnippet>273</a>                            <span class="kw">return </span><span class="prelude-val">Err</span>(VelociError::Busy);
+<a href=#274 id=274 data-nosnippet>274</a>                        }
+<a href=#275 id=275 data-nosnippet>275</a>                        <span class="comment">// Remove shared lock, will add exclusive below
+<a href=#276 id=276 data-nosnippet>276</a>                        </span>entries.retain(|e| e.txn_id != txn_id);
+<a href=#277 id=277 data-nosnippet>277</a>                        <span class="kw">break</span>;
 <a href=#278 id=278 data-nosnippet>278</a>                    }
-<a href=#279 id=279 data-nosnippet>279</a>                    (LockType::Shared, LockType::Shared) | (LockType::Exclusive, LockType::Exclusive) =&gt; {
-<a href=#280 id=280 data-nosnippet>280</a>                        <span class="comment">// Same lock type, already held
-<a href=#281 id=281 data-nosnippet>281</a>                        </span><span class="kw">return </span><span class="prelude-val">Ok</span>(());
-<a href=#282 id=282 data-nosnippet>282</a>                    }
-<a href=#283 id=283 data-nosnippet>283</a>                }
-<a href=#284 id=284 data-nosnippet>284</a>            } <span class="kw">else </span>{
-<a href=#285 id=285 data-nosnippet>285</a>                <span class="comment">// Different transaction - check for conflicts
-<a href=#286 id=286 data-nosnippet>286</a>                </span><span class="kw">match </span>(lock_type, existing.lock_type) {
-<a href=#287 id=287 data-nosnippet>287</a>                    (LockType::Shared, LockType::Shared) =&gt; {
-<a href=#288 id=288 data-nosnippet>288</a>                        <span class="comment">// Multiple shared locks are allowed - continue checking
-<a href=#289 id=289 data-nosnippet>289</a>                    </span>}
-<a href=#290 id=290 data-nosnippet>290</a>                    (LockType::Exclusive, <span class="kw">_</span>) | (<span class="kw">_</span>, LockType::Exclusive) =&gt; {
-<a href=#291 id=291 data-nosnippet>291</a>                        <span class="comment">// Conflict with exclusive lock
-<a href=#292 id=292 data-nosnippet>292</a>                        </span><span class="kw">return </span><span class="prelude-val">Err</span>(VelociError::Busy);
-<a href=#293 id=293 data-nosnippet>293</a>                    }
-<a href=#294 id=294 data-nosnippet>294</a>                }
-<a href=#295 id=295 data-nosnippet>295</a>            }
-<a href=#296 id=296 data-nosnippet>296</a>        }
-<a href=#297 id=297 data-nosnippet>297</a>
-<a href=#298 id=298 data-nosnippet>298</a>        <span class="comment">// Add the new lock
-<a href=#299 id=299 data-nosnippet>299</a>        </span>entries.push(LockEntry { txn_id, lock_type });
-<a href=#300 id=300 data-nosnippet>300</a>        <span class="prelude-val">Ok</span>(())
-<a href=#301 id=301 data-nosnippet>301</a>    }
+<a href=#279 id=279 data-nosnippet>279</a>                    (LockType::Exclusive, LockType::Shared) =&gt; {
+<a href=#280 id=280 data-nosnippet>280</a>                        <span class="kw">return </span><span class="prelude-val">Err</span>(VelociError::ConstraintViolation(
+<a href=#281 id=281 data-nosnippet>281</a>                            <span class="string">"Cannot downgrade exclusive lock to shared"</span>.to_string()
+<a href=#282 id=282 data-nosnippet>282</a>                        ));
+<a href=#283 id=283 data-nosnippet>283</a>                    }
+<a href=#284 id=284 data-nosnippet>284</a>                    (LockType::Shared, LockType::Shared) | (LockType::Exclusive, LockType::Exclusive) =&gt; {
+<a href=#285 id=285 data-nosnippet>285</a>                        <span class="comment">// Same lock type, already held
+<a href=#286 id=286 data-nosnippet>286</a>                        </span><span class="kw">return </span><span class="prelude-val">Ok</span>(());
+<a href=#287 id=287 data-nosnippet>287</a>                    }
+<a href=#288 id=288 data-nosnippet>288</a>                }
+<a href=#289 id=289 data-nosnippet>289</a>            } <span class="kw">else </span>{
+<a href=#290 id=290 data-nosnippet>290</a>                <span class="comment">// Different transaction - check for conflicts
+<a href=#291 id=291 data-nosnippet>291</a>                </span><span class="kw">match </span>(lock_type, existing.lock_type) {
+<a href=#292 id=292 data-nosnippet>292</a>                    (LockType::Shared, LockType::Shared) =&gt; {
+<a href=#293 id=293 data-nosnippet>293</a>                        <span class="comment">// Multiple shared locks are allowed - continue checking
+<a href=#294 id=294 data-nosnippet>294</a>                    </span>}
+<a href=#295 id=295 data-nosnippet>295</a>                    (LockType::Exclusive, <span class="kw">_</span>) | (<span class="kw">_</span>, LockType::Exclusive) =&gt; {
+<a href=#296 id=296 data-nosnippet>296</a>                        <span class="comment">// Conflict with exclusive lock
+<a href=#297 id=297 data-nosnippet>297</a>                        </span><span class="kw">return </span><span class="prelude-val">Err</span>(VelociError::Busy);
+<a href=#298 id=298 data-nosnippet>298</a>                    }
+<a href=#299 id=299 data-nosnippet>299</a>                }
+<a href=#300 id=300 data-nosnippet>300</a>            }
+<a href=#301 id=301 data-nosnippet>301</a>        }
 <a href=#302 id=302 data-nosnippet>302</a>
-<a href=#303 id=303 data-nosnippet>303</a>    <span class="kw">pub fn </span>release_lock(<span class="kw-2">&amp;</span><span class="self">self</span>, resource: <span class="kw-2">&amp;</span>str, txn_id: TransactionId) -&gt; <span class="prelude-ty">Result</span>&lt;()&gt; {
-<a href=#304 id=304 data-nosnippet>304</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(<span class="kw-2">mut </span>entry) = <span class="self">self</span>.locks.get_mut(resource) {
-<a href=#305 id=305 data-nosnippet>305</a>            entry.value_mut().retain(|e| e.txn_id != txn_id);
-<a href=#306 id=306 data-nosnippet>306</a>            
-<a href=#307 id=307 data-nosnippet>307</a>            <span class="comment">// Clean up empty entries
-<a href=#308 id=308 data-nosnippet>308</a>            </span><span class="kw">if </span>entry.value().is_empty() {
-<a href=#309 id=309 data-nosnippet>309</a>                drop(entry);
-<a href=#310 id=310 data-nosnippet>310</a>                <span class="self">self</span>.locks.remove(resource);
-<a href=#311 id=311 data-nosnippet>311</a>            }
-<a href=#312 id=312 data-nosnippet>312</a>        }
-<a href=#313 id=313 data-nosnippet>313</a>        <span class="prelude-val">Ok</span>(())
-<a href=#314 id=314 data-nosnippet>314</a>    }
-<a href=#315 id=315 data-nosnippet>315</a>
-<a href=#316 id=316 data-nosnippet>316</a>    <span class="kw">pub fn </span>release_all_locks(<span class="kw-2">&amp;</span><span class="self">self</span>, txn_id: TransactionId) {
-<a href=#317 id=317 data-nosnippet>317</a>        <span class="comment">// Collect keys to avoid holding lock during iteration
-<a href=#318 id=318 data-nosnippet>318</a>        </span><span class="kw">let </span>keys: Vec&lt;String&gt; = <span class="self">self</span>.locks.iter().map(|r| r.key().clone()).collect();
-<a href=#319 id=319 data-nosnippet>319</a>        
-<a href=#320 id=320 data-nosnippet>320</a>        <span class="kw">for </span>key <span class="kw">in </span>keys {
-<a href=#321 id=321 data-nosnippet>321</a>            <span class="kw">let _ </span>= <span class="self">self</span>.release_lock(<span class="kw-2">&amp;</span>key, txn_id);
-<a href=#322 id=322 data-nosnippet>322</a>        }
-<a href=#323 id=323 data-nosnippet>323</a>    }
-<a href=#324 id=324 data-nosnippet>324</a>    
-<a href=#325 id=325 data-nosnippet>325</a>    <span class="doccomment">/// Check if a transaction holds any locks (for debugging)
-<a href=#326 id=326 data-nosnippet>326</a>    </span><span class="kw">pub fn </span>has_locks(<span class="kw-2">&amp;</span><span class="self">self</span>, txn_id: TransactionId) -&gt; bool {
-<a href=#327 id=327 data-nosnippet>327</a>        <span class="self">self</span>.locks.iter().any(|entry| {
-<a href=#328 id=328 data-nosnippet>328</a>            entry.value().iter().any(|e| e.txn_id == txn_id)
-<a href=#329 id=329 data-nosnippet>329</a>        })
-<a href=#330 id=330 data-nosnippet>330</a>    }
-<a href=#331 id=331 data-nosnippet>331</a>}
-<a href=#332 id=332 data-nosnippet>332</a>
-<a href=#333 id=333 data-nosnippet>333</a><span class="attr">#[cfg(test)]
-<a href=#334 id=334 data-nosnippet>334</a></span><span class="kw">mod </span>tests {
-<a href=#335 id=335 data-nosnippet>335</a>    <span class="kw">use </span>super::<span class="kw-2">*</span>;
-<a href=#336 id=336 data-nosnippet>336</a>
-<a href=#337 id=337 data-nosnippet>337</a>    <span class="attr">#[test]
-<a href=#338 id=338 data-nosnippet>338</a>    </span><span class="kw">fn </span>test_transaction_lifecycle() {
-<a href=#339 id=339 data-nosnippet>339</a>        <span class="kw">let </span>txn_mgr = TransactionManager::new();
-<a href=#340 id=340 data-nosnippet>340</a>        <span class="kw">let </span>txn = txn_mgr.begin();
-<a href=#341 id=341 data-nosnippet>341</a>        
-<a href=#342 id=342 data-nosnippet>342</a>        <span class="macro">assert_eq!</span>(txn.state(), TransactionState::Active);
-<a href=#343 id=343 data-nosnippet>343</a>        
-<a href=#344 id=344 data-nosnippet>344</a>        txn_mgr.commit(<span class="kw-2">&amp;</span>txn).unwrap();
-<a href=#345 id=345 data-nosnippet>345</a>        <span class="macro">assert_eq!</span>(txn.state(), TransactionState::Committed);
-<a href=#346 id=346 data-nosnippet>346</a>    }
-<a href=#347 id=347 data-nosnippet>347</a>
-<a href=#348 id=348 data-nosnippet>348</a>    <span class="attr">#[test]
-<a href=#349 id=349 data-nosnippet>349</a>    </span><span class="kw">fn </span>test_lock_manager() {
-<a href=#350 id=350 data-nosnippet>350</a>        <span class="kw">let </span>lock_mgr = LockManager::new();
-<a href=#351 id=351 data-nosnippet>351</a>        
-<a href=#352 id=352 data-nosnippet>352</a>        lock_mgr.acquire_lock(<span class="string">"table1"</span>, <span class="number">1</span>, LockType::Shared).unwrap();
-<a href=#353 id=353 data-nosnippet>353</a>        lock_mgr.acquire_lock(<span class="string">"table1"</span>, <span class="number">2</span>, LockType::Shared).unwrap();
-<a href=#354 id=354 data-nosnippet>354</a>        
-<a href=#355 id=355 data-nosnippet>355</a>        <span class="kw">let </span>result = lock_mgr.acquire_lock(<span class="string">"table1"</span>, <span class="number">3</span>, LockType::Exclusive);
-<a href=#356 id=356 data-nosnippet>356</a>        <span class="macro">assert!</span>(result.is_err());
-<a href=#357 id=357 data-nosnippet>357</a>    }
-<a href=#358 id=358 data-nosnippet>358</a>}
-<a href=#359 id=359 data-nosnippet>359</a>
+<a href=#303 id=303 data-nosnippet>303</a>        <span class="comment">// Add the new lock
+<a href=#304 id=304 data-nosnippet>304</a>        </span>entries.push(LockEntry { txn_id, lock_type });
+<a href=#305 id=305 data-nosnippet>305</a>        <span class="prelude-val">Ok</span>(())
+<a href=#306 id=306 data-nosnippet>306</a>    }
+<a href=#307 id=307 data-nosnippet>307</a>
+<a href=#308 id=308 data-nosnippet>308</a>    <span class="kw">pub fn </span>release_lock(<span class="kw-2">&amp;</span><span class="self">self</span>, resource: <span class="kw-2">&amp;</span>str, txn_id: TransactionId) -&gt; <span class="prelude-ty">Result</span>&lt;()&gt; {
+<a href=#309 id=309 data-nosnippet>309</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(<span class="kw-2">mut </span>entry) = <span class="self">self</span>.locks.get_mut(resource) {
+<a href=#310 id=310 data-nosnippet>310</a>            entry.value_mut().retain(|e| e.txn_id != txn_id);
+<a href=#311 id=311 data-nosnippet>311</a>            
+<a href=#312 id=312 data-nosnippet>312</a>            <span class="comment">// Clean up empty entries
+<a href=#313 id=313 data-nosnippet>313</a>            </span><span class="kw">if </span>entry.value().is_empty() {
+<a href=#314 id=314 data-nosnippet>314</a>                drop(entry);
+<a href=#315 id=315 data-nosnippet>315</a>                <span class="self">self</span>.locks.remove(resource);
+<a href=#316 id=316 data-nosnippet>316</a>            }
+<a href=#317 id=317 data-nosnippet>317</a>        }
+<a href=#318 id=318 data-nosnippet>318</a>        <span class="prelude-val">Ok</span>(())
+<a href=#319 id=319 data-nosnippet>319</a>    }
+<a href=#320 id=320 data-nosnippet>320</a>
+<a href=#321 id=321 data-nosnippet>321</a>    <span class="kw">pub fn </span>release_all_locks(<span class="kw-2">&amp;</span><span class="self">self</span>, txn_id: TransactionId) {
+<a href=#322 id=322 data-nosnippet>322</a>        <span class="comment">// Collect keys to avoid holding lock during iteration
+<a href=#323 id=323 data-nosnippet>323</a>        </span><span class="kw">let </span>keys: Vec&lt;String&gt; = <span class="self">self</span>.locks.iter().map(|r| r.key().clone()).collect();
+<a href=#324 id=324 data-nosnippet>324</a>        
+<a href=#325 id=325 data-nosnippet>325</a>        <span class="kw">for </span>key <span class="kw">in </span>keys {
+<a href=#326 id=326 data-nosnippet>326</a>            <span class="kw">let _ </span>= <span class="self">self</span>.release_lock(<span class="kw-2">&amp;</span>key, txn_id);
+<a href=#327 id=327 data-nosnippet>327</a>        }
+<a href=#328 id=328 data-nosnippet>328</a>    }
+<a href=#329 id=329 data-nosnippet>329</a>    
+<a href=#330 id=330 data-nosnippet>330</a>    <span class="doccomment">/// Check if a transaction holds any locks (for debugging)
+<a href=#331 id=331 data-nosnippet>331</a>    </span><span class="kw">pub fn </span>has_locks(<span class="kw-2">&amp;</span><span class="self">self</span>, txn_id: TransactionId) -&gt; bool {
+<a href=#332 id=332 data-nosnippet>332</a>        <span class="self">self</span>.locks.iter().any(|entry| {
+<a href=#333 id=333 data-nosnippet>333</a>            entry.value().iter().any(|e| e.txn_id == txn_id)
+<a href=#334 id=334 data-nosnippet>334</a>        })
+<a href=#335 id=335 data-nosnippet>335</a>    }
+<a href=#336 id=336 data-nosnippet>336</a>}
+<a href=#337 id=337 data-nosnippet>337</a>
+<a href=#338 id=338 data-nosnippet>338</a><span class="attr">#[cfg(test)]
+<a href=#339 id=339 data-nosnippet>339</a></span><span class="kw">mod </span>tests {
+<a href=#340 id=340 data-nosnippet>340</a>    <span class="kw">use </span>super::<span class="kw-2">*</span>;
+<a href=#341 id=341 data-nosnippet>341</a>
+<a href=#342 id=342 data-nosnippet>342</a>    <span class="attr">#[test]
+<a href=#343 id=343 data-nosnippet>343</a>    </span><span class="kw">fn </span>test_transaction_lifecycle() {
+<a href=#344 id=344 data-nosnippet>344</a>        <span class="kw">let </span>txn_mgr = TransactionManager::new();
+<a href=#345 id=345 data-nosnippet>345</a>        <span class="kw">let </span>txn = txn_mgr.begin();
+<a href=#346 id=346 data-nosnippet>346</a>        
+<a href=#347 id=347 data-nosnippet>347</a>        <span class="macro">assert_eq!</span>(txn.state(), TransactionState::Active);
+<a href=#348 id=348 data-nosnippet>348</a>        
+<a href=#349 id=349 data-nosnippet>349</a>        txn_mgr.commit(<span class="kw-2">&amp;</span>txn).unwrap();
+<a href=#350 id=350 data-nosnippet>350</a>        <span class="macro">assert_eq!</span>(txn.state(), TransactionState::Committed);
+<a href=#351 id=351 data-nosnippet>351</a>    }
+<a href=#352 id=352 data-nosnippet>352</a>
+<a href=#353 id=353 data-nosnippet>353</a>    <span class="attr">#[test]
+<a href=#354 id=354 data-nosnippet>354</a>    </span><span class="kw">fn </span>test_lock_manager() {
+<a href=#355 id=355 data-nosnippet>355</a>        <span class="kw">let </span>lock_mgr = LockManager::new();
+<a href=#356 id=356 data-nosnippet>356</a>        
+<a href=#357 id=357 data-nosnippet>357</a>        lock_mgr.acquire_lock(<span class="string">"table1"</span>, <span class="number">1</span>, LockType::Shared).unwrap();
+<a href=#358 id=358 data-nosnippet>358</a>        lock_mgr.acquire_lock(<span class="string">"table1"</span>, <span class="number">2</span>, LockType::Shared).unwrap();
+<a href=#359 id=359 data-nosnippet>359</a>        
+<a href=#360 id=360 data-nosnippet>360</a>        <span class="kw">let </span>result = lock_mgr.acquire_lock(<span class="string">"table1"</span>, <span class="number">3</span>, LockType::Exclusive);
+<a href=#361 id=361 data-nosnippet>361</a>        <span class="macro">assert!</span>(result.is_err());
+<a href=#362 id=362 data-nosnippet>362</a>    }
+<a href=#363 id=363 data-nosnippet>363</a>
+<a href=#364 id=364 data-nosnippet>364</a>    <span class="attr">#[test]
+<a href=#365 id=365 data-nosnippet>365</a>    </span><span class="kw">fn </span>test_lock_upgrade_concurrency() {
+<a href=#366 id=366 data-nosnippet>366</a>        <span class="kw">let </span>lock_mgr = LockManager::new();
+<a href=#367 id=367 data-nosnippet>367</a>        
+<a href=#368 id=368 data-nosnippet>368</a>        <span class="comment">// Two transactions hold Shared locks
+<a href=#369 id=369 data-nosnippet>369</a>        </span>lock_mgr.acquire_lock(<span class="string">"table1"</span>, <span class="number">1</span>, LockType::Shared).unwrap();
+<a href=#370 id=370 data-nosnippet>370</a>        lock_mgr.acquire_lock(<span class="string">"table1"</span>, <span class="number">2</span>, LockType::Shared).unwrap();
+<a href=#371 id=371 data-nosnippet>371</a>        
+<a href=#372 id=372 data-nosnippet>372</a>        <span class="comment">// Transaction 1 tries to upgrade to Exclusive, which should fail (since 2 holds a Shared lock)
+<a href=#373 id=373 data-nosnippet>373</a>        </span><span class="kw">let </span>result = lock_mgr.acquire_lock(<span class="string">"table1"</span>, <span class="number">1</span>, LockType::Exclusive);
+<a href=#374 id=374 data-nosnippet>374</a>        <span class="macro">assert!</span>(result.is_err());
+<a href=#375 id=375 data-nosnippet>375</a>        
+<a href=#376 id=376 data-nosnippet>376</a>        <span class="comment">// Release Transaction 2's lock
+<a href=#377 id=377 data-nosnippet>377</a>        </span>lock_mgr.release_lock(<span class="string">"table1"</span>, <span class="number">2</span>).unwrap();
+<a href=#378 id=378 data-nosnippet>378</a>        
+<a href=#379 id=379 data-nosnippet>379</a>        <span class="comment">// Transaction 1 tries to upgrade to Exclusive again, which should now succeed
+<a href=#380 id=380 data-nosnippet>380</a>        </span>lock_mgr.acquire_lock(<span class="string">"table1"</span>, <span class="number">1</span>, LockType::Exclusive).unwrap();
+<a href=#381 id=381 data-nosnippet>381</a>    }
+<a href=#382 id=382 data-nosnippet>382</a>}
+<a href=#383 id=383 data-nosnippet>383</a>
 </code></pre></div></section></main></body></html>
