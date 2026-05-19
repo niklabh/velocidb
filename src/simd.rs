@@ -240,7 +240,8 @@ impl VectorizedAggregation {
             }
 
             let values_vec = _mm256_loadu_si256(values[i..].as_ptr() as *const __m256i);
-            min_vec = _mm256_min_epi64(min_vec, values_vec);
+            let cmp = _mm256_cmpgt_epi64(min_vec, values_vec);
+            min_vec = _mm256_blendv_epi8(min_vec, values_vec, cmp);
         }
 
         let mut temp = [0i64; 4];
@@ -288,7 +289,8 @@ impl VectorizedAggregation {
             }
 
             let values_vec = _mm256_loadu_si256(values[i..].as_ptr() as *const __m256i);
-            max_vec = _mm256_max_epi64(max_vec, values_vec);
+            let cmp = _mm256_cmpgt_epi64(values_vec, max_vec);
+            max_vec = _mm256_blendv_epi8(max_vec, values_vec, cmp);
         }
 
         let mut temp = [0i64; 4];

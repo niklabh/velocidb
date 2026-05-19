@@ -311,7 +311,8 @@ impl CrdtStore {
     /// Prune old operations (garbage collection)
     /// Remove operations older than all known vector clocks
     pub fn prune_operations(&mut self) {
-        if self.vector_clock.is_empty() {
+        if self.vector_clock.len() <= 1 {
+            // Do not prune if we are the only known node (prevent wiping out own edits)
             return;
         }
 
@@ -470,7 +471,7 @@ mod tests {
         store.prune_operations();
 
         // All operations should remain (only one node)
-        assert!(store.operation_log.len() <= 100);
+        assert_eq!(store.operation_log.len(), 100);
     }
 }
 

@@ -47,10 +47,7 @@ impl VersionInfo {
             return false;
         }
 
-        // Version must not be deleted before our snapshot
-        if self.deleted_at > 0 && self.deleted_at <= snapshot.timestamp {
-            return false;
-        }
+
 
         // Check transaction visibility
         if !snapshot.is_transaction_visible(self.xmin) {
@@ -557,6 +554,40 @@ mod tests {
         // Stats should show cleanup (in a real scenario with old snapshots)
         let stats_after = mvcc.get_stats();
         assert!(stats_after.total_versions >= 1); // At least one version should remain
+    }
+
+    #[test]
+    fn test_mvcc_uncommitted_delete_visibility() {
+        let mvcc = MvccManager::new();
+
+        // Transaction 1: Insert record and commit
+        let snapshot_setup = mvcc.begin_transaction();
+        mvcc.insert_version("test", 1, vec![Value::Integer(100)], &snapshot_setup).unwrap();
+        mvcc.commit_transaction(&snapshot_setup).unwrap();
+
+        // Transaction 2: Begin transaction
+        let snapshot_writer = mvcc.begin_transaction();
+
+        // Transaction 2: Delete record
+        mvcc.delete_version("test", 1, &snapshot_writer).unwrap();
+
+        // Transaction 3: Starts *after* T2's delete but *before* T2's commit
+        let snapshot_reader = mvcc.begin_transaction();
+
+        // T3 should STILL see the record because T2 has not committed!
+        let result = mvcc.read_version("test", 1, &snapshot_reader).unwrap();
+        assert!(result.is_some(), "Active uncommitted delete was prematurely visible to concurrent transactions!");
+        assert_eq!(result.unwrap()[0], Value::Integer(100));
+
+        // T2 commits
+        mvcc.commit_transaction(&snapshot_writer).unwrap();
+
+        // Transaction 4 starts *after* T2 commits
+        let snapshot_after = mvcc.begin_transaction();
+
+        // T4 should now see the record as deleted (None)
+        let result_after = mvcc.read_version("test", 1, &snapshot_after).unwrap();
+        assert!(result_after.is_none(), "Committed delete should be visible!");
     }
 }
 

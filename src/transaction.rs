@@ -267,6 +267,11 @@ impl LockManager {
                 match (existing.lock_type, lock_type) {
                     (LockType::Shared, LockType::Exclusive) => {
                         // Allow upgrade from shared to exclusive
+                        // Check if there are other transactions holding locks on this resource
+                        let other_locks_exist = entries.iter().any(|e| e.txn_id != txn_id);
+                        if other_locks_exist {
+                            return Err(VelociError::Busy);
+                        }
                         // Remove shared lock, will add exclusive below
                         entries.retain(|e| e.txn_id != txn_id);
                         break;
@@ -354,6 +359,25 @@ mod tests {
         
         let result = lock_mgr.acquire_lock("table1", 3, LockType::Exclusive);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lock_upgrade_concurrency() {
+        let lock_mgr = LockManager::new();
+        
+        // Two transactions hold Shared locks
+        lock_mgr.acquire_lock("table1", 1, LockType::Shared).unwrap();
+        lock_mgr.acquire_lock("table1", 2, LockType::Shared).unwrap();
+        
+        // Transaction 1 tries to upgrade to Exclusive, which should fail (since 2 holds a Shared lock)
+        let result = lock_mgr.acquire_lock("table1", 1, LockType::Exclusive);
+        assert!(result.is_err());
+        
+        // Release Transaction 2's lock
+        lock_mgr.release_lock("table1", 2).unwrap();
+        
+        // Transaction 1 tries to upgrade to Exclusive again, which should now succeed
+        lock_mgr.acquire_lock("table1", 1, LockType::Exclusive).unwrap();
     }
 }
 

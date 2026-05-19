@@ -833,7 +833,10 @@ impl BTree {
         }
 
         // Split point (middle of keys)
-        let split_index = entries.len() / 2;
+        let mut split_index = entries.len() / 2;
+        if split_index == 0 && !entries.is_empty() {
+            split_index = 1;
+        }
         let split_key = entries[split_index].0;
 
         // Create new sibling page
