@@ -2,14 +2,17 @@
 
 use crate::btree::BTree;
 use crate::executor::Executor;
+use crate::mvcc::MvccManager;
 use crate::parser::{Parser, Statement};
 use crate::transaction::TransactionManager;
 use crate::types::{DataType, PageId, QueryResult, Result, VelociError};
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub const PAGE_SIZE: usize = 4096;
@@ -46,7 +49,9 @@ impl Default for Page {
 pub struct Pager {
     file: File,
     num_pages: u64,
-    cache: RwLock<lru::LruCache<PageId, Arc<RwLock<Page>>>>,
+    cache: Arc<DashMap<PageId, Arc<RwLock<Page>>>>,
+    cache_size: AtomicUsize,
+    max_cache_size: usize,
 }
 
 impl Pager {
@@ -68,19 +73,16 @@ impl Pager {
         Ok(Self {
             file,
             num_pages,
-            cache: RwLock::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(CACHE_SIZE).unwrap(),
-            )),
+            cache: Arc::new(DashMap::new()),
+            cache_size: AtomicUsize::new(0),
+            max_cache_size: CACHE_SIZE,
         })
     }
 
     pub fn read_page(&mut self, page_id: PageId) -> Result<Arc<RwLock<Page>>> {
-        // Check cache first
-        {
-            let mut cache = self.cache.write();
-            if let Some(page) = cache.get(&page_id) {
-                return Ok(Arc::clone(page));
-            }
+        // Check cache first (lock-free read via DashMap)
+        if let Some(page) = self.cache.get(&page_id) {
+            return Ok(page.clone());
         }
 
         // Read from disk
@@ -98,9 +100,23 @@ impl Pager {
 
         let page_arc = Arc::new(RwLock::new(page));
 
+        // Evict if cache is full
+        while self.cache.len() >= self.max_cache_size {
+            // Evict the first entry we can remove
+            let key_to_remove = self.cache.iter().next().map(|e| *e.key());
+            if let Some(key) = key_to_remove {
+                if self.cache.remove(&key).is_some() {
+                    self.cache_size.fetch_sub(1, Ordering::Relaxed);
+                }
+            } else {
+                break;
+            }
+        }
+
         // Add to cache
-        let mut cache = self.cache.write();
-        cache.put(page_id, Arc::clone(&page_arc));
+        if self.cache.insert(page_id, page_arc.clone()).is_none() {
+            self.cache_size.fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(page_arc)
     }
@@ -111,9 +127,23 @@ impl Pager {
         self.file.write_all(&page.data)?;
         self.file.sync_data()?;
 
-        // Update cache
-        let mut cache = self.cache.write();
-        cache.put(page_id, Arc::new(RwLock::new(page.clone())));
+        // Update cache (evict if needed before inserting)
+        while self.cache.len() >= self.max_cache_size {
+            let key_to_remove = self.cache.iter().next().map(|e| *e.key());
+            if let Some(key) = key_to_remove {
+                if key == page_id {
+                    break;
+                }
+                if self.cache.remove(&key).is_some() {
+                    self.cache_size.fetch_sub(1, Ordering::Relaxed);
+                }
+            } else {
+                break;
+            }
+        }
+        if self.cache.insert(page_id, Arc::new(RwLock::new(page.clone()))).is_none() {
+            self.cache_size.fetch_add(1, Ordering::Relaxed);
+        }
 
         if page_id >= self.num_pages {
             self.num_pages = page_id + 1;
@@ -164,6 +194,8 @@ pub struct Database {
     btrees: Arc<RwLock<HashMap<String, Arc<RwLock<BTree>>>>>,
     transaction_manager: Arc<TransactionManager>,
     schema: Arc<RwLock<Schema>>,
+    mvcc: Arc<MvccManager>,
+    executor: RwLock<Option<Arc<Executor>>>,
 }
 
 impl Database {
@@ -191,12 +223,15 @@ impl Database {
         let btrees = Arc::new(RwLock::new(HashMap::new()));
         let transaction_manager = Arc::new(TransactionManager::new());
         let schema = Arc::new(RwLock::new(Schema::new()));
+        let mvcc = Arc::new(MvccManager::new());
 
         let db = Arc::new(Self {
             pager,
             btrees,
             transaction_manager,
             schema,
+            mvcc,
+            executor: RwLock::new(None),
         });
 
         // Initialize if new database
@@ -227,79 +262,110 @@ impl Database {
     }
 
     fn load_schema(&self) -> Result<()> {
-        let pager_read = self.pager.read();
-        if pager_read.num_pages() < 2 {
-            return Ok(()); // No schema page yet
-        }
-        drop(pager_read);
+        // Read all schema pages (starting from page 1) until we hit the last one
+        let mut data_copy = Vec::new();
+        let mut schema_page = 1u64;
 
-        // Read schema data without holding the lock for too long
-        let data_copy: Vec<u8> = {
-            let mut pager = self.pager.write();
-            let page_arc = pager.read_page(1)?;
-            let page = page_arc.read();
-            let data = page.data();
+        loop {
+            let pager_read = self.pager.read();
+            if pager_read.num_pages() <= schema_page {
+                break;
+            }
+            drop(pager_read);
 
-            // Simple schema format: number of tables, then each table
-            if data.len() < 4 {
-                return Ok(()); // Empty schema
+            let page_data: Vec<u8> = {
+                let mut pager = self.pager.write();
+                let page_arc = pager.read_page(schema_page)?;
+                let page = page_arc.read();
+                page.data().to_vec()
+            };
+
+            if page_data.len() < 4 {
+                break;
             }
 
-            // Copy data to avoid holding locks while parsing
-            data.to_vec()
-        };
+            let chunk_len = u32::from_le_bytes(
+                page_data[0..4].try_into()
+                    .map_err(|_| VelociError::Corruption("Failed to read chunk length".to_string()))?
+            ) as usize;
 
-        // Parse schema without holding pager lock
-        let data = &data_copy[..];
-        if data.len() < 4 {
-            return Ok(());
+            let chunk_end = std::cmp::min(4 + chunk_len, page_data.len());
+            data_copy.extend_from_slice(&page_data[4..chunk_end]);
+
+            if chunk_len < PAGE_SIZE - 4 {
+                break; // Last page (partial chunk)
+            }
+            schema_page += 1;
         }
 
-        let num_tables = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0, 0, 0, 0]));
-        let mut offset = 4;
+        if data_copy.len() < 4 {
+            return Ok(()); // Empty schema
+        }
+
+        let data = &data_copy[..];
+
+        let num_tables = u32::from_le_bytes(
+            data[0..4].try_into()
+                .map_err(|_| VelociError::Corruption("Failed to read table count".to_string()))?
+        );
+        let mut offset: usize = 4;
 
         for _ in 0..num_tables {
-            if offset + 8 > data.len() {
-                break; // Corrupted data
+            if offset + 4 > data.len() {
+                return Err(VelociError::Corruption("Schema truncated at table name length".to_string()));
             }
 
-            // Table name length and name
-            let name_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or([0, 0, 0, 0])) as usize;
+            let name_len = u32::from_le_bytes(
+                data[offset..offset + 4].try_into()
+                    .map_err(|_| VelociError::Corruption("Failed to read table name length".to_string()))?
+            ) as usize;
             offset += 4;
 
             if offset + name_len > data.len() {
-                break;
+                return Err(VelociError::Corruption(format!(
+                    "Schema truncated at table name (expected {} bytes)", name_len
+                )));
             }
 
             let table_name = String::from_utf8(data[offset..offset + name_len].to_vec())
-                .unwrap_or_default();
+                .map_err(|_| VelociError::Corruption(format!("Invalid UTF-8 in table name at offset {}", offset)))?;
             offset += name_len;
 
-            // Number of columns
             if offset + 4 > data.len() {
-                break;
+                return Err(VelociError::Corruption(format!(
+                    "Schema truncated at column count for table '{}'", table_name
+                )));
             }
 
-            let num_cols = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or([0, 0, 0, 0])) as usize;
+            let num_cols = u32::from_le_bytes(
+                data[offset..offset + 4].try_into()
+                    .map_err(|_| VelociError::Corruption("Failed to read column count".to_string()))?
+            ) as usize;
             offset += 4;
 
             let mut columns = Vec::new();
             let mut table_root_page: u64 = 0;
             for _ in 0..num_cols {
-                if offset + 13 > data.len() {
-                    break;
+                if offset + 4 > data.len() {
+                    return Err(VelociError::Corruption(format!(
+                        "Schema truncated at column name length in table '{}'", table_name
+                    )));
                 }
 
-                // Column data: name_len(4) + name + data_type(1) + flags(1) + root_page(8)
-                let col_name_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or([0, 0, 0, 0])) as usize;
+                let col_name_len = u32::from_le_bytes(
+                    data[offset..offset + 4].try_into()
+                        .map_err(|_| VelociError::Corruption("Failed to read column name length".to_string()))?
+                ) as usize;
                 offset += 4;
 
                 if offset + col_name_len + 10 > data.len() {
-                    break;
+                    return Err(VelociError::Corruption(format!(
+                        "Schema truncated at column data for table '{}'", table_name
+                    )));
                 }
 
                 let col_name = String::from_utf8(data[offset..offset + col_name_len].to_vec())
-                    .unwrap_or_default();
+                    .map_err(|_| VelociError::Corruption(format!("Invalid UTF-8 in column name at offset {}", offset)))?;
                 offset += col_name_len;
 
                 let data_type_byte = data[offset];
@@ -308,7 +374,10 @@ impl Database {
                     1 => DataType::Real,
                     2 => DataType::Text,
                     3 => DataType::Blob,
-                    _ => DataType::Text,
+                    _ => return Err(VelociError::Corruption(format!(
+                        "Unknown data type byte {} for column '{}' in table '{}'",
+                        data_type_byte, col_name, table_name
+                    ))),
                 };
                 offset += 1;
 
@@ -318,10 +387,12 @@ impl Database {
                 let unique = (flags & 4) != 0;
                 offset += 1;
 
-                let root_page = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap_or([0, 0, 0, 0, 0, 0, 0, 0]));
+                let root_page = u64::from_le_bytes(
+                    data[offset..offset + 8].try_into()
+                        .map_err(|_| VelociError::Corruption("Failed to read root page".to_string()))?
+                );
                 offset += 8;
 
-                // Use the first non-zero root_page as the table's root page
                 if table_root_page == 0 && root_page != 0 {
                     table_root_page = root_page;
                 }
@@ -335,13 +406,10 @@ impl Database {
                 });
             }
 
-            // Create B-Tree for this table (once per table, not per column)
             let btree_root = if table_root_page == 0 {
-                // Root page is invalid, create a new properly initialized B-Tree
                 let mut pager = self.pager.write();
                 let new_root_page = pager.allocate_page()?;
 
-                // Initialize as B-Tree leaf node
                 let mut page = crate::storage::Page::new();
                 let header = crate::btree::NodeHeader::new_leaf();
                 header.serialize(page.data_mut());
@@ -355,7 +423,6 @@ impl Database {
             let btree = crate::btree::BTree::from_root(btree_root, Arc::clone(&self.pager));
             self.btrees.write().insert(table_name.clone(), Arc::new(RwLock::new(btree)));
 
-            // Add table to schema
             let table_schema = TableSchema {
                 name: table_name,
                 columns,
@@ -418,14 +485,12 @@ impl Database {
                     let root_page = if let Some(btree_arc) = self.btrees.read().get(&table_name) {
                         let rp = btree_arc.read().root_page();
                         if rp == 0 {
-                            // This shouldn't happen for properly initialized B-Trees
                             eprintln!("Warning: Table '{}' has invalid root page 0", table_name);
                             0u64
                         } else {
                             rp
                         }
                     } else {
-                        // This shouldn't happen - B-Tree should exist for created tables
                         eprintln!("Warning: No B-Tree found for table '{}'", table_name);
                         0u64
                     };
@@ -434,25 +499,50 @@ impl Database {
             }
         }
 
-        // Write to schema page (page 1)
+        // Write schema across multiple pages if needed
         let mut pager = self.pager.write();
-        if pager.num_pages() < 2 {
-            pager.allocate_page()?; // Ensure schema page exists
+        let usable_size = PAGE_SIZE - 4; // Reserve 4 bytes for chunk length header
+        let num_pages_needed = if buffer.is_empty() { 1 } else { (buffer.len() + usable_size - 1) / usable_size };
+
+        // Ensure we have enough schema pages (starting from page 1)
+        while pager.num_pages() < 1 + num_pages_needed as u64 {
+            pager.allocate_page()?;
         }
 
-        let mut page = crate::storage::Page::new();
-        let copy_len = std::cmp::min(buffer.len(), crate::storage::PAGE_SIZE);
-        if buffer.len() > crate::storage::PAGE_SIZE {
-            return Err(VelociError::StorageError(format!(
-                "Schema size ({} bytes) exceeds page size ({} bytes). Consider multi-page schema storage.",
-                buffer.len(),
-                crate::storage::PAGE_SIZE
-            )));
+        for page_idx in 0..num_pages_needed {
+            let start = page_idx * usable_size;
+            let end = std::cmp::min(start + usable_size, buffer.len());
+            let chunk = &buffer[start..end];
+
+            let mut page = crate::storage::Page::new();
+            // First 4 bytes: chunk length for this page (u32)
+            let chunk_len = chunk.len() as u32;
+            page.data_mut()[0..4].copy_from_slice(&chunk_len.to_le_bytes());
+            page.data_mut()[4..4 + chunk.len()].copy_from_slice(chunk);
+
+            let schema_page_id = 1 + page_idx as u64;
+            pager.write_page(schema_page_id, &page)?;
         }
-        page.data_mut()[0..copy_len].copy_from_slice(&buffer[0..copy_len]);
-        pager.write_page(1, &page)?;
 
         Ok(())
+    }
+
+    fn get_or_create_executor(&self) -> Arc<Executor> {
+        {
+            let exec_guard = self.executor.read();
+            if let Some(ref exec) = *exec_guard {
+                return Arc::clone(exec);
+            }
+        }
+        let exec = Arc::new(Executor::new(
+            Arc::clone(&self.pager),
+            Arc::clone(&self.btrees),
+            Arc::clone(&self.schema),
+            Arc::clone(&self.transaction_manager),
+            Arc::clone(&self.mvcc),
+        ));
+        *self.executor.write() = Some(Arc::clone(&exec));
+        exec
     }
 
     /// Executes a SQL statement that does not return rows (e.g., CREATE, INSERT, UPDATE, DELETE).
@@ -473,14 +563,9 @@ impl Database {
         let parser = Parser::new();
         let statement = parser.parse(sql)?;
 
-        let executor = Executor::new(
-            Arc::clone(&self.pager),
-            Arc::clone(&self.btrees),
-            Arc::clone(&self.schema),
-            Arc::clone(&self.transaction_manager),
-        );
+        let executor = self.get_or_create_executor();
 
-        executor.execute(statement.clone())?;
+        executor.execute_statement(statement.clone())?;
 
         // Save schema if this was a DDL statement
         match statement {
@@ -518,14 +603,27 @@ impl Database {
         let parser = Parser::new();
         let statement = parser.parse(sql)?;
         
-        let executor = Executor::new(
-            Arc::clone(&self.pager),
-            Arc::clone(&self.btrees),
-            Arc::clone(&self.schema),
-            Arc::clone(&self.transaction_manager),
-        );
+        let executor = self.get_or_create_executor();
         
-        executor.query(statement)
+        executor.query_statement(statement)
+    }
+
+    /// Begins an explicit transaction.
+    pub fn begin(&self) -> Result<()> {
+        let executor = self.get_or_create_executor();
+        executor.begin_transaction()
+    }
+
+    /// Commits the current explicit transaction.
+    pub fn commit(&self) -> Result<()> {
+        let executor = self.get_or_create_executor();
+        executor.commit_transaction()
+    }
+
+    /// Rolls back the current explicit transaction.
+    pub fn rollback(&self) -> Result<()> {
+        let executor = self.get_or_create_executor();
+        executor.rollback_transaction()
     }
 
     /// Closes the database and flushes all changes to disk.

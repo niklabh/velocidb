@@ -4,10 +4,12 @@
 use crate::storage::{Page, PAGE_SIZE};
 use crate::types::{PageId, Result, VelociError};
 use async_trait::async_trait;
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::RwLock as TokioRwLock;
@@ -163,39 +165,51 @@ impl AsyncVfs for TokioVfs {
     }
 }
 
-/// Async page cache with LRU eviction
+/// Async page cache with concurrent access
 pub struct AsyncPageCache {
-    cache: Arc<RwLock<lru::LruCache<PageId, Arc<Page>>>>,
+    cache: Arc<DashMap<PageId, Arc<Page>>>,
+    capacity: usize,
+    size: AtomicUsize,
     vfs: Arc<dyn AsyncVfs>,
 }
 
 impl AsyncPageCache {
     pub fn new(capacity: usize, vfs: Arc<dyn AsyncVfs>) -> Self {
         Self {
-            cache: Arc::new(RwLock::new(
-                lru::LruCache::new(std::num::NonZeroUsize::new(capacity).unwrap()),
-            )),
+            cache: Arc::new(DashMap::new()),
+            capacity,
+            size: AtomicUsize::new(0),
             vfs,
         }
     }
 
     /// Read a page with caching
     pub async fn read_page(&self, page_id: PageId) -> Result<Arc<Page>> {
-        // Check cache first
-        {
-            let mut cache = self.cache.write();
-            if let Some(page) = cache.get(&page_id) {
-                return Ok(Arc::clone(page));
-            }
+        // Check cache first (lock-free read via DashMap)
+        if let Some(page) = self.cache.get(&page_id) {
+            return Ok(page.clone());
         }
 
         // Cache miss - read from VFS
         let page = self.vfs.read_page(page_id).await?;
         let page_arc = Arc::new(page);
 
+        // Evict if needed
+        while self.cache.len() >= self.capacity {
+            let key_to_remove = self.cache.iter().next().map(|e| *e.key());
+            if let Some(key) = key_to_remove {
+                if self.cache.remove(&key).is_some() {
+                    self.size.fetch_sub(1, Ordering::Relaxed);
+                }
+            } else {
+                break;
+            }
+        }
+
         // Add to cache
-        let mut cache = self.cache.write();
-        cache.put(page_id, Arc::clone(&page_arc));
+        if self.cache.insert(page_id, Arc::clone(&page_arc)).is_none() {
+            self.size.fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(page_arc)
     }
@@ -205,10 +219,25 @@ impl AsyncPageCache {
         // Write to VFS first
         self.vfs.write_page(page_id, &page).await?;
 
-        // Update cache
+        // Update cache (evict if needed before inserting)
+        while self.cache.len() >= self.capacity {
+            let key_to_remove = self.cache.iter().next().map(|e| *e.key());
+            if let Some(key) = key_to_remove {
+                if key == page_id {
+                    break;
+                }
+                if self.cache.remove(&key).is_some() {
+                    self.size.fetch_sub(1, Ordering::Relaxed);
+                }
+            } else {
+                break;
+            }
+        }
+
         let page_arc = Arc::new(page);
-        let mut cache = self.cache.write();
-        cache.put(page_id, page_arc);
+        if self.cache.insert(page_id, page_arc).is_none() {
+            self.size.fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(())
     }
@@ -225,10 +254,9 @@ impl AsyncPageCache {
 
     /// Get cache statistics
     pub fn cache_stats(&self) -> CacheStats {
-        let cache = self.cache.read();
         CacheStats {
-            size: cache.len(),
-            capacity: cache.cap().get(),
+            size: self.cache.len(),
+            capacity: self.capacity,
         }
     }
 }
