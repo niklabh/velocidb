@@ -7,6 +7,7 @@ mod parser;
 mod executor;
 mod transaction;
 mod types;
+mod mvcc;
 
 use anyhow::Result;
 use std::env;
@@ -43,6 +44,27 @@ fn process_command(db: &Database, input: &str) -> Result<bool> {
                 }
             }
             return Ok(true); // Continue
+        }
+        "begin" | "begin transaction" => {
+            match db.begin() {
+                Ok(()) => println!("Transaction started."),
+                Err(e) => println!("Error: {}", e),
+            }
+            return Ok(true);
+        }
+        "commit" | "commit transaction" => {
+            match db.commit() {
+                Ok(()) => println!("Transaction committed."),
+                Err(e) => println!("Error: {}", e),
+            }
+            return Ok(true);
+        }
+        "rollback" | "rollback transaction" => {
+            match db.rollback() {
+                Ok(()) => println!("Transaction rolled back."),
+                Err(e) => println!("Error: {}", e),
+            }
+            return Ok(true);
         }
         _ => {}
     }
@@ -223,6 +245,11 @@ fn print_help() {
     println!("  SELECT * FROM <table> WHERE ...   - Query with filter");
     println!("  UPDATE <table> SET ... WHERE ...  - Update data");
     println!("  DELETE FROM <table> WHERE ...     - Delete data");
+    println!();
+    println!("Transaction Commands:");
+    println!("  BEGIN                            - Start a transaction");
+    println!("  COMMIT                           - Commit transaction");
+    println!("  ROLLBACK                         - Rollback transaction");
     println!();
     println!("Meta Commands:");
     println!("  .help    - Show this help");

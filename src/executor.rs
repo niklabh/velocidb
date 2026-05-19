@@ -1,9 +1,10 @@
 // Query executor
 
 use crate::btree::BTree;
+use crate::mvcc::{MvccManager, Snapshot};
 use crate::parser::{Statement, WhereClause};
 use crate::storage::{Pager, Schema, TableSchema};
-use crate::transaction::{LockManager, LockType, TransactionManager};
+use crate::transaction::{LockManager, LockType, TransactionManager, Transaction};
 use crate::types::{Column, QueryResult, Result, Row, Value, VelociError};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -15,6 +16,9 @@ pub struct Executor {
     schema: Arc<RwLock<Schema>>,
     transaction_manager: Arc<TransactionManager>,
     lock_manager: Arc<LockManager>,
+    mvcc: Arc<MvccManager>,
+    active_transaction: RwLock<Option<Arc<Transaction>>>,
+    active_snapshot: RwLock<Option<Snapshot>>,
 }
 
 impl Executor {
@@ -23,6 +27,7 @@ impl Executor {
         btrees: Arc<RwLock<HashMap<String, Arc<RwLock<BTree>>>>>,
         schema: Arc<RwLock<Schema>>,
         transaction_manager: Arc<TransactionManager>,
+        mvcc: Arc<MvccManager>,
     ) -> Self {
         Self {
             pager,
@@ -30,44 +35,95 @@ impl Executor {
             schema,
             transaction_manager,
             lock_manager: Arc::new(LockManager::new()),
+            mvcc,
+            active_transaction: RwLock::new(None),
+            active_snapshot: RwLock::new(None),
         }
     }
 
-    pub fn execute(&self, statement: Statement) -> Result<()> {
+    pub fn execute_statement(&self, statement: Statement) -> Result<()> {
         match statement {
             Statement::CreateTable { name, columns } => self.execute_create_table(&name, columns),
             Statement::DropTable { name } => self.execute_drop_table(&name),
-            Statement::Insert {
-                table,
-                columns,
-                values,
-            } => self.execute_insert(&table, columns, values),
-            Statement::Update {
-                table,
-                assignments,
-                where_clause,
-            } => self.execute_update(&table, assignments, where_clause),
-            Statement::Delete {
-                table,
-                where_clause,
-            } => self.execute_delete(&table, where_clause),
-            _ => Err(VelociError::ParseError(
-                "Statement should be executed with query()".to_string(),
-            )),
+            Statement::Insert { table, columns, values } => self.execute_insert(&table, columns, values),
+            Statement::Update { table, assignments, where_clause } => self.execute_update(&table, assignments, where_clause),
+            Statement::Delete { table, where_clause } => self.execute_delete(&table, where_clause),
+            Statement::BeginTransaction => self.begin_transaction(),
+            Statement::CommitTransaction => self.commit_transaction(),
+            Statement::RollbackTransaction => self.rollback_transaction(),
+            _ => Err(VelociError::ParseError("Statement should be executed with query()".to_string())),
         }
     }
 
-    pub fn query(&self, statement: Statement) -> Result<QueryResult> {
+    pub fn query_statement(&self, statement: Statement) -> Result<QueryResult> {
         match statement {
-            Statement::Select {
-                table,
-                columns,
-                where_clause,
-            } => self.execute_select(&table, columns, where_clause),
-            _ => Err(VelociError::ParseError(
-                "Statement is not a query".to_string(),
-            )),
+            Statement::Select { table, columns, where_clause } => self.execute_select(&table, columns, where_clause),
+            _ => Err(VelociError::ParseError("Statement is not a query".to_string())),
         }
+    }
+
+    pub fn begin_transaction(&self) -> Result<()> {
+        let mut active = self.active_transaction.write();
+        if active.is_some() {
+            return Err(VelociError::TransactionError("Transaction already in progress".to_string()));
+        }
+        let txn = self.transaction_manager.begin();
+        let snapshot = self.mvcc.begin_transaction();
+        *self.active_snapshot.write() = Some(snapshot);
+        *active = Some(txn);
+        Ok(())
+    }
+
+    pub fn commit_transaction(&self) -> Result<()> {
+        let mut active = self.active_transaction.write();
+        let mut snap = self.active_snapshot.write();
+        match active.take() {
+            Some(txn) => {
+                if let Some(ref snapshot) = *snap {
+                    let _ = self.mvcc.commit_transaction(snapshot);
+                }
+                *snap = None;
+                self.transaction_manager.commit(&txn)?;
+                self.lock_manager.release_all_locks(txn.id());
+                Ok(())
+            }
+            None => Err(VelociError::TransactionError("No active transaction to commit".to_string())),
+        }
+    }
+
+    pub fn rollback_transaction(&self) -> Result<()> {
+        let mut active = self.active_transaction.write();
+        let mut snap = self.active_snapshot.write();
+        match active.take() {
+            Some(txn) => {
+                if let Some(ref snapshot) = *snap {
+                    let _ = self.mvcc.abort_transaction(snapshot);
+                }
+                *snap = None;
+                self.transaction_manager.abort(&txn)?;
+                self.lock_manager.release_all_locks(txn.id());
+                Ok(())
+            }
+            None => Err(VelociError::TransactionError("No active transaction to rollback".to_string())),
+        }
+    }
+
+    fn get_snapshot(&self, auto_snapshot: &mut Option<Snapshot>) {
+        if let Some(ref snap) = *self.active_snapshot.read() {
+            *auto_snapshot = Some(snap.clone());
+        } else {
+            *auto_snapshot = Some(self.mvcc.begin_transaction());
+        }
+    }
+
+    fn commit_snapshot(&self, snapshot: &Snapshot, auto_commit: bool) {
+        if auto_commit {
+            let _ = self.mvcc.commit_transaction(snapshot);
+        }
+    }
+
+    fn active_txn_id(&self) -> Option<crate::types::TransactionId> {
+        self.active_transaction.read().as_ref().map(|t| t.id())
     }
 
     fn execute_create_table(&self, name: &str, columns: Vec<Column>) -> Result<()> {
@@ -116,19 +172,26 @@ impl Executor {
         columns: Option<Vec<String>>,
         values: Vec<Value>,
     ) -> Result<()> {
-        // LOCK ORDERING (Safe):
-        // 1. TransactionManager (begin - Level 1)
-        // 2. LockManager (table lock - Level 2)
-        // 3. Schema (read - Level 1, but released quickly)
-        // 4. BTree (write - Level 3, acquired once)
-        // 5. TransactionManager (commit - Level 1)
-        
-        // Start transaction
-        let txn = self.transaction_manager.begin();
-        
-        // Acquire table-level lock early
-        self.lock_manager
-            .acquire_lock(table, txn.id(), LockType::Exclusive)?;
+        // Check if we're in an explicit transaction; if not, auto-commit
+        let explicit_txn = self.active_transaction.read().clone();
+        let txn: Arc<Transaction>;
+        let auto_commit: bool;
+
+        if let Some(ref active) = explicit_txn {
+            txn = Arc::clone(active);
+            auto_commit = false;
+        } else {
+            txn = self.transaction_manager.begin();
+            auto_commit = true;
+        }
+
+        if !auto_commit {
+            self.lock_manager
+                .acquire_lock(table, txn.id(), LockType::Exclusive)?;
+        } else {
+            self.lock_manager
+                .acquire_lock(table, txn.id(), LockType::Exclusive)?;
+        }
 
         // Get table schema and immediately clone to release lock
         let table_schema = {
@@ -211,8 +274,9 @@ impl Executor {
                     pk_value, table
                 )))
             } else {
-                // Insert into B-Tree
-                btree.insert(pk_value, &row)
+                // Insert into B-Tree for persistence
+                btree.insert(pk_value, &row)?;
+                Ok(())
             }
         }; // btrees and btree locks released here
 
@@ -223,9 +287,19 @@ impl Executor {
             return Err(e);
         }
 
-        // Commit transaction and release locks
-        self.transaction_manager.commit(&txn)?;
-        self.lock_manager.release_lock(table, txn.id())?;
+        // Also write to MVCC version store for snapshot isolation
+        let mut mvcc_snap: Option<Snapshot> = None;
+        self.get_snapshot(&mut mvcc_snap);
+        if let Some(ref snap) = mvcc_snap {
+            let _ = self.mvcc.insert_version(table, pk_value, row.values.clone(), snap);
+            self.commit_snapshot(snap, auto_commit);
+        }
+
+        // Only commit/release lock for auto-commit mode
+        if auto_commit {
+            self.transaction_manager.commit(&txn)?;
+            self.lock_manager.release_lock(table, txn.id())?;
+        }
 
         Ok(())
     }
@@ -236,14 +310,18 @@ impl Executor {
         columns: Vec<String>,
         where_clause: Option<WhereClause>,
     ) -> Result<QueryResult> {
-        // LOCK ORDERING (Safe):
-        // 1. TransactionManager (begin)
-        // 2. LockManager (shared lock on table)
-        // 3. Schema (read, then release)
-        // 4. BTree (read, single acquisition)
-        // 5. TransactionManager (commit)
-        
-        let txn = self.transaction_manager.begin();
+        let explicit_txn = self.active_transaction.read().clone();
+        let txn: Arc<Transaction>;
+        let auto_commit: bool;
+
+        if let Some(ref active) = explicit_txn {
+            txn = Arc::clone(active);
+            auto_commit = false;
+        } else {
+            txn = self.transaction_manager.begin();
+            auto_commit = true;
+        }
+
         self.lock_manager
             .acquire_lock(table, txn.id(), LockType::Shared)?;
 
@@ -253,15 +331,30 @@ impl Executor {
             schema.get_table(table)?.clone()
         }; // schema lock released
 
-        // Scan rows with minimal lock scope
-        let all_rows = {
+        // Try reading from MVCC version store first (snapshot isolation)
+        let mut mvcc_snap: Option<Snapshot> = None;
+        self.get_snapshot(&mut mvcc_snap);
+        let mvcc_rows = if let Some(ref snap) = mvcc_snap {
+            self.mvcc.scan_table(table, snap).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let all_rows: Vec<(i64, Row)> = if !mvcc_rows.is_empty() {
+            mvcc_rows.into_iter().map(|(k, v)| (k, Row::new(v))).collect()
+        } else {
             let btrees = self.btrees.read();
             let btree_arc = btrees.get(table).ok_or_else(|| {
                 VelociError::NotFound(format!("Table '{}' not initialized", table))
             })?;
             let btree = btree_arc.read();
             btree.scan()?
-        }; // btrees and btree locks released
+        };
+
+        // Commit MVCC snapshot if auto-commit
+        if let Some(ref snap) = mvcc_snap {
+            self.commit_snapshot(snap, auto_commit);
+        }
 
         // Process data without holding any locks
         let filtered_rows: Vec<(i64, Row)> = if let Some(ref where_clause) = where_clause {
@@ -288,8 +381,10 @@ impl Executor {
             }];
             let result_rows = vec![Row::new(vec![Value::Integer(count)])];
 
-            self.transaction_manager.commit(&txn)?;
-            self.lock_manager.release_lock(table, txn.id())?;
+            if auto_commit {
+                self.transaction_manager.commit(&txn)?;
+                self.lock_manager.release_lock(table, txn.id())?;
+            }
 
             return Ok(QueryResult::new(result_columns, result_rows));
         }
@@ -331,9 +426,10 @@ impl Executor {
             })
             .collect();
 
-        // Commit transaction and release locks
-        self.transaction_manager.commit(&txn)?;
-        self.lock_manager.release_lock(table, txn.id())?;
+        if auto_commit {
+            self.transaction_manager.commit(&txn)?;
+            self.lock_manager.release_lock(table, txn.id())?;
+        }
 
         Ok(QueryResult::new(result_columns, result_rows))
     }
@@ -344,10 +440,16 @@ impl Executor {
         assignments: HashMap<String, Value>,
         where_clause: Option<WhereClause>,
     ) -> Result<()> {
-        // LOCK ORDERING (Safe):
-        // Similar to execute_insert - acquire locks in order, release early
-        
-        let txn = self.transaction_manager.begin();
+        let explicit_txn = self.active_transaction.read().clone();
+        let txn: Arc<Transaction>;
+        let auto_commit: bool;
+        if let Some(ref active) = explicit_txn {
+            txn = Arc::clone(active);
+            auto_commit = false;
+        } else {
+            txn = self.transaction_manager.begin();
+            auto_commit = true;
+        }
         self.lock_manager
             .acquire_lock(table, txn.id(), LockType::Exclusive)?;
 
@@ -437,18 +539,25 @@ impl Executor {
             return Err(e);
         }
 
-        // Commit transaction and release locks
-        self.transaction_manager.commit(&txn)?;
-        self.lock_manager.release_lock(table, txn.id())?;
+        if auto_commit {
+            self.transaction_manager.commit(&txn)?;
+            self.lock_manager.release_lock(table, txn.id())?;
+        }
 
         Ok(())
     }
 
     fn execute_delete(&self, table: &str, where_clause: Option<WhereClause>) -> Result<()> {
-        // LOCK ORDERING (Safe):
-        // Same pattern as other operations
-        
-        let txn = self.transaction_manager.begin();
+        let explicit_txn = self.active_transaction.read().clone();
+        let txn: Arc<Transaction>;
+        let auto_commit: bool;
+        if let Some(ref active) = explicit_txn {
+            txn = Arc::clone(active);
+            auto_commit = false;
+        } else {
+            txn = self.transaction_manager.begin();
+            auto_commit = true;
+        }
         self.lock_manager
             .acquire_lock(table, txn.id(), LockType::Exclusive)?;
 
@@ -459,7 +568,7 @@ impl Executor {
         }; // schema lock released
 
         // Perform delete with single btree lock acquisition
-        let result = {
+        let (result, deleted_keys) = {
             let btrees = self.btrees.read();
             let btree_arc = btrees.get(table).ok_or_else(|| {
                 VelociError::NotFound(format!("Table '{}' not initialized", table))
@@ -481,11 +590,11 @@ impl Executor {
             };
 
             // Delete each row
-            for key in rows_to_delete {
-                btree.delete(key)?;
+            for key in &rows_to_delete {
+                btree.delete(*key)?;
             }
             
-            Ok::<(), VelociError>(())
+            (Ok::<(), VelociError>(()), rows_to_delete)
         }; // btrees and btree locks released
 
         // Handle errors
@@ -495,9 +604,20 @@ impl Executor {
             return Err(e);
         }
 
-        // Commit transaction and release locks
-        self.transaction_manager.commit(&txn)?;
-        self.lock_manager.release_lock(table, txn.id())?;
+        // Also mark deleted in MVCC version store
+        let mut mvcc_snap: Option<Snapshot> = None;
+        self.get_snapshot(&mut mvcc_snap);
+        if let Some(ref snap) = mvcc_snap {
+            for key in &deleted_keys {
+                let _ = self.mvcc.delete_version(table, *key, snap);
+            }
+            self.commit_snapshot(snap, auto_commit);
+        }
+
+        if auto_commit {
+            self.transaction_manager.commit(&txn)?;
+            self.lock_manager.release_lock(table, txn.id())?;
+        }
 
         Ok(())
     }

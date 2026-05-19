@@ -32,6 +32,9 @@ pub enum Statement {
         table: String,
         where_clause: Option<WhereClause>,
     },
+    BeginTransaction,
+    CommitTransaction,
+    RollbackTransaction,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -170,6 +173,12 @@ impl Parser {
             self.parse_update(sql)
         } else if upper.starts_with("DELETE FROM") {
             self.parse_delete(sql)
+        } else if upper == "BEGIN" || upper == "BEGIN TRANSACTION" {
+            Ok(Statement::BeginTransaction)
+        } else if upper == "COMMIT" || upper == "COMMIT TRANSACTION" {
+            Ok(Statement::CommitTransaction)
+        } else if upper == "ROLLBACK" || upper == "ROLLBACK TRANSACTION" {
+            Ok(Statement::RollbackTransaction)
         } else {
             Err(VelociError::ParseError(format!(
                 "Unsupported statement: {}",
