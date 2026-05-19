@@ -1,5 +1,7 @@
-// Hybrid Row/Columnar Storage Layout
-// Row-major for OLTP, columnar projections for OLAP
+//! Hybrid row/columnar storage for mixed OLTP + OLAP workloads.
+//!
+//! [`HybridTable`] stores data row-major by default and projects columns on
+//! demand. Supports adaptive layout switching based on access patterns.
 
 use crate::types::{Column, Result, Row, Value, VelociError};
 use crate::simd::{VectorColumn, VectorBatch};

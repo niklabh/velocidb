@@ -1,5 +1,10 @@
-// Lock-free data structures for maximum concurrency
-// Minimizes context switching and kernel overhead on multi-core systems
+//! Lock-free data structures for multi-core scalability.
+//!
+//! - [`LockFreePageCache`] — wait-free reads, lock-free inserts/evictions.
+//! - [`LockFreeIoQueue`] — MPSC queue for I/O request dispatch.
+//! - [`LockFreeCounter`] — atomic counter with CAS-based increment.
+//!
+//! Built on `crossbeam-epoch` and `crossbeam-queue` to minimise kernel overhead.
 
 use crate::storage::{Page, PAGE_SIZE};
 use crate::types::{PageId, Result, VelociError};

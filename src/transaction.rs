@@ -1,10 +1,11 @@
-// Transaction management with ACID guarantees
-// 
-// LOCK ORDERING RULES:
-// 1. TransactionManager::active_transactions (Level 1 - Global)
-// 2. Individual Transaction::state (Level 2 - Per-transaction)
-// 
-// SAFETY: Use atomic state instead of RwLock to eliminate per-transaction lock contention
+//! ACID transaction manager with two-phase locking and atomic state transitions.
+//!
+//! ## Lock ordering (prevent deadlocks)
+//! 1. `TransactionManager::active_transactions` (Level 1 — Global)
+//! 2. Individual `Transaction::state` (Level 2 — Per-transaction)
+//!
+//! Per-transaction state is stored in an [`AtomicU64`] rather than an `RwLock`
+//! to eliminate lock contention on high-throughput workloads.
 
 use crate::types::{Result, TransactionId, VelociError};
 use parking_lot::RwLock;

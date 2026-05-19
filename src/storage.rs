@@ -1,4 +1,7 @@
-// Storage layer - Pager and page management
+//! Storage engine layer: file-backed pager, database lifecycle, and schema management.
+//!
+//! This module implements a page-based storage engine with 4 KB pages,
+//! providing the foundation for B-Tree indexes and MVCC record storage.
 
 use crate::btree::BTree;
 use crate::executor::Executor;

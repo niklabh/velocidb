@@ -406,21 +406,21 @@ impl AsyncVfs for CloudVfs {
 
 ### Throughput (ops/sec)
 
-| Operation      | SQLite (Classic) | VelociDB 1.0 | VelociDB 2.0 |
-|----------------|------------------|--------------|--------------|
-| Insert         | 5,000            | 10,000       | **50,000**   |
-| Select (cache) | 20,000           | 50,000       | **200,000**  |
-| Select (scan)  | 1,000            | 2,000        | **15,000**   |
-| Update         | 4,000            | 8,000        | **30,000**   |
-| Aggregate      | 500              | 1,000        | **10,000**   |
+| Operation      | SQLite (Classic) | VelociDB v0.1 | VelociDB (target) |
+|----------------|------------------|---------------|-------------------|
+| Insert         | 5,000            | 10,000        | **50,000**        |
+| Select (cache) | 20,000           | 50,000        | **200,000**       |
+| Select (scan)  | 1,000            | 2,000         | **15,000**        |
+| Update         | 4,000            | 8,000         | **30,000**        |
+| Aggregate      | 500              | 1,000         | **10,000**        |
 
 ### Latency (microseconds)
 
-| Operation      | SQLite | VelociDB 1.0 | VelociDB 2.0 |
-|----------------|--------|--------------|--------------|
-| Single Read    | 200    | 100          | **20**       |
-| Single Write   | 500    | 250          | **50**       |
-| Transaction    | 1000   | 500          | **100**      |
+| Operation      | SQLite | VelociDB v0.1 | VelociDB (target) |
+|----------------|--------|---------------|-------------------|
+| Single Read    | 200    | 100           | **20**            |
+| Single Write   | 500    | 250           | **50**            |
+| Transaction    | 1000   | 500           | **100**           |
 
 ---
 
@@ -480,9 +480,9 @@ impl AsyncVfs for CloudVfs {
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on contributing to VelociDB 2.0.
+See [Contributing Guide](contributing.md) for guidelines on contributing to VelociDB.
 
 ## License
 
-Apache 2.0 License - See [LICENSE](LICENSE) file for details.
+MIT License - See [LICENSE](../LICENSE) file for details.
 

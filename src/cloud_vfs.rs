@@ -1,5 +1,7 @@
-// Cloud Virtual File System for remote object storage
-// Supports S3, Azure Blob, Google Cloud Storage via object_store crate
+//! Cloud VFS backed by S3, Azure Blob, or Google Cloud Storage.
+//!
+//! Behind the `cloud-vfs` feature flag. Implements [`AsyncVfs`] over the
+//! `object_store` crate with lazy page loading and prefetching.
 
 #[cfg(feature = "cloud-vfs")]
 use object_store::{ObjectStore, path::Path as ObjectPath};

@@ -39,17 +39,27 @@ cargo bench
 ```
 velocidb/
 ├── src/
-│   ├── main.rs          # Entry point
-│   ├── lib.rs           # Library interface
-│   ├── storage.rs       # Storage layer
-│   ├── btree.rs         # B-Tree implementation
-│   ├── parser.rs        # SQL parser
-│   ├── executor.rs      # Query executor
-│   ├── transaction.rs   # Transaction management
-│   └── types.rs         # Core types
-├── tests/               # Integration tests
-├── benches/             # Benchmarks
-└── docs/                # Documentation
+│   ├── main.rs              # REPL entry point
+│   ├── lib.rs               # Library interface and re-exports
+│   ├── storage.rs           # Storage engine: pager, database, schema
+│   ├── btree.rs             # B-Tree index implementation
+│   ├── btree_optimized.rs   # Cache-optimized B-Tree with SIMD search
+│   ├── parser.rs            # SQL parser (DDL, DML, DQL support)
+│   ├── executor.rs          # Query executor backed by MVCC
+│   ├── transaction.rs       # ACID transaction manager + lock manager
+│   ├── types.rs             # Core types: Value, Row, Column, errors
+│   ├── mvcc.rs              # Multi-Version Concurrency Control
+│   ├── async_io.rs          # Async I/O with Tokio / io_uring
+│   ├── lockfree.rs          # Lock-free data structures
+│   ├── simd.rs              # SIMD vectorized execution
+│   ├── crdt.rs              # CRDT-based sync (feature-gated)
+│   ├── cloud_vfs.rs         # Cloud storage VFS (feature-gated)
+│   ├── hybrid_storage.rs    # Hybrid row/columnar storage
+│   └── pmem.rs              # Persistent memory PMEM/DAX (feature-gated)
+├── tests/                   # Integration tests
+├── benches/                 # Criterion benchmarks
+├── docs/                    # Documentation
+└── Cargo.toml               # Crate manifest with feature flags
 ```
 
 ## Contributing Guidelines

@@ -1,5 +1,7 @@
-// Conflict-Free Replicated Data Types (CRDT) for distributed synchronization
-// Enables bi-directional sync without complex conflict resolution
+//! Conflict-free Replicated Data Types (CRDT) for offline-first sync.
+//!
+//! Behind the `crdt-sync` feature flag. Operation-based CRDTs with Lamport
+//! timestamps provide deterministic convergence without coordination.
 
 use crate::types::{Result, Value, VelociError};
 use serde::{Deserialize, Serialize};

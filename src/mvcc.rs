@@ -1,5 +1,8 @@
-// Multi-Version Concurrency Control (MVCC) implementation
-// Enables non-blocking reads and concurrent writes through snapshot isolation
+//! Multi-Version Concurrency Control (MVCC) with snapshot isolation.
+//!
+//! Each transaction sees a consistent snapshot. Readers never block writers
+//! and writers never block readers. Garbage collection via [`MvccManager::vacuum`]
+//! reclaims space from obsolete versions.
 
 use crate::types::{Result, TransactionId, Value, VelociError};
 use parking_lot::RwLock;

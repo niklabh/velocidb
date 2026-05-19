@@ -1,5 +1,8 @@
-// Asynchronous I/O layer for high-performance storage access
-// Supports both standard async I/O and io_uring for maximum performance
+//! Asynchronous I/O layer for high-throughput storage.
+//!
+//! Provides the [`AsyncVfs`] trait and a [`TokioVfs`] implementation by default.
+//! On Linux, `io_uring` support is available behind the `io-uring` feature flag
+//! for kernel-bypass I/O with minimal latency.
 
 use crate::storage::{Page, PAGE_SIZE};
 use crate::types::{PageId, Result, VelociError};

@@ -616,8 +616,8 @@ mount -o dax /dev/pmem0 /mnt/pmem
 
 ## Next Steps
 
-- Read [ARCHITECTURE.md](ARCHITECTURE.md) for deep dive
-- See [SQLITE2_IMPLEMENTATION.md](SQLITE2_IMPLEMENTATION.md) for research paper
+- Read [Architecture Guide](architecture.md) for a deep dive
+- See [Implementation Details](implementation.md) for design notes
 - Check module docs: `cargo doc --open`
 - Run benchmarks: `cargo bench`
 

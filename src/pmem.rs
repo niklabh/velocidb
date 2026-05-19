@@ -1,5 +1,7 @@
-// Persistent Memory (PMEM) and Direct Access (DAX) support
-// Optimized for Intel Optane DC and other byte-addressable persistent memory
+//! Persistent Memory (PMEM) VFS with Direct Access (DAX).
+//!
+//! Behind the `pmem-support` feature flag. Bypasses the kernel page cache
+//! for byte-addressable, microsecond-persistence writes on Intel Optane DC.
 
 #[cfg(feature = "pmem-support")]
 use pmem::pmem::PersistentMemory;

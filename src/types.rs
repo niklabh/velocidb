@@ -1,4 +1,7 @@
-// Type definitions for VelociDB
+//! Core type definitions for VelociDB.
+//!
+//! Includes [`Value`] (SQL data), [`Row`], [`Column`], [`QueryResult`], and
+//! the [`VelociError`] enum for structured error handling.
 
 use std::fmt;
 use serde::{Deserialize, Serialize};

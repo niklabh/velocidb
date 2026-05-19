@@ -1,5 +1,7 @@
-// VelociDB - A high-performance SQLite reimplementation in Rust
-// REPL interface for interactive SQL commands
+//! VelociDB — A high-performance embedded database engine written in Rust.
+//!
+//! This binary provides an interactive REPL for executing SQL commands.
+//! Type `help` for a list of supported commands or `exit` to quit.
 
 mod storage;
 mod btree;

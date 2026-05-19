@@ -1,5 +1,8 @@
-// Vectorized query execution using SIMD instructions
-// Leverages CPU vector units (AVX, SSE) for data parallelism
+//! Vectorized query execution using SIMD (AVX2 / AVX-512 / NEON).
+//!
+//! [`VectorizedFilter`] accelerates `WHERE` predicates and [`VectorizedAggregation`]
+//! speeds up `SUM`, `AVG`, `MIN`, `MAX` on large batches. Falls back to scalar
+//! execution on CPUs without vector extensions.
 
 use crate::types::{Result, Value, VelociError};
 

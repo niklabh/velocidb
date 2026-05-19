@@ -1,4 +1,7 @@
-// Query executor
+//! Query executor that translates AST statements into storage operations.
+//!
+//! Coordinates B-Tree, MVCC, lock manager, and schema to execute SQL
+//! statements with ACID guarantees.
 
 use crate::btree::BTree;
 use crate::mvcc::{MvccManager, Snapshot};

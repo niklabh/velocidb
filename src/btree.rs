@@ -1,4 +1,7 @@
-// B-Tree implementation for indexing
+//! B-Tree index for primary key lookups and range scans.
+//!
+//! Supports insert, delete, point lookup, and range scan operations.
+//! Keys are stored as `i64` with associated `Row` values in leaf pages.
 
 use crate::storage::{Page, Pager, PAGE_SIZE};
 use crate::types::{PageId, Result, Row, Value, VelociError};

@@ -1,4 +1,7 @@
-// SQL Parser
+//! SQL parser supporting DDL (CREATE TABLE, DROP TABLE), DML (INSERT, UPDATE,
+//! DELETE), and DQL (SELECT with WHERE, COUNT(\*) aggregation).
+//!
+//! Parses SQL text into an AST of [`Statement`] variants consumed by the executor.
 
 use crate::types::{Column, DataType, Result, Value, VelociError};
 use regex::Regex;
