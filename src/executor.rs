@@ -4,8 +4,7 @@
 //! statements with ACID guarantees.
 
 use crate::btree::BTree;
-use crate::mvcc::{MvccManager, Snapshot};
-use crate::parser::{Statement, WhereClause};
+use crate::parser::{OrderBy, Statement, WhereClause};
 use crate::storage::{Pager, Schema, TableSchema};
 use crate::transaction::{LockManager, LockType, TransactionManager, Transaction};
 use crate::types::{Column, QueryResult, Result, Row, Value, VelociError};
@@ -19,9 +18,7 @@ pub struct Executor {
     schema: Arc<RwLock<Schema>>,
     transaction_manager: Arc<TransactionManager>,
     lock_manager: Arc<LockManager>,
-    mvcc: Arc<MvccManager>,
     active_transaction: RwLock<Option<Arc<Transaction>>>,
-    active_snapshot: RwLock<Option<Snapshot>>,
 }
 
 impl Executor {
@@ -30,7 +27,6 @@ impl Executor {
         btrees: Arc<RwLock<HashMap<String, Arc<RwLock<BTree>>>>>,
         schema: Arc<RwLock<Schema>>,
         transaction_manager: Arc<TransactionManager>,
-        mvcc: Arc<MvccManager>,
     ) -> Self {
         Self {
             pager,
@@ -38,9 +34,7 @@ impl Executor {
             schema,
             transaction_manager,
             lock_manager: Arc::new(LockManager::new()),
-            mvcc,
             active_transaction: RwLock::new(None),
-            active_snapshot: RwLock::new(None),
         }
     }
 
@@ -60,7 +54,9 @@ impl Executor {
 
     pub fn query_statement(&self, statement: Statement) -> Result<QueryResult> {
         match statement {
-            Statement::Select { table, columns, where_clause } => self.execute_select(&table, columns, where_clause),
+            Statement::Select { table, columns, where_clause, order_by, limit } => {
+                self.execute_select(&table, columns, where_clause, order_by, limit)
+            }
             _ => Err(VelociError::ParseError("Statement is not a query".to_string())),
         }
     }
@@ -68,65 +64,45 @@ impl Executor {
     pub fn begin_transaction(&self) -> Result<()> {
         let mut active = self.active_transaction.write();
         if active.is_some() {
-            return Err(VelociError::TransactionError("Transaction already in progress".to_string()));
+            return Err(VelociError::TransactionError(
+                "Transaction already in progress".to_string(),
+            ));
         }
         let txn = self.transaction_manager.begin();
-        let snapshot = self.mvcc.begin_transaction();
-        *self.active_snapshot.write() = Some(snapshot);
         *active = Some(txn);
         Ok(())
     }
 
     pub fn commit_transaction(&self) -> Result<()> {
         let mut active = self.active_transaction.write();
-        let mut snap = self.active_snapshot.write();
         match active.take() {
             Some(txn) => {
-                if let Some(ref snapshot) = *snap {
-                    self.mvcc.commit_transaction(snapshot)?;
-                }
-                *snap = None;
                 self.transaction_manager.commit(&txn)?;
                 self.lock_manager.release_all_locks(txn.id());
                 Ok(())
             }
-            None => Err(VelociError::TransactionError("No active transaction to commit".to_string())),
+            None => Err(VelociError::TransactionError(
+                "No active transaction to commit".to_string(),
+            )),
         }
     }
 
     pub fn rollback_transaction(&self) -> Result<()> {
+        // NOTE: Until WAL undo is wired in, rolling back an explicit
+        // transaction only releases locks. Any storage mutations the
+        // transaction performed remain on disk. The WAL milestone will close
+        // this gap.
         let mut active = self.active_transaction.write();
-        let mut snap = self.active_snapshot.write();
         match active.take() {
             Some(txn) => {
-                if let Some(ref snapshot) = *snap {
-                    self.mvcc.abort_transaction(snapshot)?;
-                }
-                *snap = None;
                 self.transaction_manager.abort(&txn)?;
                 self.lock_manager.release_all_locks(txn.id());
                 Ok(())
             }
-            None => Err(VelociError::TransactionError("No active transaction to rollback".to_string())),
+            None => Err(VelociError::TransactionError(
+                "No active transaction to rollback".to_string(),
+            )),
         }
-    }
-
-    fn get_snapshot(&self, auto_snapshot: &mut Option<Snapshot>) {
-        if let Some(ref snap) = *self.active_snapshot.read() {
-            *auto_snapshot = Some(snap.clone());
-        } else {
-            *auto_snapshot = Some(self.mvcc.begin_transaction());
-        }
-    }
-
-    fn commit_snapshot(&self, snapshot: &Snapshot, auto_commit: bool) {
-        if auto_commit {
-            let _ = self.mvcc.commit_transaction(snapshot);
-        }
-    }
-
-    fn active_txn_id(&self) -> Option<crate::types::TransactionId> {
-        self.active_transaction.read().as_ref().map(|t| t.id())
     }
 
     fn execute_create_table(&self, name: &str, columns: Vec<Column>) -> Result<()> {
@@ -290,19 +266,6 @@ impl Executor {
             return Err(e);
         }
 
-        // Also write to MVCC version store for snapshot isolation
-        let mut mvcc_snap: Option<Snapshot> = None;
-        self.get_snapshot(&mut mvcc_snap);
-        if let Some(ref snap) = mvcc_snap {
-            if let Err(e) = self.mvcc.insert_version(table, pk_value, row.values.clone(), snap) {
-                // MVCC insert failed - abort the B-tree write to maintain consistency
-                self.transaction_manager.abort(&txn)?;
-                self.lock_manager.release_lock(table, txn.id())?;
-                return Err(e);
-            }
-            self.commit_snapshot(snap, auto_commit);
-        }
-
         // Only commit/release lock for auto-commit mode
         if auto_commit {
             self.transaction_manager.commit(&txn)?;
@@ -317,6 +280,8 @@ impl Executor {
         table: &str,
         columns: Vec<String>,
         where_clause: Option<WhereClause>,
+        order_by: Option<OrderBy>,
+        limit: Option<u64>,
     ) -> Result<QueryResult> {
         let explicit_txn = self.active_transaction.read().clone();
         let txn: Arc<Transaction>;
@@ -339,43 +304,19 @@ impl Executor {
             schema.get_table(table)?.clone()
         }; // schema lock released
 
-        // Try reading from MVCC version store first (snapshot isolation)
-        let mut mvcc_snap: Option<Snapshot> = None;
-        self.get_snapshot(&mut mvcc_snap);
-        let mvcc_rows = if let Some(ref snap) = mvcc_snap {
-            self.mvcc.scan_table(table, snap).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
+        // The B-tree is authoritative. MVCC overlay is intentionally not used
+        // until WAL-backed snapshot isolation lands.
         let all_rows: Vec<(i64, Row)> = {
-            // Always read B-tree first
             let btrees = self.btrees.read();
             let btree_arc = btrees.get(table).ok_or_else(|| {
                 VelociError::NotFound(format!("Table '{}' not initialized", table))
             })?;
             let btree = btree_arc.read();
-            let btree_rows = btree.scan()?;
-
-            // Overlay MVCC rows on top, preferring MVCC on key collision
-            if mvcc_rows.is_empty() {
-                btree_rows
-            } else {
-                let mut merged: HashMap<i64, Row> = btree_rows.into_iter().map(|(k, v)| (k, v)).collect();
-                for (k, v) in mvcc_rows {
-                    merged.insert(k, Row::new(v));
-                }
-                merged.into_iter().collect()
-            }
+            btree.scan()?
         };
 
-        // Commit MVCC snapshot if auto-commit
-        if let Some(ref snap) = mvcc_snap {
-            self.commit_snapshot(snap, auto_commit);
-        }
-
         // Process data without holding any locks
-        let filtered_rows: Vec<(i64, Row)> = if let Some(ref where_clause) = where_clause {
+        let mut filtered_rows: Vec<(i64, Row)> = if let Some(ref where_clause) = where_clause {
             all_rows
                 .into_iter()
                 .filter(|(_, row)| self.evaluate_where_clause(row, where_clause, &table_schema).unwrap_or(false))
@@ -383,6 +324,34 @@ impl Executor {
         } else {
             all_rows
         };
+
+        // Apply ORDER BY (sort by the requested column; primary-key fallback for stability).
+        if let Some(ref order) = order_by {
+            let col_index = table_schema
+                .columns
+                .iter()
+                .position(|c| c.name == order.column)
+                .ok_or_else(|| {
+                    VelociError::NotFound(format!(
+                        "ORDER BY column '{}' not found in table '{}'",
+                        order.column, table
+                    ))
+                })?;
+
+            filtered_rows.sort_by(|(ak, a), (bk, b)| {
+                let av = a.values.get(col_index).unwrap_or(&Value::Null);
+                let bv = b.values.get(col_index).unwrap_or(&Value::Null);
+                let primary = compare_values(av, bv);
+                let secondary = ak.cmp(bk);
+                let combined = primary.then(secondary);
+                if order.ascending { combined } else { combined.reverse() }
+            });
+        }
+
+        // Apply LIMIT n (does not affect COUNT(*), which counts rows after WHERE).
+        if let Some(n) = limit {
+            filtered_rows.truncate(n as usize);
+        }
 
         // Check for aggregate functions (COUNT)
         let is_count = columns.len() == 1
@@ -565,6 +534,7 @@ impl Executor {
         Ok(())
     }
 
+    #[allow(clippy::let_and_return)]
     fn execute_delete(&self, table: &str, where_clause: Option<WhereClause>) -> Result<()> {
         let explicit_txn = self.active_transaction.read().clone();
         let txn: Arc<Transaction>;
@@ -586,17 +556,14 @@ impl Executor {
         }; // schema lock released
 
         // Perform delete with single btree lock acquisition
-        let (result, deleted_keys) = {
+        let result: Result<()> = {
             let btrees = self.btrees.read();
             let btree_arc = btrees.get(table).ok_or_else(|| {
                 VelociError::NotFound(format!("Table '{}' not initialized", table))
             })?;
             let mut btree = btree_arc.write();
 
-            // Scan all rows
             let all_rows = btree.scan()?;
-
-            // Find rows to delete
             let rows_to_delete: Vec<i64> = if let Some(ref where_clause) = where_clause {
                 all_rows
                     .into_iter()
@@ -607,31 +574,16 @@ impl Executor {
                 all_rows.into_iter().map(|(key, _)| key).collect()
             };
 
-            // Delete each row
             for key in &rows_to_delete {
                 btree.delete(*key)?;
             }
-            
-            (Ok::<(), VelociError>(()), rows_to_delete)
-        }; // btrees and btree locks released
+            Ok(())
+        };
 
-        // Handle errors
         if let Err(e) = result {
             self.lock_manager.release_lock(table, txn.id())?;
             self.transaction_manager.abort(&txn)?;
             return Err(e);
-        }
-
-        // Also mark deleted in MVCC version store
-        let mut mvcc_snap: Option<Snapshot> = None;
-        self.get_snapshot(&mut mvcc_snap);
-        if let Some(ref snap) = mvcc_snap {
-            for key in &deleted_keys {
-                if let Err(e) = self.mvcc.delete_version(table, *key, snap) {
-                    return Err(e);
-                }
-            }
-            self.commit_snapshot(snap, auto_commit);
         }
 
         if auto_commit {
@@ -648,6 +600,7 @@ impl Executor {
         where_clause: &WhereClause,
         table_schema: &TableSchema,
     ) -> Result<bool> {
+        // (helper) See `compare_values` below for sort ordering semantics.
         for condition in &where_clause.conditions {
             let col_index = table_schema
                 .columns
@@ -666,6 +619,34 @@ impl Executor {
         }
 
         Ok(true)
+    }
+}
+
+/// Order two `Value`s for ORDER BY purposes.
+///
+/// SQL NULL semantics here: NULL sorts after all non-NULL values (the SQLite
+/// default for ASC and the conventional "NULLS LAST" behaviour).
+fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        (Value::Blob(x), Value::Blob(y)) => x.cmp(y),
+        // Mixed numeric: promote to f64.
+        (lhs, rhs)
+            if matches!(lhs, Value::Float(_) | Value::Real(_) | Value::Integer(_))
+                && matches!(rhs, Value::Float(_) | Value::Real(_) | Value::Integer(_)) =>
+        {
+            let lf = lhs.as_float().unwrap_or(0.0);
+            let rf = rhs.as_float().unwrap_or(0.0);
+            lf.partial_cmp(&rf).unwrap_or(Ordering::Equal)
+        }
+        // Different incomparable types: fall back to discriminant order so that
+        // the sort is at least total and deterministic.
+        _ => format!("{:?}", a).cmp(&format!("{:?}", b)),
     }
 }
 

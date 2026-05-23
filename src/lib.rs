@@ -42,17 +42,24 @@ pub mod parser;
 pub mod executor;
 pub mod transaction;
 pub mod types;
+pub mod wal;
 
-// Modern architecture modules
-pub mod mvcc;            // Multi-Version Concurrency Control
-pub mod async_io;        // Asynchronous I/O with Tokio/io_uring
-pub mod lockfree;        // Lock-free data structures
-pub mod simd;            // Vectorized execution with SIMD
-pub mod btree_optimized; // Cache-conscious B-tree
-pub mod crdt;            // CRDT-based synchronization
-pub mod cloud_vfs;       // Cloud storage VFS
-pub mod hybrid_storage;  // Hybrid row/columnar storage
-pub mod pmem;            // Persistent memory (PMEM/DAX) support
+// EXPERIMENTAL MODULES
+// ---------------------------------------------------------------------------
+// The modules below are standalone implementations of advanced storage and
+// concurrency techniques. They are exported for experimentation and to keep
+// the engineering work visible, but they are NOT currently on the active
+// SQL/storage path. The Database engine uses `storage`, `btree`, `executor`,
+// `parser`, and `transaction` only.
+pub mod mvcc;            // Multi-Version Concurrency Control (experimental)
+pub mod async_io;        // Asynchronous I/O with Tokio/io_uring (experimental)
+pub mod lockfree;        // Lock-free data structures (experimental)
+pub mod simd;            // Vectorized execution with SIMD (experimental)
+pub mod btree_optimized; // Cache-conscious B-tree (experimental)
+pub mod crdt;            // CRDT-based synchronization (experimental)
+pub mod cloud_vfs;       // Cloud storage VFS (experimental)
+pub mod hybrid_storage;  // Hybrid row/columnar storage (experimental)
+pub mod pmem;            // Persistent memory (PMEM/DAX) support (experimental)
 
 // Re-export commonly used types
 pub use storage::Database;

@@ -646,13 +646,249 @@ impl BTree {
             let page = page_arc.read();
             NodeHeader::deserialize(page.data())?
         };
-        if header.parent == 0 {
+
+        // The root is allowed to have fewer than MIN_KEYS keys. If the root has
+        // dropped to a single child, `remove_child_from_parent` already promotes
+        // that child to be the new root.
+        if header.parent == 0 || page_id == root_page {
             return Ok(());
         }
-        // For simplicity, internal node underflow follows the same pattern as leaf underflow
-        // but redistributes child pointers instead of data entries.
-        // This is a simplified implementation - a full implementation would mirror
-        // handle_leaf_underflow but for internal nodes.
+
+        let parent_id = header.parent as PageId;
+        let (sibling_id, separator_key, sibling_is_left) = {
+            let parent_arc = pager.read_page(parent_id)?;
+            let parent_page = parent_arc.read();
+            let parent_header = NodeHeader::deserialize(parent_page.data())?;
+            self.find_sibling_info(&parent_page, &parent_header, page_id)?
+        };
+
+        if sibling_id == 0 {
+            return Err(VelociError::Corruption(format!(
+                "Internal node {} has no sibling in parent {}",
+                page_id, parent_id
+            )));
+        }
+
+        let sibling_keys = {
+            let sibling_arc = pager.read_page(sibling_id)?;
+            let page = sibling_arc.read();
+            NodeHeader::deserialize(page.data())?.num_keys as usize
+        };
+
+        if sibling_keys > MIN_KEYS {
+            self.redistribute_internal(pager, page_id, sibling_id, parent_id, separator_key, sibling_is_left)?;
+        } else {
+            self.merge_internal(pager, page_id, sibling_id, parent_id, separator_key, root_page, sibling_is_left)?;
+        }
+
+        Ok(())
+    }
+
+    /// Reads an internal node's keys and child pointers into vectors for easier
+    /// manipulation during merge/redistribute.
+    fn parse_internal_node(&self, data: &[u8], header: &NodeHeader) -> Result<(Vec<i64>, Vec<PageId>)> {
+        let mut keys = Vec::with_capacity(header.num_keys as usize);
+        let mut children = Vec::with_capacity(header.num_keys as usize + 1);
+        let mut offset = NodeHeader::SIZE;
+
+        let first_child = u64::from_le_bytes(
+            data[offset..offset + 8]
+                .try_into()
+                .map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
+        ) as PageId;
+        children.push(first_child);
+        offset += 8;
+
+        for _ in 0..header.num_keys {
+            let k = i64::from_le_bytes(
+                data[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+            );
+            keys.push(k);
+            let c = u64::from_le_bytes(
+                data[offset + 8..offset + 16]
+                    .try_into()
+                    .map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
+            ) as PageId;
+            children.push(c);
+            offset += 16;
+        }
+
+        Ok((keys, children))
+    }
+
+    /// Writes the body of an internal node (children + interleaved keys). The
+    /// caller is responsible for writing the `NodeHeader`.
+    fn write_internal_body(&self, page: &mut Page, keys: &[i64], children: &[PageId]) -> Result<()> {
+        if children.len() != keys.len() + 1 {
+            return Err(VelociError::Corruption(format!(
+                "Internal node invariant violated: {} keys but {} children",
+                keys.len(),
+                children.len()
+            )));
+        }
+        let needed = NodeHeader::SIZE + 8 + keys.len() * 16;
+        if needed > PAGE_SIZE {
+            return Err(VelociError::StorageError(
+                "Internal node would exceed page size".to_string(),
+            ));
+        }
+        let mut offset = NodeHeader::SIZE;
+        page.data_mut()[offset..offset + 8].copy_from_slice(&(children[0] as u64).to_le_bytes());
+        offset += 8;
+        for (k, c) in keys.iter().zip(children.iter().skip(1)) {
+            page.data_mut()[offset..offset + 8].copy_from_slice(&k.to_le_bytes());
+            page.data_mut()[offset + 8..offset + 16].copy_from_slice(&(*c as u64).to_le_bytes());
+            offset += 16;
+        }
+        Ok(())
+    }
+
+    fn redistribute_internal(
+        &self,
+        pager: &mut Pager,
+        page_id: PageId,
+        sibling_id: PageId,
+        parent_id: PageId,
+        separator_key: i64,
+        sibling_is_left: bool,
+    ) -> Result<()> {
+        let (sibling_header, sibling_keys, sibling_children) = {
+            let arc = pager.read_page(sibling_id)?;
+            let page = arc.read();
+            let h = NodeHeader::deserialize(page.data())?;
+            let (k, c) = self.parse_internal_node(page.data(), &h)?;
+            (h, k, c)
+        };
+        let (node_header, mut node_keys, mut node_children) = {
+            let arc = pager.read_page(page_id)?;
+            let page = arc.read();
+            let h = NodeHeader::deserialize(page.data())?;
+            let (k, c) = self.parse_internal_node(page.data(), &h)?;
+            (h, k, c)
+        };
+
+        let mut new_sibling_keys = sibling_keys;
+        let mut new_sibling_children = sibling_children;
+        let (new_separator, moved_child) = if sibling_is_left {
+            // Borrow rightmost (key, child) from the left sibling.
+            let stolen_child = new_sibling_children.pop().ok_or_else(|| {
+                VelociError::Corruption("Left sibling has no children".to_string())
+            })?;
+            let new_separator = new_sibling_keys.pop().ok_or_else(|| {
+                VelociError::Corruption("Left sibling has no keys".to_string())
+            })?;
+            // The old parent separator descends into this node as the new
+            // leftmost key, and the borrowed child becomes the leftmost child.
+            node_keys.insert(0, separator_key);
+            node_children.insert(0, stolen_child);
+            (new_separator, stolen_child)
+        } else {
+            // Borrow leftmost (key, child) from the right sibling.
+            let stolen_child = new_sibling_children.remove(0);
+            let new_separator = new_sibling_keys.remove(0);
+            // The old separator descends as the new rightmost key of this
+            // node, with the borrowed child appended as the new last child.
+            node_keys.push(separator_key);
+            node_children.push(stolen_child);
+            (new_separator, stolen_child)
+        };
+
+        // Persist sibling.
+        let mut sib_page = Page::new();
+        let mut new_sh = sibling_header.clone();
+        new_sh.num_keys = new_sibling_keys.len() as u16;
+        new_sh.serialize(sib_page.data_mut());
+        self.write_internal_body(&mut sib_page, &new_sibling_keys, &new_sibling_children)?;
+        pager.write_page(sibling_id, &sib_page)?;
+
+        // Persist this node.
+        let mut node_page = Page::new();
+        let mut new_nh = node_header.clone();
+        new_nh.num_keys = node_keys.len() as u16;
+        new_nh.serialize(node_page.data_mut());
+        self.write_internal_body(&mut node_page, &node_keys, &node_children)?;
+        pager.write_page(page_id, &node_page)?;
+
+        // Update the moved child's parent pointer through write_page so the
+        // change is durable.
+        self.set_parent_pointer(pager, moved_child, page_id as u32)?;
+
+        // Replace the separator in the parent.
+        self.update_parent_key(pager, parent_id, separator_key, new_separator)?;
+
+        Ok(())
+    }
+
+    fn merge_internal(
+        &self,
+        pager: &mut Pager,
+        page_id: PageId,
+        sibling_id: PageId,
+        parent_id: PageId,
+        separator_key: i64,
+        root_page: PageId,
+        sibling_is_left: bool,
+    ) -> Result<()> {
+        // Canonical merge: always merge the right node into the left node so
+        // that any subsequent cascading underflow follows a consistent shape.
+        let (left_id, right_id) = if sibling_is_left {
+            (sibling_id, page_id)
+        } else {
+            (page_id, sibling_id)
+        };
+
+        let (left_header, left_keys, left_children) = {
+            let arc = pager.read_page(left_id)?;
+            let page = arc.read();
+            let h = NodeHeader::deserialize(page.data())?;
+            let (k, c) = self.parse_internal_node(page.data(), &h)?;
+            (h, k, c)
+        };
+        let (right_header, right_keys, right_children) = {
+            let arc = pager.read_page(right_id)?;
+            let page = arc.read();
+            let h = NodeHeader::deserialize(page.data())?;
+            let (k, c) = self.parse_internal_node(page.data(), &h)?;
+            (h, k, c)
+        };
+
+        // [left keys] + separator + [right keys]; children concatenate directly.
+        let mut merged_keys = left_keys;
+        merged_keys.push(separator_key);
+        merged_keys.extend(right_keys);
+
+        let mut merged_children = left_children;
+        merged_children.extend(right_children.iter().copied());
+
+        // Check capacity before writing back.
+        if NodeHeader::SIZE + 8 + merged_keys.len() * 16 > PAGE_SIZE {
+            return Err(VelociError::StorageError(
+                "Cannot merge internal nodes: combined size exceeds page".to_string(),
+            ));
+        }
+
+        // Children that moved from the right node need their parent pointer
+        // re-targeted to the left (surviving) node. Go through write_page so
+        // the change is logged.
+        let moved_count = right_header.num_keys as usize + 1;
+        for &child_id in merged_children.iter().rev().take(moved_count) {
+            self.set_parent_pointer(pager, child_id, left_id as u32)?;
+        }
+
+        // Write the merged left node.
+        let mut left_page = Page::new();
+        let mut new_lh = left_header.clone();
+        new_lh.num_keys = merged_keys.len() as u16;
+        new_lh.serialize(left_page.data_mut());
+        self.write_internal_body(&mut left_page, &merged_keys, &merged_children)?;
+        pager.write_page(left_id, &left_page)?;
+
+        // Drop the right child from the parent. This call will recursively
+        // trigger handle_internal_underflow on the parent if needed.
+        self.remove_child_from_parent(pager, parent_id, right_id, root_page)?;
+
         Ok(())
     }
 
@@ -926,30 +1162,35 @@ impl BTree {
         // Write new root
         pager.write_page(root_page_id, &root_page)?;
 
-        // Update child parent pointers
-        let left_page_data = pager.read_page(left_page)?;
-        let mut left_header = NodeHeader::deserialize(left_page_data.read().data())?;
-        left_header.parent = root_page_id as u32;
-        left_header.serialize(left_page_data.write().data_mut());
-
-        let right_page_data = pager.read_page(right_page)?;
-        let mut right_header = NodeHeader::deserialize(right_page_data.read().data())?;
-        right_header.parent = root_page_id as u32;
-        right_header.serialize(right_page_data.write().data_mut());
+        // Update child parent pointers. These MUST go through write_page so
+        // the change is logged to the WAL and applied to the data file —
+        // mutating the cache via the Arc directly is not durable.
+        self.set_parent_pointer(pager, left_page, root_page_id as u32)?;
+        self.set_parent_pointer(pager, right_page, root_page_id as u32)?;
 
         Ok(root_page_id)
     }
 
-    fn insert_into_internal(&self, pager: &mut Pager, page_id: PageId, left_page: PageId, right_page: PageId, key: i64) -> Result<Option<PageId>> {
-        // Update right_page parent pointer to this page
-        // We do this first so that if we split, the child already points to us (the left node),
-        // and if it moves to the sibling, the split logic will update it to the sibling.
-        {
-            let right_page_data = pager.read_page(right_page)?;
-            let mut right_header = NodeHeader::deserialize(right_page_data.read().data())?;
-            right_header.parent = page_id as u32;
-            right_header.serialize(right_page_data.write().data_mut());
+    /// Reads the page, updates its `parent` field, and writes it back through
+    /// the pager so the change is durable (logged in the WAL).
+    fn set_parent_pointer(&self, pager: &mut Pager, page_id: PageId, new_parent: u32) -> Result<()> {
+        let arc = pager.read_page(page_id)?;
+        let mut page = arc.read().clone();
+        let mut header = NodeHeader::deserialize(page.data())?;
+        if header.parent == new_parent {
+            return Ok(());
         }
+        header.parent = new_parent;
+        header.serialize(page.data_mut());
+        pager.write_page(page_id, &page)?;
+        Ok(())
+    }
+
+    fn insert_into_internal(&self, pager: &mut Pager, page_id: PageId, left_page: PageId, right_page: PageId, key: i64) -> Result<Option<PageId>> {
+        // Update right_page parent pointer to this page through write_page so
+        // the change is durable. (Pre-WAL versions mutated the cache directly
+        // and lost the update on eviction.)
+        self.set_parent_pointer(pager, right_page, page_id as u32)?;
 
         let page_arc = pager.read_page(page_id)?;
         let mut page = page_arc.read().clone();
@@ -1069,14 +1310,10 @@ impl BTree {
             offset += 16;
         }
 
-        // Update parent pointers for children moved to sibling
+        // Update parent pointers for children moved to sibling. These must go
+        // through write_page so they are durable.
         for &child_id in right_children {
-            let child_page_arc = pager.read_page(child_id)?;
-            // We need to acquire a write lock on the child page to update its parent pointer
-            let mut child_page = child_page_arc.write();
-            let mut child_header = NodeHeader::deserialize(child_page.data())?;
-            child_header.parent = sibling_page_id as u32;
-            child_header.serialize(child_page.data_mut());
+            self.set_parent_pointer(pager, child_id, sibling_page_id as u32)?;
         }
 
         pager.write_page(sibling_page_id, &sibling_page)?;
@@ -1308,6 +1545,95 @@ mod tests {
         
         // Test non-existent keys
         assert!(btree.search(100).unwrap().is_none());
+    }
+
+    /// Stress test that mixes inserts and deletes across enough keys to span
+    /// multiple internal node levels, then verifies that scan output exactly
+    /// matches the model (a `BTreeMap` we maintain in parallel).
+    #[test]
+    fn test_insert_delete_mixed_invariants() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let pager = Arc::new(RwLock::new(Pager::new(temp_file.path()).unwrap()));
+        let mut btree = BTree::new(pager).unwrap();
+
+        let mut model: std::collections::BTreeMap<i64, Row> = std::collections::BTreeMap::new();
+
+        // First grow the tree to ~3 levels of internal nodes.
+        for i in 0..2_000i64 {
+            let row = Row::new(vec![Value::Integer(i), Value::Text(format!("R{}", i))]);
+            btree.insert(i, &row).unwrap();
+            model.insert(i, row);
+        }
+
+        // Now delete every third key. With BTREE_ORDER=64 and MIN_KEYS=32 this
+        // is enough to exercise internal-node merge/redistribute paths.
+        for i in (0..2_000i64).step_by(3) {
+            assert!(btree.delete(i).unwrap(), "delete {} returned false", i);
+            model.remove(&i);
+        }
+
+        // Re-insert some of the deleted keys with different payloads.
+        for i in (0..2_000i64).step_by(7) {
+            if !model.contains_key(&i) {
+                let row = Row::new(vec![Value::Integer(i), Value::Text(format!("X{}", i))]);
+                btree.insert(i, &row).unwrap();
+                model.insert(i, row);
+            }
+        }
+
+        // Point lookups must agree.
+        for (k, expected) in model.iter() {
+            let got = btree.search(*k).unwrap();
+            assert!(got.is_some(), "missing key {}", k);
+            let got = got.unwrap();
+            assert_eq!(got.values.len(), expected.values.len(), "value count mismatch at {}", k);
+            assert_eq!(got.values[0], expected.values[0], "pk value mismatch at {}", k);
+            assert_eq!(got.values[1], expected.values[1], "payload mismatch at {}", k);
+        }
+
+        // Full scan must contain exactly the model keys.
+        let scan_keys: std::collections::BTreeSet<i64> =
+            btree.scan().unwrap().into_iter().map(|(k, _)| k).collect();
+        let model_keys: std::collections::BTreeSet<i64> = model.keys().copied().collect();
+        assert_eq!(scan_keys, model_keys, "scan keys do not match model");
+    }
+
+    // Property test: any random sequence of inserts and deletes leaves the
+    // B-tree consistent with a parallel in-memory model.
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 16, max_global_rejects: 1000, .. ProptestConfig::default() })]
+
+        #[test]
+        fn proptest_btree_matches_model(
+            ops in proptest::collection::vec(
+                (any::<bool>(), 0i64..600i64),
+                1..400usize,
+            )
+        ) {
+            let temp_file = NamedTempFile::new().unwrap();
+            let pager = Arc::new(RwLock::new(Pager::new(temp_file.path()).unwrap()));
+            let mut btree = BTree::new(pager).unwrap();
+            let mut model: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+
+            for (is_insert, key) in ops {
+                if is_insert {
+                    let row = Row::new(vec![Value::Integer(key)]);
+                    if !model.contains_key(&key) {
+                        btree.insert(key, &row).unwrap();
+                        model.insert(key, key);
+                    }
+                } else if model.remove(&key).is_some() {
+                    assert!(btree.delete(key).unwrap());
+                }
+            }
+
+            let scan_keys: std::collections::BTreeSet<i64> =
+                btree.scan().unwrap().into_iter().map(|(k, _)| k).collect();
+            let model_keys: std::collections::BTreeSet<i64> = model.keys().copied().collect();
+            prop_assert_eq!(scan_keys, model_keys);
+        }
     }
 }
 

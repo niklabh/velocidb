@@ -25,6 +25,8 @@ pub enum Statement {
         table: String,
         columns: Vec<String>,
         where_clause: Option<WhereClause>,
+        order_by: Option<OrderBy>,
+        limit: Option<u64>,
     },
     Update {
         table: String,
@@ -43,6 +45,13 @@ pub enum Statement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WhereClause {
     pub conditions: Vec<Condition>,
+}
+
+/// ORDER BY clause: which column to sort by and whether ascending.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderBy {
+    pub column: String,
+    pub ascending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -315,12 +324,49 @@ impl Parser {
         // SELECT * FROM users WHERE age > 25
         // SELECT id, name FROM users
         // SELECT COUNT(*) FROM users
+        // SELECT * FROM users WHERE age > 25 ORDER BY name DESC LIMIT 10
 
-        let re = Regex::new(r"(?i)SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?")
+        // Strip trailing LIMIT n first, then ORDER BY clause, so the remainder
+        // is a regular SELECT [...] FROM <table> [WHERE ...].
+        let mut remaining = sql.trim().to_string();
+
+        let limit_re = Regex::new(r"(?i)\s+LIMIT\s+(\d+)\s*;?\s*$")
+            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        let limit = if let Some(caps) = limit_re.captures(&remaining) {
+            let n = caps
+                .get(1)
+                .unwrap()
+                .as_str()
+                .parse::<u64>()
+                .map_err(|e| VelociError::ParseError(format!("Invalid LIMIT value: {}", e)))?;
+            remaining = limit_re.replace(&remaining, "").to_string();
+            Some(n)
+        } else {
+            None
+        };
+
+        let order_re = Regex::new(r"(?i)\s+ORDER\s+BY\s+(\w+)(?:\s+(ASC|DESC))?\s*;?\s*$")
+            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        let order_by = if let Some(caps) = order_re.captures(&remaining) {
+            let col = caps.get(1).unwrap().as_str().to_string();
+            let ascending = caps
+                .get(2)
+                .map(|m| !m.as_str().eq_ignore_ascii_case("DESC"))
+                .unwrap_or(true);
+            remaining = order_re.replace(&remaining, "").to_string();
+            Some(OrderBy { column: col, ascending })
+        } else {
+            None
+        };
+
+        // Drop trailing semicolons left over from earlier stripping.
+        let remaining = remaining.trim_end_matches(';').trim().to_string();
+
+        let re = Regex::new(r"(?i)^SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?$")
             .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
 
         let captures = re
-            .captures(sql)
+            .captures(&remaining)
             .ok_or_else(|| VelociError::ParseError("Invalid SELECT syntax".to_string()))?;
 
         let columns_str = captures.get(1).unwrap().as_str().trim();
@@ -347,6 +393,8 @@ impl Parser {
             table: table_name,
             columns,
             where_clause,
+            order_by,
+            limit,
         })
     }
 
@@ -724,10 +772,70 @@ mod tests {
                 table,
                 columns,
                 where_clause,
+                order_by,
+                limit,
             } => {
                 assert_eq!(table, "users");
                 assert_eq!(columns, vec!["*"]);
                 assert!(where_clause.is_some());
+                assert!(order_by.is_none());
+                assert!(limit.is_none());
+            }
+            _ => panic!("Wrong statement type"),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_order_by_limit() {
+        let parser = Parser::new();
+        let stmt = parser
+            .parse("SELECT * FROM users WHERE age > 18 ORDER BY name DESC LIMIT 5")
+            .unwrap();
+
+        match stmt {
+            Statement::Select {
+                table,
+                where_clause,
+                order_by,
+                limit,
+                ..
+            } => {
+                assert_eq!(table, "users");
+                assert!(where_clause.is_some());
+                let order = order_by.unwrap();
+                assert_eq!(order.column, "name");
+                assert!(!order.ascending);
+                assert_eq!(limit, Some(5));
+            }
+            _ => panic!("Wrong statement type"),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_order_by_default_ascending() {
+        let parser = Parser::new();
+        let stmt = parser.parse("SELECT * FROM t ORDER BY id").unwrap();
+        match stmt {
+            Statement::Select { order_by, limit, where_clause, .. } => {
+                let order = order_by.unwrap();
+                assert_eq!(order.column, "id");
+                assert!(order.ascending);
+                assert!(where_clause.is_none());
+                assert!(limit.is_none());
+            }
+            _ => panic!("Wrong statement type"),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_limit_only() {
+        let parser = Parser::new();
+        let stmt = parser.parse("SELECT * FROM t LIMIT 3").unwrap();
+        match stmt {
+            Statement::Select { limit, order_by, where_clause, .. } => {
+                assert_eq!(limit, Some(3));
+                assert!(order_by.is_none());
+                assert!(where_clause.is_none());
             }
             _ => panic!("Wrong statement type"),
         }
