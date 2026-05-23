@@ -293,6 +293,74 @@ fn test_insert_text_with_commas() {
 }
 
 #[test]
+fn test_order_by_asc_default() {
+    let db = TestDb::new();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)");
+    db.execute("INSERT INTO items (id, name) VALUES (1, 'Charlie')");
+    db.execute("INSERT INTO items (id, name) VALUES (2, 'Alice')");
+    db.execute("INSERT INTO items (id, name) VALUES (3, 'Bob')");
+
+    let result = db.query("SELECT * FROM items ORDER BY name");
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(result.rows[0].values[1], Value::Text("Alice".to_string()));
+    assert_eq!(result.rows[1].values[1], Value::Text("Bob".to_string()));
+    assert_eq!(result.rows[2].values[1], Value::Text("Charlie".to_string()));
+}
+
+#[test]
+fn test_order_by_desc() {
+    let db = TestDb::new();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, val INTEGER)");
+    db.execute("INSERT INTO items (id, val) VALUES (1, 10)");
+    db.execute("INSERT INTO items (id, val) VALUES (2, 30)");
+    db.execute("INSERT INTO items (id, val) VALUES (3, 20)");
+
+    let result = db.query("SELECT * FROM items ORDER BY val DESC");
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(result.rows[0].values[1], Value::Integer(30));
+    assert_eq!(result.rows[1].values[1], Value::Integer(20));
+    assert_eq!(result.rows[2].values[1], Value::Integer(10));
+}
+
+#[test]
+fn test_limit() {
+    let db = TestDb::new();
+    db.execute("CREATE TABLE nums (id INTEGER PRIMARY KEY, v INTEGER)");
+    for i in 0..10 {
+        db.execute(&format!("INSERT INTO nums (id, v) VALUES ({}, {})", i, i));
+    }
+
+    let result = db.query("SELECT * FROM nums LIMIT 3");
+    assert_eq!(result.rows.len(), 3);
+}
+
+#[test]
+fn test_order_by_with_limit_and_where() {
+    let db = TestDb::new();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, age INTEGER, name TEXT)");
+    db.execute("INSERT INTO u (id, age, name) VALUES (1, 30, 'Alice')");
+    db.execute("INSERT INTO u (id, age, name) VALUES (2, 25, 'Bob')");
+    db.execute("INSERT INTO u (id, age, name) VALUES (3, 35, 'Charlie')");
+    db.execute("INSERT INTO u (id, age, name) VALUES (4, 40, 'Diana')");
+    db.execute("INSERT INTO u (id, age, name) VALUES (5, 22, 'Eve')");
+
+    let result = db.query("SELECT * FROM u WHERE age > 24 ORDER BY age ASC LIMIT 2");
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0].values[1], Value::Integer(25)); // Bob
+    assert_eq!(result.rows[1].values[1], Value::Integer(30)); // Alice
+}
+
+#[test]
+fn test_order_by_unknown_column_errors() {
+    let db = TestDb::new();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+    db.execute("INSERT INTO t (id, v) VALUES (1, 10)");
+
+    let result = db.db.query("SELECT * FROM t ORDER BY bogus");
+    assert!(result.is_err());
+}
+
+#[test]
 fn test_large_dataset_with_splits() {
     // Test that scan works correctly after B-Tree splits
     let db = TestDb::new();

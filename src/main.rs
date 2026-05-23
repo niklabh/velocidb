@@ -1,7 +1,7 @@
 //! VelociDB — A high-performance embedded database engine written in Rust.
 //!
 //! This binary provides an interactive REPL for executing SQL commands.
-//! Type `help` for a list of supported commands or `exit` to quit.
+//! Type `.help` for a list of supported commands or `.exit` to quit.
 
 mod storage;
 mod btree;
@@ -10,43 +10,37 @@ mod executor;
 mod transaction;
 mod types;
 mod mvcc;
+mod wal;
 
 use anyhow::Result;
+use rustyline::config::Builder as RustylineBuilder;
+use rustyline::error::ReadlineError;
+use rustyline::history::FileHistory;
+use rustyline::{Editor, EventHandler, KeyCode, KeyEvent, Modifiers};
 use std::env;
-use std::io::{self, IsTerminal, Write};
-use tracing::{info, error, Level};
+use std::io::{self, IsTerminal};
+use std::path::PathBuf;
+use tracing::{error, info, Level};
 use tracing_subscriber;
 
 use crate::storage::Database;
 
+/// Returns true to continue the REPL, false to exit.
 fn process_command(db: &Database, input: &str) -> Result<bool> {
-    // Handle special commands
-    match input.to_lowercase().as_str() {
-        "" => return Ok(true), // Continue
-        "exit" | "quit" | ".exit" | ".quit" => {
-            // Close database before exiting
-            if let Err(e) = db.close() {
-                error!("Error closing database: {}", e);
-            }
-            println!("Goodbye!");
-            return Ok(false); // Exit
-        }
-        "help" | ".help" => {
-            print_help();
-            return Ok(true); // Continue
-        }
-        ".tables" => {
-            let tables = db.list_tables();
-            if tables.is_empty() {
-                println!("No tables found.");
-            } else {
-                println!("Tables:");
-                for table in tables {
-                    println!("  {}", table);
-                }
-            }
-            return Ok(true); // Continue
-        }
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(true);
+    }
+
+    // Meta commands always start with `.` and are single-line.
+    if let Some(rest) = trimmed.strip_prefix('.') {
+        return handle_meta_command(db, rest.trim());
+    }
+
+    // Plain word commands carried over from the previous REPL for compatibility.
+    match trimmed.to_lowercase().as_str() {
+        "exit" | "quit" => return handle_meta_command(db, "exit"),
+        "help" => return handle_meta_command(db, "help"),
         "begin" | "begin transaction" => {
             match db.begin() {
                 Ok(()) => println!("Transaction started."),
@@ -71,67 +65,187 @@ fn process_command(db: &Database, input: &str) -> Result<bool> {
         _ => {}
     }
 
-    // Execute SQL
-    if input.to_uppercase().starts_with("SELECT") {
-        // Query
-        match db.query(input) {
-            Ok(result) => {
-                println!("Columns: {}", result.columns.len());
-                println!("Rows: {}", result.rows.len());
+    // Execute one or more SQL statements separated by `;`.
+    for statement in split_statements(trimmed) {
+        run_sql(db, &statement);
+    }
 
-                // Print column headers
-                for (i, col) in result.columns.iter().enumerate() {
-                    if i > 0 { print!(" | "); }
-                    print!("{}", col.name);
-                }
-                println!();
+    Ok(true)
+}
 
-                // Print separator
-                for (i, col) in result.columns.iter().enumerate() {
-                    if i > 0 { print!("-+-"); }
-                    print!("{}", "-".repeat(col.name.len().max(10)));
-                }
-                println!();
+fn handle_meta_command(db: &Database, cmd: &str) -> Result<bool> {
+    let mut parts = cmd.splitn(2, char::is_whitespace);
+    let verb = parts.next().unwrap_or("").to_lowercase();
+    let arg = parts.next().map(str::trim).unwrap_or("");
 
-                // Print rows
-                for row in &result.rows {
-                    for (i, value) in row.values.iter().enumerate() {
-                        if i > 0 { print!(" | "); }
-                        print!("{}", value);
-                    }
-                    println!();
-                }
-
-                println!("\n{} row(s) returned", result.rows.len());
+    match verb.as_str() {
+        "exit" | "quit" => {
+            if let Err(e) = db.close() {
+                error!("Error closing database: {}", e);
             }
+            println!("Goodbye!");
+            Ok(false)
+        }
+        "help" => {
+            print_help();
+            Ok(true)
+        }
+        "tables" => {
+            let tables = db.list_tables();
+            if tables.is_empty() {
+                println!("No tables.");
+            } else {
+                println!("Tables:");
+                for table in tables {
+                    println!("  {}", table);
+                }
+            }
+            Ok(true)
+        }
+        "schema" => {
+            if arg.is_empty() {
+                let tables = db.list_tables();
+                if tables.is_empty() {
+                    println!("No tables.");
+                }
+                for t in tables {
+                    match db.describe_table(&t) {
+                        Ok(sql) => println!("{};", sql),
+                        Err(e) => println!("Error describing '{}': {}", t, e),
+                    }
+                }
+            } else {
+                match db.describe_table(arg) {
+                    Ok(sql) => println!("{};", sql),
+                    Err(e) => println!("Error: {}", e),
+                }
+            }
+            Ok(true)
+        }
+        other => {
+            println!("Unknown meta command: .{}", other);
+            Ok(true)
+        }
+    }
+}
+
+/// Splits a buffer on top-level `;` boundaries, respecting single/double quoted
+/// string literals. Empty statements are skipped.
+fn split_statements(buffer: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut quote = '\'';
+
+    for ch in buffer.chars() {
+        if in_string {
+            current.push(ch);
+            if ch == quote {
+                in_string = false;
+            }
+        } else if ch == '\'' || ch == '"' {
+            in_string = true;
+            quote = ch;
+            current.push(ch);
+        } else if ch == ';' {
+            let s = current.trim().to_string();
+            if !s.is_empty() {
+                out.push(s);
+            }
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+
+    let s = current.trim().to_string();
+    if !s.is_empty() {
+        out.push(s);
+    }
+    out
+}
+
+/// Returns true if the buffered text contains at least one complete statement
+/// (a `;` outside of a quoted string).
+fn has_complete_statement(buffer: &str) -> bool {
+    let mut in_string = false;
+    let mut quote = '\'';
+    for ch in buffer.chars() {
+        if in_string {
+            if ch == quote {
+                in_string = false;
+            }
+        } else if ch == '\'' || ch == '"' {
+            in_string = true;
+            quote = ch;
+        } else if ch == ';' {
+            return true;
+        }
+    }
+    false
+}
+
+fn run_sql(db: &Database, sql: &str) {
+    if sql.to_uppercase().starts_with("SELECT") {
+        match db.query(sql) {
+            Ok(result) => print_query_result(&result),
             Err(e) => {
                 error!("Query error: {}", e);
                 println!("Error: {}", e);
             }
         }
     } else {
-        // Execute command
-        match db.execute(input) {
-            Ok(_) => {
-                println!("OK");
-            }
+        match db.execute(sql) {
+            Ok(_) => println!("OK"),
             Err(e) => {
                 error!("Execution error: {}", e);
                 println!("Error: {}", e);
             }
         }
     }
+}
 
-    Ok(true) // Continue
+fn print_query_result(result: &crate::types::QueryResult) {
+    // Header.
+    for (i, col) in result.columns.iter().enumerate() {
+        if i > 0 {
+            print!(" | ");
+        }
+        print!("{}", col.name);
+    }
+    println!();
+    for (i, col) in result.columns.iter().enumerate() {
+        if i > 0 {
+            print!("-+-");
+        }
+        print!("{}", "-".repeat(col.name.len().max(10)));
+    }
+    println!();
+    for row in &result.rows {
+        for (i, value) in row.values.iter().enumerate() {
+            if i > 0 {
+                print!(" | ");
+            }
+            print!("{}", value);
+        }
+        println!();
+    }
+    println!("\n{} row(s) returned", result.rows.len());
+}
+
+fn history_path() -> Option<PathBuf> {
+    if let Ok(p) = env::var("VELOCIDB_HISTORY") {
+        return Some(PathBuf::from(p));
+    }
+    let home = env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".velocidb_history"))
 }
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
-    // Parse command line arguments
     let mut db_filename = "veloci.db".to_string();
     let mut i = 1;
-
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => {
@@ -143,80 +257,166 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             "--db" | "-d" => {
-                // Next argument should be the database filename
                 if i + 1 < args.len() {
                     db_filename = args[i + 1].clone();
                     i += 2;
                 } else {
                     eprintln!("Error: --db/-d requires a filename argument");
-                    eprintln!("Usage: {} [--help|-h] [--version|-v] [--db|-d <filename>] [database_file]", args[0]);
                     return Ok(());
                 }
             }
             arg if arg.starts_with('-') => {
                 eprintln!("Unknown option: {}", arg);
-                eprintln!("Usage: {} [--help|-h] [--version|-v] [--db|-d <filename>] [database_file]", args[0]);
                 return Ok(());
             }
             _ => {
-                // Treat as database filename
                 db_filename = args[i].clone();
                 i += 1;
             }
         }
     }
 
-    // Initialize logging
     tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
+        .with_max_level(Level::WARN)
         .init();
 
     info!("VelociDB v0.1.0 - Interactive SQL Shell");
     println!("VelociDB v0.1.0");
     println!("Database: {}", db_filename);
-    println!("Type 'help' for help, 'exit' or 'quit' to exit");
+    println!("Type '.help' for help, '.exit' to quit. Statements end with ';'.");
     println!();
 
-    // Open or create database
     let db = Database::open(&db_filename)?;
-    info!("Database opened: {}", db_filename);
 
-    // Check if stdin is a TTY (for non-interactive environments)
     if !io::stdin().is_terminal() {
-        // Non-interactive environment - exit cleanly
-        info!("Non-interactive environment detected, exiting cleanly");
+        // Non-interactive: read stdin line by line so that `.meta` commands
+        // and SQL statements terminated by `;` are both handled.
+        let mut buf = String::new();
+        use std::io::Read as _;
+        if io::stdin().read_to_string(&mut buf).is_ok() {
+            let mut sql_buf = String::new();
+            for line in buf.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if sql_buf.is_empty() && trimmed.starts_with('.') {
+                    if let Ok(false) = process_command(&db, trimmed) {
+                        break;
+                    }
+                    continue;
+                }
+                if !sql_buf.is_empty() {
+                    sql_buf.push('\n');
+                }
+                sql_buf.push_str(line);
+                if has_complete_statement(&sql_buf) {
+                    let to_run = std::mem::take(&mut sql_buf);
+                    if let Ok(false) = process_command(&db, to_run.trim()) {
+                        break;
+                    }
+                }
+            }
+            if !sql_buf.trim().is_empty() {
+                let _ = process_command(&db, sql_buf.trim());
+            }
+        }
+        if let Err(e) = db.close() {
+            eprintln!("Warning: failed to close database: {}", e);
+        }
         return Ok(());
     }
 
-    // REPL loop
-    loop {
-        // Print prompt
-        print!("velocidb> ");
-        io::stdout().flush()?;
+    // Interactive REPL with rustyline.
+    let config = RustylineBuilder::new()
+        .auto_add_history(true)
+        .history_ignore_dups(true)?
+        .build();
+    let mut rl: Editor<(), FileHistory> = Editor::with_config(config)?;
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Char('c'), Modifiers::CTRL),
+        EventHandler::Simple(rustyline::Cmd::Interrupt),
+    );
 
-        // Read line
-        let mut input = String::new();
-        match io::stdin().read_line(&mut input) {
-            Ok(0) => {
-                // EOF reached (Ctrl+D on Unix, Ctrl+Z on Windows)
+    let hist_path = history_path();
+    if let Some(ref p) = hist_path {
+        let _ = rl.load_history(p);
+    }
+
+    let mut buffer = String::new();
+    loop {
+        let prompt = if buffer.is_empty() { "velocidb> " } else { "      ...> " };
+        match rl.readline(prompt) {
+            Ok(line) => {
+                let line_trimmed = line.trim();
+
+                // Meta commands (`.help`, `.tables`, ...) execute immediately
+                // even when there is partial buffered SQL.
+                if buffer.is_empty() && line_trimmed.starts_with('.') {
+                    match process_command(&db, line_trimmed) {
+                        Ok(true) => continue,
+                        Ok(false) => break,
+                        Err(e) => {
+                            println!("Error: {}", e);
+                            continue;
+                        }
+                    }
+                }
+
+                // Top-level non-SQL keywords kept for compatibility (single line).
+                if buffer.is_empty() {
+                    let lower = line_trimmed.to_lowercase();
+                    if matches!(
+                        lower.as_str(),
+                        "exit" | "quit" | "help" | "begin" | "commit" | "rollback"
+                            | "begin transaction" | "commit transaction" | "rollback transaction"
+                    ) {
+                        match process_command(&db, line_trimmed) {
+                            Ok(true) => continue,
+                            Ok(false) => break,
+                            Err(e) => {
+                                println!("Error: {}", e);
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                if !buffer.is_empty() {
+                    buffer.push('\n');
+                }
+                buffer.push_str(&line);
+
+                if has_complete_statement(&buffer) {
+                    let to_run = std::mem::take(&mut buffer);
+                    if let Err(e) = process_command(&db, to_run.trim()) {
+                        println!("Error: {}", e);
+                    }
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                if !buffer.is_empty() {
+                    println!("(input cleared)");
+                    buffer.clear();
+                } else {
+                    println!("(Ctrl-D or .exit to quit)");
+                }
+            }
+            Err(ReadlineError::Eof) => {
                 println!("\nGoodbye!");
                 break;
             }
-            Ok(_) => {
-                let input = input.trim();
-                if !process_command(&db, input)? {
-                    break; // Exit requested
-                }
-            }
             Err(e) => {
                 error!("Failed to read input: {}", e);
-                println!("Error reading input: {}", e);
                 break;
             }
         }
     }
 
-    // Ensure database is properly closed before exiting
+    if let Some(ref p) = hist_path {
+        let _ = rl.save_history(p);
+    }
+
     if let Err(e) = db.close() {
         error!("Error closing database: {}", e);
         eprintln!("Warning: Failed to properly close database: {}", e);
@@ -226,7 +426,7 @@ fn main() -> Result<()> {
 }
 
 fn print_help() {
-    println!("VelociDB v0.1.0 - SQLite-compatible database");
+    println!("VelociDB v0.1.0");
     println!();
     println!("USAGE:");
     println!("    velocidb [OPTIONS] [DATABASE]");
@@ -236,38 +436,19 @@ fn print_help() {
     println!("    -v, --version    Show version information");
     println!("    -d, --db <FILE>  Specify database file (alternative syntax)");
     println!();
-    println!("ARGUMENTS:");
-    println!("    <DATABASE>       Database file path (default: veloci.db)");
+    println!("Meta commands (single-line):");
+    println!("    .help              Show this help");
+    println!("    .tables            List tables");
+    println!("    .schema [name]     Show CREATE TABLE for one or all tables");
+    println!("    .exit              Exit the shell");
     println!();
-    println!("SQL Commands:");
-    println!("  CREATE TABLE <name> (<columns>)  - Create a new table");
-    println!("  DROP TABLE <name>                - Drop a table");
-    println!("  INSERT INTO <table> VALUES (...)  - Insert data");
-    println!("  SELECT * FROM <table>             - Query data");
-    println!("  SELECT * FROM <table> WHERE ...   - Query with filter");
-    println!("  UPDATE <table> SET ... WHERE ...  - Update data");
-    println!("  DELETE FROM <table> WHERE ...     - Delete data");
-    println!();
-    println!("Transaction Commands:");
-    println!("  BEGIN                            - Start a transaction");
-    println!("  COMMIT                           - Commit transaction");
-    println!("  ROLLBACK                         - Rollback transaction");
-    println!();
-    println!("Meta Commands:");
-    println!("  .help    - Show this help");
-    println!("  .tables  - List all tables");
-    println!("  .exit    - Exit the shell");
-    println!();
-    println!("Supported Data Types:");
-    println!("  INTEGER  - 64-bit signed integer");
-    println!("  REAL     - 64-bit floating point");
-    println!("  TEXT     - UTF-8 text string");
-    println!("  BLOB     - Binary data");
-    println!();
-    println!("Examples:");
-    println!("  CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)");
-    println!("  INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)");
-    println!("  SELECT * FROM users WHERE age > 25");
-    println!("  UPDATE users SET age = 31 WHERE name = 'Alice'");
-    println!("  DELETE FROM users WHERE id = 1");
+    println!("SQL (terminated by ';'):");
+    println!("    CREATE TABLE <name> (...)");
+    println!("    DROP TABLE <name>");
+    println!("    INSERT INTO <table> [(cols)] VALUES (...)");
+    println!("    SELECT [* | cols | COUNT(*)] FROM <table>");
+    println!("        [WHERE expr [AND expr ...]] [ORDER BY col [ASC|DESC]] [LIMIT n]");
+    println!("    UPDATE <table> SET col = val [, ...] [WHERE ...]");
+    println!("    DELETE FROM <table> [WHERE ...]");
+    println!("    BEGIN | COMMIT | ROLLBACK");
 }

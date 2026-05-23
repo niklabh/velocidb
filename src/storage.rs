@@ -5,12 +5,12 @@
 
 use crate::btree::BTree;
 use crate::executor::Executor;
-use crate::mvcc::MvccManager;
 use crate::parser::{Parser, Statement};
 use crate::transaction::TransactionManager;
 use crate::types::{DataType, PageId, QueryResult, Result, VelociError};
+use crate::wal::WalManager;
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -49,12 +49,26 @@ impl Default for Page {
     }
 }
 
+/// The pager owns the on-disk data file and the WAL.
+///
+/// All page mutations flow through `write_page`. If a "write group" is active
+/// (started by `begin_group`), the page is appended to the WAL and buffered in
+/// `pending` until `commit_group` fsyncs the WAL and applies the buffered
+/// pages to the data file. With no active group, `write_page` opens an
+/// implicit single-write group, giving every standalone write its own atomic
+/// WAL transaction.
+///
+/// Reads consult `pending` first (so writes within the active group are
+/// visible to subsequent reads), then the page cache, then the data file.
 pub struct Pager {
     file: File,
     num_pages: u64,
     cache: Arc<DashMap<PageId, Arc<RwLock<Page>>>>,
     cache_size: AtomicUsize,
     max_cache_size: usize,
+    wal: WalManager,
+    active_group: Option<u64>,
+    pending: HashMap<PageId, Page>,
 }
 
 impl Pager {
@@ -73,22 +87,127 @@ impl Pager {
             (file_size + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64
         };
 
-        Ok(Self {
+        let wal = WalManager::open(path)?;
+
+        let mut pager = Self {
             file,
             num_pages,
             cache: Arc::new(DashMap::new()),
             cache_size: AtomicUsize::new(0),
             max_cache_size: CACHE_SIZE,
-        })
+            wal,
+            active_group: None,
+            pending: HashMap::new(),
+        };
+
+        pager.recover()?;
+        Ok(pager)
+    }
+
+    /// Replays any committed WAL groups onto the data file, then truncates the
+    /// WAL. Safe to call multiple times (truncated WAL yields zero groups).
+    fn recover(&mut self) -> Result<()> {
+        let groups = self.wal.read_committed_groups()?;
+        if groups.is_empty() {
+            return Ok(());
+        }
+        for group in &groups {
+            for (page_id, data) in &group.writes {
+                self.write_page_raw(*page_id, data)?;
+            }
+        }
+        self.file.sync_data()?;
+        self.wal.truncate()?;
+        Ok(())
+    }
+
+    /// Writes a page directly to the data file (no WAL, no cache, no pending).
+    /// Only used by recovery and `commit_group`.
+    fn write_page_raw(&mut self, page_id: PageId, data: &[u8]) -> Result<()> {
+        if data.len() != PAGE_SIZE {
+            return Err(VelociError::StorageError(format!(
+                "write_page_raw: expected {} bytes, got {}",
+                PAGE_SIZE,
+                data.len()
+            )));
+        }
+        let offset = page_id * PAGE_SIZE as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(data)?;
+        if page_id >= self.num_pages {
+            self.num_pages = page_id + 1;
+        }
+        Ok(())
+    }
+
+    /// Begins a write group. Subsequent `write_page` calls are buffered and
+    /// only made durable on `commit_group`. Fails if a group is already
+    /// active (callers should serialize via a writer mutex).
+    pub fn begin_group(&mut self) -> Result<u64> {
+        if self.active_group.is_some() {
+            return Err(VelociError::TransactionError(
+                "Write group already active".to_string(),
+            ));
+        }
+        let id = self.wal.allocate_group_id();
+        self.active_group = Some(id);
+        Ok(id)
+    }
+
+    /// Commits the active write group: fsyncs the WAL (durability of the
+    /// COMMIT marker), applies buffered pages to the data file, fsyncs the
+    /// data file, then truncates the WAL.
+    pub fn commit_group(&mut self) -> Result<()> {
+        let group_id = self.active_group.take().ok_or_else(|| {
+            VelociError::TransactionError("No active write group to commit".to_string())
+        })?;
+
+        // Empty group: nothing to commit, no WAL records were written.
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+
+        self.wal.log_commit(group_id)?;
+
+        let pending = std::mem::take(&mut self.pending);
+        for (page_id, page) in &pending {
+            self.write_page_raw(*page_id, page.data())?;
+        }
+        self.file.sync_data()?;
+        self.wal.truncate()?;
+        Ok(())
+    }
+
+    /// Aborts the active write group: discards buffered pages and evicts them
+    /// from the cache so subsequent reads observe the pre-group state.
+    /// The WAL is left untouched; any orphan records are skipped by recovery
+    /// (no COMMIT marker) and removed by the next successful `truncate`.
+    pub fn abort_group(&mut self) -> Result<()> {
+        if self.active_group.take().is_none() {
+            return Err(VelociError::TransactionError(
+                "No active write group to abort".to_string(),
+            ));
+        }
+        for page_id in self.pending.keys() {
+            if self.cache.remove(page_id).is_some() {
+                self.cache_size.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        self.pending.clear();
+        Ok(())
     }
 
     pub fn read_page(&mut self, page_id: PageId) -> Result<Arc<RwLock<Page>>> {
-        // Check cache first (lock-free read via DashMap)
+        // Pending writes from the active group take precedence over disk/cache
+        // so writers see their own modifications.
+        if let Some(page) = self.pending.get(&page_id) {
+            return Ok(Arc::new(RwLock::new(page.clone())));
+        }
+
         if let Some(page) = self.cache.get(&page_id) {
             return Ok(page.clone());
         }
 
-        // Read from disk
         if page_id >= self.num_pages {
             return Err(VelociError::NotFound(format!(
                 "Page {} out of bounds",
@@ -103,9 +222,7 @@ impl Pager {
 
         let page_arc = Arc::new(RwLock::new(page));
 
-        // Evict if cache is full
         while self.cache.len() >= self.max_cache_size {
-            // Evict the first entry we can remove
             let key_to_remove = self.cache.iter().next().map(|e| *e.key());
             if let Some(key) = key_to_remove {
                 if self.cache.remove(&key).is_some() {
@@ -116,7 +233,6 @@ impl Pager {
             }
         }
 
-        // Add to cache
         if self.cache.insert(page_id, page_arc.clone()).is_none() {
             self.cache_size.fetch_add(1, Ordering::Relaxed);
         }
@@ -125,12 +241,19 @@ impl Pager {
     }
 
     pub fn write_page(&mut self, page_id: PageId, page: &Page) -> Result<()> {
-        let offset = page_id * PAGE_SIZE as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&page.data)?;
-        self.file.sync_data()?;
+        // Auto-group if the caller didn't open one explicitly.
+        let auto_group = self.active_group.is_none();
+        if auto_group {
+            self.begin_group()?;
+        }
+        let group_id = self.active_group.expect("group active after begin_group");
 
-        // Update cache (evict if needed before inserting)
+        self.wal.log_page_write(group_id, page_id, page.data())?;
+
+        // Update pending buffer.
+        self.pending.insert(page_id, page.clone());
+
+        // Update cache (overwrites any older version).
         while self.cache.len() >= self.max_cache_size {
             let key_to_remove = self.cache.iter().next().map(|e| *e.key());
             if let Some(key) = key_to_remove {
@@ -144,7 +267,11 @@ impl Pager {
                 break;
             }
         }
-        if self.cache.insert(page_id, Arc::new(RwLock::new(page.clone()))).is_none() {
+        if self
+            .cache
+            .insert(page_id, Arc::new(RwLock::new(page.clone())))
+            .is_none()
+        {
             self.cache_size.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -152,17 +279,18 @@ impl Pager {
             self.num_pages = page_id + 1;
         }
 
+        if auto_group {
+            self.commit_group()?;
+        }
+
         Ok(())
     }
 
     pub fn allocate_page(&mut self) -> Result<PageId> {
         let page_id = self.num_pages;
-        self.num_pages += 1;
-        
-        // Initialize the page
         let page = Page::new();
+        // `write_page` will bump num_pages.
         self.write_page(page_id, &page)?;
-        
         Ok(page_id)
     }
 
@@ -171,6 +299,12 @@ impl Pager {
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        // If a group is active when flush is called (typically because the
+        // database is being closed mid-operation), abort it so we don't leave
+        // partially-applied state behind.
+        if self.active_group.is_some() {
+            let _ = self.abort_group();
+        }
         self.file.sync_all()?;
         Ok(())
     }
@@ -178,8 +312,7 @@ impl Pager {
 
 impl Drop for Pager {
     fn drop(&mut self) {
-        // Ensure file is flushed before closing
-        let _ = self.file.sync_all();
+        let _ = self.flush();
     }
 }
 
@@ -197,8 +330,11 @@ pub struct Database {
     btrees: Arc<RwLock<HashMap<String, Arc<RwLock<BTree>>>>>,
     transaction_manager: Arc<TransactionManager>,
     schema: Arc<RwLock<Schema>>,
-    mvcc: Arc<MvccManager>,
     executor: RwLock<Option<Arc<Executor>>>,
+    /// Serializes write groups across statements so only one writer creates an
+    /// active WAL group at a time. Read paths (`query`) do not acquire this
+    /// mutex.
+    writer: Mutex<()>,
 }
 
 impl Database {
@@ -226,15 +362,14 @@ impl Database {
         let btrees = Arc::new(RwLock::new(HashMap::new()));
         let transaction_manager = Arc::new(TransactionManager::new());
         let schema = Arc::new(RwLock::new(Schema::new()));
-        let mvcc = Arc::new(MvccManager::new());
 
         let db = Arc::new(Self {
             pager,
             btrees,
             transaction_manager,
             schema,
-            mvcc,
             executor: RwLock::new(None),
+            writer: Mutex::new(()),
         });
 
         // Initialize if new database
@@ -244,19 +379,29 @@ impl Database {
     }
 
     fn initialize(&self) -> Result<()> {
+        // The two initial pages (root + schema) are durably allocated through a
+        // WAL group so the database is consistent even if the process crashes
+        // right after open().
         let num_pages = {
             let mut pager = self.pager.write();
-
-            // If empty database, create root page and schema page
             if pager.num_pages() == 0 {
-                pager.allocate_page()?; // Page 0 - root
-                pager.allocate_page()?; // Page 1 - schema
+                pager.begin_group()?;
+                let result = (|| -> Result<()> {
+                    pager.allocate_page()?; // Page 0 - root
+                    pager.allocate_page()?; // Page 1 - schema
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => pager.commit_group()?,
+                    Err(e) => {
+                        let _ = pager.abort_group();
+                        return Err(e);
+                    }
+                }
             }
-            
             pager.num_pages()
-        }; // Drop the write lock here
-        
-        // Load existing schema if database already exists
+        };
+
         if num_pages > 0 {
             self.load_schema()?;
         }
@@ -410,15 +555,28 @@ impl Database {
             }
 
             let btree_root = if table_root_page == 0 {
+                // A schema entry without a valid root page indicates a bug or
+                // partial recovery. Allocate a fresh leaf root for it.
                 let mut pager = self.pager.write();
-                let new_root_page = pager.allocate_page()?;
-
-                let mut page = crate::storage::Page::new();
-                let header = crate::btree::NodeHeader::new_leaf();
-                header.serialize(page.data_mut());
-                pager.write_page(new_root_page, &page)?;
-
-                new_root_page
+                pager.begin_group()?;
+                let res = (|| -> Result<u64> {
+                    let new_root_page = pager.allocate_page()?;
+                    let mut page = crate::storage::Page::new();
+                    let header = crate::btree::NodeHeader::new_leaf();
+                    header.serialize(page.data_mut());
+                    pager.write_page(new_root_page, &page)?;
+                    Ok(new_root_page)
+                })();
+                match res {
+                    Ok(p) => {
+                        pager.commit_group()?;
+                        p
+                    }
+                    Err(e) => {
+                        let _ = pager.abort_group();
+                        return Err(e);
+                    }
+                }
             } else {
                 table_root_page
             };
@@ -502,29 +660,39 @@ impl Database {
             }
         }
 
-        // Write schema across multiple pages if needed
+        // The entire schema serialization is one atomic WAL group: either all
+        // chained pages land or none do.
         let mut pager = self.pager.write();
         let usable_size = PAGE_SIZE - 4; // Reserve 4 bytes for chunk length header
         let num_pages_needed = if buffer.is_empty() { 1 } else { (buffer.len() + usable_size - 1) / usable_size };
 
-        // Ensure we have enough schema pages (starting from page 1)
-        while pager.num_pages() < 1 + num_pages_needed as u64 {
-            pager.allocate_page()?;
-        }
+        pager.begin_group()?;
+        let res = (|| -> Result<()> {
+            while pager.num_pages() < 1 + num_pages_needed as u64 {
+                pager.allocate_page()?;
+            }
 
-        for page_idx in 0..num_pages_needed {
-            let start = page_idx * usable_size;
-            let end = std::cmp::min(start + usable_size, buffer.len());
-            let chunk = &buffer[start..end];
+            for page_idx in 0..num_pages_needed {
+                let start = page_idx * usable_size;
+                let end = std::cmp::min(start + usable_size, buffer.len());
+                let chunk = &buffer[start..end];
 
-            let mut page = crate::storage::Page::new();
-            // First 4 bytes: chunk length for this page (u32)
-            let chunk_len = chunk.len() as u32;
-            page.data_mut()[0..4].copy_from_slice(&chunk_len.to_le_bytes());
-            page.data_mut()[4..4 + chunk.len()].copy_from_slice(chunk);
+                let mut page = crate::storage::Page::new();
+                let chunk_len = chunk.len() as u32;
+                page.data_mut()[0..4].copy_from_slice(&chunk_len.to_le_bytes());
+                page.data_mut()[4..4 + chunk.len()].copy_from_slice(chunk);
 
-            let schema_page_id = 1 + page_idx as u64;
-            pager.write_page(schema_page_id, &page)?;
+                let schema_page_id = 1 + page_idx as u64;
+                pager.write_page(schema_page_id, &page)?;
+            }
+            Ok(())
+        })();
+        match res {
+            Ok(()) => pager.commit_group()?,
+            Err(e) => {
+                let _ = pager.abort_group();
+                return Err(e);
+            }
         }
 
         Ok(())
@@ -542,7 +710,6 @@ impl Database {
             Arc::clone(&self.btrees),
             Arc::clone(&self.schema),
             Arc::clone(&self.transaction_manager),
-            Arc::clone(&self.mvcc),
         ));
         *self.executor.write() = Some(Arc::clone(&exec));
         exec
@@ -568,18 +735,50 @@ impl Database {
 
         let executor = self.get_or_create_executor();
 
-        executor.execute_statement(statement.clone())?;
+        // Serialize writers so the pager only ever has a single active WAL
+        // group. We do NOT hold `pager.write()` across the executor call —
+        // the executor takes the pager lock many times internally and a
+        // recursive write lock would deadlock. The active_group field on
+        // Pager persists across lock releases, so `write_page` calls from the
+        // executor still see the group and buffer correctly.
+        let _writer = self.writer.lock();
 
-        // Save schema if this was a DDL statement
-        match statement {
-            Statement::CreateTable { .. } |
-            Statement::DropTable { .. } => {
-                self.save_schema()?;
+        let needs_schema_save = matches!(
+            statement,
+            Statement::CreateTable { .. } | Statement::DropTable { .. }
+        );
+
+        // Capture root pages before the statement so we can detect any
+        // B-tree root changes (caused by splits or root-collapse during
+        // underflow). If a root changed, the schema page must be re-saved
+        // so a subsequent open finds the correct root.
+        let roots_before = self.snapshot_roots();
+
+        self.pager.write().begin_group()?;
+        let result = executor.execute_statement(statement);
+        match &result {
+            Ok(()) => self.pager.write().commit_group()?,
+            Err(_) => {
+                let _ = self.pager.write().abort_group();
             }
-            _ => {}
+        }
+        result?;
+
+        let roots_after = self.snapshot_roots();
+        if needs_schema_save || roots_before != roots_after {
+            self.save_schema()?;
         }
 
         Ok(())
+    }
+
+    fn snapshot_roots(&self) -> HashMap<String, PageId> {
+        let btrees = self.btrees.read();
+        let mut out = HashMap::with_capacity(btrees.len());
+        for (name, bt) in btrees.iter() {
+            out.insert(name.clone(), bt.read().root_page());
+        }
+        out
     }
 
     /// Executes a SQL query that returns rows (e.g., SELECT).
@@ -641,6 +840,38 @@ impl Database {
     /// Lists all tables in the database.
     pub fn list_tables(&self) -> Vec<String> {
         self.schema.read().list_tables()
+    }
+
+    /// Returns a human-readable `CREATE TABLE` statement for the named table,
+    /// suitable for display in `.schema`-style REPL commands.
+    pub fn describe_table(&self, name: &str) -> Result<String> {
+        let schema = self.schema.read();
+        let table = schema.get_table(name)?;
+        let mut out = format!("CREATE TABLE {} (", table.name);
+        for (i, col) in table.columns.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let type_str = match col.data_type {
+                DataType::Integer => "INTEGER",
+                DataType::Real => "REAL",
+                DataType::Text => "TEXT",
+                DataType::Blob => "BLOB",
+                DataType::Null => "NULL",
+            };
+            out.push_str(&format!("{} {}", col.name, type_str));
+            if col.primary_key {
+                out.push_str(" PRIMARY KEY");
+            }
+            if col.not_null && !col.primary_key {
+                out.push_str(" NOT NULL");
+            }
+            if col.unique && !col.primary_key {
+                out.push_str(" UNIQUE");
+            }
+        }
+        out.push(')');
+        Ok(out)
     }
 }
 
