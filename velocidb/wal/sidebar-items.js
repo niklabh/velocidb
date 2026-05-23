@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["REC_COMMIT","REC_PAGE_WRITE"],"fn":["wal_path_for"],"struct":["CommittedGroup","WalManager"]};

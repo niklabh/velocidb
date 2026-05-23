@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"enum":["Operator","Statement"],"struct":["Condition","Parser","WhereClause"]};
+window.SIDEBAR_ITEMS = {"enum":["Operator","Statement"],"struct":["Condition","OrderBy","Parser","WhereClause"]};

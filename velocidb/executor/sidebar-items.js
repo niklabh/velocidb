@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"struct":["Executor"]};
+window.SIDEBAR_ITEMS = {"fn":["compare_values"],"struct":["Executor"]};
