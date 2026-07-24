@@ -63,9 +63,9 @@ LIMIT 5;
 ## Tests
 
 Unit tests live in `src/vector.rs`; end-to-end coverage in
-`tests/turso_features_tests.rs` (roundtrip, dimension enforcement, KNN
+`tests/advanced_features_tests.rs` (roundtrip, dimension enforcement, KNN
 ordering, projection distances, reopen persistence, 1500-row parallel KNN).
 
 ```bash
-cargo test --lib vector && cargo test --test turso_features_tests
+cargo test --lib vector && cargo test --test advanced_features_tests
 ```

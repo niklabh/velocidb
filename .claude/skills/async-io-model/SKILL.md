@@ -60,6 +60,6 @@ compile.
 ## Testing async code
 
 Use `#[tokio::test]` (tokio "full" is available through the default feature).
-See `tests/turso_features_tests.rs::test_async_concurrent_writers_and_readers`
+See `tests/advanced_features_tests.rs::test_async_concurrent_writers_and_readers`
 for the concurrency-test pattern: spawn tasks with their own connections,
 join all, then assert counts.

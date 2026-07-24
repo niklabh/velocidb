@@ -12,14 +12,14 @@ description: How to run and write VelociDB tests - test suite layout, commands, 
 | Unit tests | `#[cfg(test)] mod tests` in each `src/*.rs` | parser, btree (incl. proptest), wal, vector, cdc, async_api, storage |
 | `tests/integration_tests.rs` | full SQL path | CRUD, WHERE, ORDER BY, LIMIT, constraints |
 | `tests/recovery_tests.rs` | crash safety | WAL replay, torn tails, uncommitted groups, reopen persistence |
-| `tests/turso_features_tests.rs` | Turso-inspired features | vector search, KNN, async API, CDC, ALTER TABLE, parallel paths |
+| `tests/advanced_features_tests.rs` | Turso-inspired features | vector search, KNN, async API, CDC, ALTER TABLE, parallel paths |
 | `benches/benchmarks.rs` | criterion | perf only, not part of `cargo test` |
 
 ## Commands
 
 ```bash
 cargo test                                 # everything (~2 min)
-cargo test --test turso_features_tests    # one integration suite
+cargo test --test advanced_features_tests    # one integration suite
 cargo test --lib vector                    # unit tests of one module
 cargo test test_cdc_capture_and_poll      # single test by name
 cargo check --all-targets                  # fast type-check incl. tests

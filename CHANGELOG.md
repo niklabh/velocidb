@@ -30,7 +30,7 @@ All notable changes to VelociDB are documented in this file.
   (existing rows padded with NULL), `DROP COLUMN` (rows rewritten;
   dropping the primary key is rejected). Schema changes persist across
   reopen.
-- Integration test suite `tests/turso_features_tests.rs` (13 tests)
+- Integration test suite `tests/advanced_features_tests.rs` (13 tests)
   covering all of the above.
 - **Agent skills** (`.claude/skills/`, modeled on Turso's): storage-format,
   transaction-correctness, async-io-model, vector-search, cdc, sql-parser,

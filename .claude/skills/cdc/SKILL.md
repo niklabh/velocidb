@@ -46,5 +46,5 @@ Hooks exist in `execute_insert`, `execute_update`, `execute_delete` in
 ## Tests
 
 Unit tests in `src/cdc.rs` (disabled-by-default, ordering, capacity bound);
-end-to-end in `tests/turso_features_tests.rs::test_cdc_capture_and_poll`
+end-to-end in `tests/advanced_features_tests.rs::test_cdc_capture_and_poll`
 (asserts op sequence, before/after images, incremental polling).
