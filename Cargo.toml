@@ -1,6 +1,6 @@
 [package]
 name = "velocidb"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.70"
 authors = ["Nikhil Ranjan <niklabh811@gmail.com>"]
