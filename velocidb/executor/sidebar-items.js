@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"fn":["compare_values"],"struct":["Executor"]};
+window.SIDEBAR_ITEMS = {"constant":["PARALLEL_THRESHOLD"],"fn":["compare_values"],"struct":["Executor"]};

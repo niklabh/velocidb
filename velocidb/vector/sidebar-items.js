@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["PARALLEL_THRESHOLD"],"enum":["DistanceMetric"],"fn":["compute_distances","cosine_distance","dot_product","euclidean_distance","knn","parse_distance_expr","parse_vector_constructor","parse_vector_literal","value_as_vector"],"struct":["DistanceExpr"]};
