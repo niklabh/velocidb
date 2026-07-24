@@ -3,15 +3,6 @@
 //! This binary provides an interactive REPL for executing SQL commands.
 //! Type `.help` for a list of supported commands or `.exit` to quit.
 
-mod storage;
-mod btree;
-mod parser;
-mod executor;
-mod transaction;
-mod types;
-mod mvcc;
-mod wal;
-
 use anyhow::Result;
 use rustyline::config::Builder as RustylineBuilder;
 use rustyline::error::ReadlineError;
@@ -23,7 +14,7 @@ use std::path::PathBuf;
 use tracing::{error, info, Level};
 use tracing_subscriber;
 
-use crate::storage::Database;
+use velocidb::Database;
 
 /// Returns true to continue the REPL, false to exit.
 fn process_command(db: &Database, input: &str) -> Result<bool> {
@@ -122,6 +113,39 @@ fn handle_meta_command(db: &Database, cmd: &str) -> Result<bool> {
             }
             Ok(true)
         }
+        "cdc" => {
+            match arg.to_lowercase().as_str() {
+                "on" => {
+                    db.enable_cdc();
+                    println!("Change Data Capture enabled.");
+                }
+                "off" => {
+                    db.disable_cdc();
+                    println!("Change Data Capture disabled.");
+                }
+                "" => {
+                    println!(
+                        "Change Data Capture is {}.",
+                        if db.cdc_enabled() { "on" } else { "off" }
+                    );
+                }
+                other => println!("Usage: .cdc [on|off] (got '{}')", other),
+            }
+            Ok(true)
+        }
+        "changes" => {
+            let since = arg.parse::<u64>().unwrap_or(0);
+            let changes = db.changes_since(since);
+            if changes.is_empty() {
+                println!("No changes captured (is CDC on? try '.cdc on').");
+            } else {
+                for ev in &changes {
+                    println!("#{} {} {} rowid={}", ev.seq, ev.op, ev.table, ev.rowid);
+                }
+                println!("{} change(s)", changes.len());
+            }
+            Ok(true)
+        }
         other => {
             println!("Unknown meta command: .{}", other);
             Ok(true)
@@ -205,7 +229,7 @@ fn run_sql(db: &Database, sql: &str) {
     }
 }
 
-fn print_query_result(result: &crate::types::QueryResult) {
+fn print_query_result(result: &velocidb::QueryResult) {
     // Header.
     for (i, col) in result.columns.iter().enumerate() {
         if i > 0 {
@@ -440,15 +464,25 @@ fn print_help() {
     println!("    .help              Show this help");
     println!("    .tables            List tables");
     println!("    .schema [name]     Show CREATE TABLE for one or all tables");
+    println!("    .cdc [on|off]      Toggle / show Change Data Capture");
+    println!("    .changes [seq]     Show captured changes after seq (default 0)");
     println!("    .exit              Exit the shell");
     println!();
     println!("SQL (terminated by ';'):");
-    println!("    CREATE TABLE <name> (...)");
+    println!("    CREATE TABLE <name> (...)   -- vector columns: F32_BLOB(n) / VECTOR(n)");
     println!("    DROP TABLE <name>");
-    println!("    INSERT INTO <table> [(cols)] VALUES (...)");
+    println!("    ALTER TABLE <name> RENAME TO <new> | RENAME COLUMN a TO b");
+    println!("                       | ADD COLUMN <col> <type> | DROP COLUMN <col>");
+    println!("    INSERT INTO <table> [(cols)] VALUES (...)  -- vectors: vector32('[1,2,3]')");
     println!("    SELECT [* | cols | COUNT(*)] FROM <table>");
     println!("        [WHERE expr [AND expr ...]] [ORDER BY col [ASC|DESC]] [LIMIT n]");
     println!("    UPDATE <table> SET col = val [, ...] [WHERE ...]");
     println!("    DELETE FROM <table> [WHERE ...]");
     println!("    BEGIN | COMMIT | ROLLBACK");
+    println!();
+    println!("Vector search (exact KNN, parallel):");
+    println!("    CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding F32_BLOB(3));");
+    println!("    INSERT INTO docs VALUES (1, vector32('[1.0, 0.0, 0.0]'));");
+    println!("    SELECT id, vector_distance_cos(embedding, vector32('[1,0,0]')) FROM docs");
+    println!("        ORDER BY vector_distance_cos(embedding, vector32('[1,0,0]')) LIMIT 5;");
 }

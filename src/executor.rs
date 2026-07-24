@@ -1,16 +1,24 @@
 //! Query executor that translates AST statements into storage operations.
 //!
 //! Coordinates B-Tree, MVCC, lock manager, and schema to execute SQL
-//! statements with ACID guarantees.
+//! statements with ACID guarantees. WHERE filtering, ORDER BY sorting, and
+//! vector distance computation are parallelized with rayon for larger row
+//! sets.
 
 use crate::btree::BTree;
-use crate::parser::{OrderBy, Statement, WhereClause};
+use crate::cdc::{CdcManager, ChangeOp};
+use crate::parser::{AlterAction, OrderBy, Statement, WhereClause};
 use crate::storage::{Pager, Schema, TableSchema};
 use crate::transaction::{LockManager, LockType, TransactionManager, Transaction};
-use crate::types::{Column, QueryResult, Result, Row, Value, VelociError};
+use crate::types::{Column, DataType, QueryResult, Result, Row, Value, VelociError};
+use crate::vector::{self, DistanceMetric};
 use parking_lot::RwLock;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Row-count threshold above which filtering/sorting switches to rayon.
+const PARALLEL_THRESHOLD: usize = 1024;
 
 pub struct Executor {
     pager: Arc<RwLock<Pager>>,
@@ -19,6 +27,7 @@ pub struct Executor {
     transaction_manager: Arc<TransactionManager>,
     lock_manager: Arc<LockManager>,
     active_transaction: RwLock<Option<Arc<Transaction>>>,
+    cdc: Arc<CdcManager>,
 }
 
 impl Executor {
@@ -27,6 +36,7 @@ impl Executor {
         btrees: Arc<RwLock<HashMap<String, Arc<RwLock<BTree>>>>>,
         schema: Arc<RwLock<Schema>>,
         transaction_manager: Arc<TransactionManager>,
+        cdc: Arc<CdcManager>,
     ) -> Self {
         Self {
             pager,
@@ -35,6 +45,7 @@ impl Executor {
             transaction_manager,
             lock_manager: Arc::new(LockManager::new()),
             active_transaction: RwLock::new(None),
+            cdc,
         }
     }
 
@@ -42,6 +53,7 @@ impl Executor {
         match statement {
             Statement::CreateTable { name, columns } => self.execute_create_table(&name, columns),
             Statement::DropTable { name } => self.execute_drop_table(&name),
+            Statement::AlterTable { table, action } => self.execute_alter_table(&table, action),
             Statement::Insert { table, columns, values } => self.execute_insert(&table, columns, values),
             Statement::Update { table, assignments, where_clause } => self.execute_update(&table, assignments, where_clause),
             Statement::Delete { table, where_clause } => self.execute_delete(&table, where_clause),
@@ -145,6 +157,136 @@ impl Executor {
         Ok(())
     }
 
+    fn execute_alter_table(&self, table: &str, action: AlterAction) -> Result<()> {
+        match action {
+            AlterAction::RenameTable { new_name } => {
+                {
+                    let schema = self.schema.read();
+                    if schema.get_table(&new_name).is_ok() {
+                        return Err(VelociError::ConstraintViolation(format!(
+                            "Table '{}' already exists",
+                            new_name
+                        )));
+                    }
+                }
+                let mut schema = self.schema.write();
+                let mut table_schema = schema.get_table(table)?.clone();
+                schema.drop_table(table)?;
+                table_schema.name = new_name.clone();
+                schema.create_table(table_schema)?;
+                drop(schema);
+
+                let mut btrees = self.btrees.write();
+                if let Some(bt) = btrees.remove(table) {
+                    btrees.insert(new_name, bt);
+                }
+                Ok(())
+            }
+            AlterAction::RenameColumn { old_name, new_name } => {
+                let mut schema = self.schema.write();
+                let table_schema = schema.get_table_mut(table)?;
+                if table_schema.columns.iter().any(|c| c.name == new_name) {
+                    return Err(VelociError::ConstraintViolation(format!(
+                        "Column '{}' already exists in table '{}'",
+                        new_name, table
+                    )));
+                }
+                let col = table_schema
+                    .columns
+                    .iter_mut()
+                    .find(|c| c.name == old_name)
+                    .ok_or_else(|| {
+                        VelociError::NotFound(format!(
+                            "Column '{}' not found in table '{}'",
+                            old_name, table
+                        ))
+                    })?;
+                col.name = new_name;
+                Ok(())
+            }
+            AlterAction::AddColumn { column } => {
+                {
+                    let schema = self.schema.read();
+                    let table_schema = schema.get_table(table)?;
+                    if table_schema.columns.iter().any(|c| c.name == column.name) {
+                        return Err(VelociError::ConstraintViolation(format!(
+                            "Column '{}' already exists in table '{}'",
+                            column.name, table
+                        )));
+                    }
+                }
+
+                // Rewrite existing rows with a trailing NULL so row width
+                // matches the new schema.
+                {
+                    let btrees = self.btrees.read();
+                    let btree_arc = btrees.get(table).ok_or_else(|| {
+                        VelociError::NotFound(format!("Table '{}' not initialized", table))
+                    })?;
+                    let mut btree = btree_arc.write();
+                    let all_rows = btree.scan()?;
+                    for (key, mut row) in all_rows {
+                        row.values.push(Value::Null);
+                        btree.delete(key)?;
+                        btree.insert(key, &row)?;
+                    }
+                }
+
+                self.schema
+                    .write()
+                    .get_table_mut(table)?
+                    .columns
+                    .push(column);
+                Ok(())
+            }
+            AlterAction::DropColumn { name } => {
+                let col_index = {
+                    let schema = self.schema.read();
+                    let table_schema = schema.get_table(table)?;
+                    let idx = table_schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == name)
+                        .ok_or_else(|| {
+                            VelociError::NotFound(format!(
+                                "Column '{}' not found in table '{}'",
+                                name, table
+                            ))
+                        })?;
+                    if table_schema.columns[idx].primary_key {
+                        return Err(VelociError::ConstraintViolation(
+                            "Cannot drop the primary key column".to_string(),
+                        ));
+                    }
+                    idx
+                };
+
+                {
+                    let btrees = self.btrees.read();
+                    let btree_arc = btrees.get(table).ok_or_else(|| {
+                        VelociError::NotFound(format!("Table '{}' not initialized", table))
+                    })?;
+                    let mut btree = btree_arc.write();
+                    let all_rows = btree.scan()?;
+                    for (key, mut row) in all_rows {
+                        if col_index < row.values.len() {
+                            row.values.remove(col_index);
+                        }
+                        btree.delete(key)?;
+                        btree.insert(key, &row)?;
+                    }
+                }
+
+                self.schema
+                    .write()
+                    .get_table_mut(table)?
+                    .columns
+                    .remove(col_index);
+                Ok(())
+            }
+        }
+    }
+
     fn execute_insert(
         &self,
         table: &str,
@@ -213,7 +355,8 @@ impl Executor {
 
         let pk_value = values[pk_value_index].as_integer()?;
 
-        // Validate NOT NULL constraints before acquiring BTree lock
+        // Validate NOT NULL and vector-dimension constraints before acquiring
+        // the BTree lock.
         for (i, value) in values.iter().enumerate() {
             let col_name = &column_names[i];
             if let Some(col) = table_schema.columns.iter().find(|c| &c.name == col_name) {
@@ -222,6 +365,26 @@ impl Executor {
                     return Err(VelociError::ConstraintViolation(format!(
                         "Column '{}' cannot be NULL", col_name
                     )));
+                }
+                if let DataType::Vector(dim) = col.data_type {
+                    match value {
+                        Value::Null => {}
+                        Value::Vector(v) if v.len() == dim as usize => {}
+                        Value::Vector(v) => {
+                            self.lock_manager.release_lock(table, txn.id())?;
+                            return Err(VelociError::ConstraintViolation(format!(
+                                "Column '{}' expects a vector of dimension {}, got {}",
+                                col_name, dim, v.len()
+                            )));
+                        }
+                        other => {
+                            self.lock_manager.release_lock(table, txn.id())?;
+                            return Err(VelociError::TypeMismatch {
+                                expected: format!("Vector({})", dim),
+                                actual: format!("{:?}", other),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -265,6 +428,9 @@ impl Executor {
             self.transaction_manager.abort(&txn)?;
             return Err(e);
         }
+
+        self.cdc
+            .record(table, ChangeOp::Insert, pk_value, None, Some(row));
 
         // Only commit/release lock for auto-commit mode
         if auto_commit {
@@ -315,37 +481,107 @@ impl Executor {
             btree.scan()?
         };
 
-        // Process data without holding any locks
+        // Process data without holding any locks. Filtering runs in parallel
+        // (rayon) once the row count crosses PARALLEL_THRESHOLD.
         let mut filtered_rows: Vec<(i64, Row)> = if let Some(ref where_clause) = where_clause {
-            all_rows
-                .into_iter()
-                .filter(|(_, row)| self.evaluate_where_clause(row, where_clause, &table_schema).unwrap_or(false))
-                .collect()
+            if all_rows.len() >= PARALLEL_THRESHOLD {
+                all_rows
+                    .into_par_iter()
+                    .filter(|(_, row)| {
+                        self.evaluate_where_clause(row, where_clause, &table_schema)
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            } else {
+                all_rows
+                    .into_iter()
+                    .filter(|(_, row)| {
+                        self.evaluate_where_clause(row, where_clause, &table_schema)
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            }
         } else {
             all_rows
         };
 
-        // Apply ORDER BY (sort by the requested column; primary-key fallback for stability).
+        // Apply ORDER BY. Two forms are supported:
+        // 1. A vector distance expression -> exact KNN (parallel distances).
+        // 2. A plain column -> comparison sort (parallel for large sets).
         if let Some(ref order) = order_by {
-            let col_index = table_schema
-                .columns
-                .iter()
-                .position(|c| c.name == order.column)
-                .ok_or_else(|| {
-                    VelociError::NotFound(format!(
-                        "ORDER BY column '{}' not found in table '{}'",
-                        order.column, table
-                    ))
-                })?;
+            if let Some(parsed) = vector::parse_distance_expr(&order.column) {
+                let expr = parsed?;
+                let col_index = table_schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name == expr.column)
+                    .ok_or_else(|| {
+                        VelociError::NotFound(format!(
+                            "Vector column '{}' not found in table '{}'",
+                            expr.column, table
+                        ))
+                    })?;
 
-            filtered_rows.sort_by(|(ak, a), (bk, b)| {
-                let av = a.values.get(col_index).unwrap_or(&Value::Null);
-                let bv = b.values.get(col_index).unwrap_or(&Value::Null);
-                let primary = compare_values(av, bv);
-                let secondary = ak.cmp(bk);
-                let combined = primary.then(secondary);
-                if order.ascending { combined } else { combined.reverse() }
-            });
+                if order.ascending {
+                    // Nearest-first with a LIMIT is the classic KNN shape:
+                    // use top-k selection instead of a full sort.
+                    let k = limit.map(|n| n as usize).unwrap_or(usize::MAX).min(filtered_rows.len());
+                    filtered_rows = vector::knn(
+                        filtered_rows,
+                        col_index,
+                        &expr.query,
+                        expr.metric,
+                        k,
+                    )
+                    .into_iter()
+                    .map(|(_, key, row)| (key, row))
+                    .collect();
+                } else {
+                    let distances = vector::compute_distances(
+                        &filtered_rows,
+                        col_index,
+                        &expr.query,
+                        expr.metric,
+                    );
+                    let mut scored: Vec<(f64, i64, Row)> = filtered_rows
+                        .into_iter()
+                        .zip(distances)
+                        .map(|((key, row), d)| (d, key, row))
+                        .collect();
+                    scored.sort_by(|a, b| {
+                        b.0.partial_cmp(&a.0)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(a.1.cmp(&b.1))
+                    });
+                    filtered_rows = scored.into_iter().map(|(_, key, row)| (key, row)).collect();
+                }
+            } else {
+                let col_index = table_schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name == order.column)
+                    .ok_or_else(|| {
+                        VelociError::NotFound(format!(
+                            "ORDER BY column '{}' not found in table '{}'",
+                            order.column, table
+                        ))
+                    })?;
+
+                let cmp = |(ak, a): &(i64, Row), (bk, b): &(i64, Row)| {
+                    let av = a.values.get(col_index).unwrap_or(&Value::Null);
+                    let bv = b.values.get(col_index).unwrap_or(&Value::Null);
+                    let primary = compare_values(av, bv);
+                    let secondary = ak.cmp(bk);
+                    let combined = primary.then(secondary);
+                    if order.ascending { combined } else { combined.reverse() }
+                };
+
+                if filtered_rows.len() >= PARALLEL_THRESHOLD {
+                    filtered_rows.par_sort_by(cmp);
+                } else {
+                    filtered_rows.sort_by(cmp);
+                }
+            }
         }
 
         // Apply LIMIT n (does not affect COUNT(*), which counts rows after WHERE).
@@ -376,40 +612,96 @@ impl Executor {
             return Ok(QueryResult::new(result_columns, result_rows));
         }
 
-        // Project columns
-        let result_columns = if columns.len() == 1 && columns[0] == "*" {
-            table_schema.columns.clone()
-        } else {
-            columns
-                .iter()
-                .filter_map(|col_name| {
-                    table_schema
-                        .columns
-                        .iter()
-                        .find(|c| &c.name == col_name)
-                        .cloned()
-                })
-                .collect()
-        };
+        // Project columns. Each projection item is either '*', a table
+        // column, or a vector distance expression computed per row.
+        enum ProjItem {
+            Star,
+            Col(usize),
+            Distance {
+                col_index: usize,
+                metric: DistanceMetric,
+                query: Vec<f32>,
+            },
+        }
+
+        let mut proj_items: Vec<(String, ProjItem)> = Vec::with_capacity(columns.len());
+        for col_name in &columns {
+            if col_name == "*" {
+                proj_items.push(("*".to_string(), ProjItem::Star));
+            } else if let Some(idx) = table_schema.columns.iter().position(|c| &c.name == col_name)
+            {
+                proj_items.push((col_name.clone(), ProjItem::Col(idx)));
+            } else if let Some(parsed) = vector::parse_distance_expr(col_name) {
+                let expr = parsed?;
+                let col_index = table_schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name == expr.column)
+                    .ok_or_else(|| {
+                        VelociError::NotFound(format!(
+                            "Vector column '{}' not found in table '{}'",
+                            expr.column, table
+                        ))
+                    })?;
+                proj_items.push((
+                    col_name.clone(),
+                    ProjItem::Distance {
+                        col_index,
+                        metric: expr.metric,
+                        query: expr.query,
+                    },
+                ));
+            } else {
+                return Err(VelociError::NotFound(format!(
+                    "Column '{}' not found in table '{}'",
+                    col_name, table
+                )));
+            }
+        }
+
+        let mut result_columns: Vec<Column> = Vec::new();
+        for (name, item) in &proj_items {
+            match item {
+                ProjItem::Star => result_columns.extend(table_schema.columns.iter().cloned()),
+                ProjItem::Col(idx) => result_columns.push(table_schema.columns[*idx].clone()),
+                ProjItem::Distance { .. } => result_columns.push(Column {
+                    name: name.clone(),
+                    data_type: DataType::Real,
+                    primary_key: false,
+                    not_null: false,
+                    unique: false,
+                }),
+            }
+        }
 
         let result_rows: Vec<Row> = filtered_rows
             .into_iter()
             .map(|(_, row)| {
-                if columns.len() == 1 && columns[0] == "*" {
-                    row
-                } else {
-                    let projected_values: Vec<Value> = columns
-                        .iter()
-                        .filter_map(|col_name| {
-                            table_schema
-                                .columns
-                                .iter()
-                                .position(|c| &c.name == col_name)
-                                .and_then(|idx| row.values.get(idx).cloned())
-                        })
-                        .collect();
-                    Row::new(projected_values)
+                let mut projected: Vec<Value> = Vec::with_capacity(result_columns.len());
+                for (_, item) in &proj_items {
+                    match item {
+                        ProjItem::Star => projected.extend(row.values.iter().cloned()),
+                        ProjItem::Col(idx) => {
+                            projected.push(row.values.get(*idx).cloned().unwrap_or(Value::Null))
+                        }
+                        ProjItem::Distance {
+                            col_index,
+                            metric,
+                            query,
+                        } => {
+                            let d = row
+                                .values
+                                .get(*col_index)
+                                .and_then(|v| vector::value_as_vector(v).ok())
+                                .and_then(|v| metric.distance(&v, query).ok());
+                            projected.push(match d {
+                                Some(d) => Value::Float(d),
+                                None => Value::Null,
+                            });
+                        }
+                    }
                 }
+                Row::new(projected)
             })
             .collect();
 
@@ -445,6 +737,10 @@ impl Executor {
             let schema = self.schema.read();
             schema.get_table(table)?.clone()
         }; // schema lock released
+
+        // Change events collected during the update, recorded to CDC only
+        // after the whole statement succeeds.
+        let mut cdc_events: Vec<(i64, Row, Row)> = Vec::new();
 
         // Perform update with single btree lock acquisition
         let result = {
@@ -514,6 +810,10 @@ impl Executor {
                 // Delete old row and insert updated row
                 btree.delete(*key)?;
                 btree.insert(new_pk_value, &updated_row)?;
+
+                if self.cdc.is_enabled() {
+                    cdc_events.push((*key, row.clone(), updated_row));
+                }
             }
             
             Ok::<(), VelociError>(())
@@ -524,6 +824,11 @@ impl Executor {
             self.lock_manager.release_lock(table, txn.id())?;
             self.transaction_manager.abort(&txn)?;
             return Err(e);
+        }
+
+        for (key, before, after) in cdc_events {
+            self.cdc
+                .record(table, ChangeOp::Update, key, Some(before), Some(after));
         }
 
         if auto_commit {
@@ -556,6 +861,7 @@ impl Executor {
         }; // schema lock released
 
         // Perform delete with single btree lock acquisition
+        let mut cdc_events: Vec<(i64, Row)> = Vec::new();
         let result: Result<()> = {
             let btrees = self.btrees.read();
             let btree_arc = btrees.get(table).ok_or_else(|| {
@@ -564,18 +870,20 @@ impl Executor {
             let mut btree = btree_arc.write();
 
             let all_rows = btree.scan()?;
-            let rows_to_delete: Vec<i64> = if let Some(ref where_clause) = where_clause {
+            let rows_to_delete: Vec<(i64, Row)> = if let Some(ref where_clause) = where_clause {
                 all_rows
                     .into_iter()
                     .filter(|(_, row)| self.evaluate_where_clause(row, where_clause, &table_schema).unwrap_or(false))
-                    .map(|(key, _)| key)
                     .collect()
             } else {
-                all_rows.into_iter().map(|(key, _)| key).collect()
+                all_rows
             };
 
-            for key in &rows_to_delete {
-                btree.delete(*key)?;
+            for (key, row) in rows_to_delete {
+                btree.delete(key)?;
+                if self.cdc.is_enabled() {
+                    cdc_events.push((key, row));
+                }
             }
             Ok(())
         };
@@ -584,6 +892,11 @@ impl Executor {
             self.lock_manager.release_lock(table, txn.id())?;
             self.transaction_manager.abort(&txn)?;
             return Err(e);
+        }
+
+        for (key, before) in cdc_events {
+            self.cdc
+                .record(table, ChangeOp::Delete, key, Some(before), None);
         }
 
         if auto_commit {
@@ -652,8 +965,6 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::parser::Parser;
     use crate::storage::Database;
     use tempfile::NamedTempFile;
 

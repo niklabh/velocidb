@@ -23,4 +23,6 @@ Thumbs.db
 *.profdata
 *.profraw
 
-.claude/
+# Claude Code local state (but keep shared agent skills in version control)
+.claude/*
+!.claude/skills/
