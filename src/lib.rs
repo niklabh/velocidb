@@ -5,10 +5,16 @@
 //!
 //! ## Key Features
 //!
-//! - **MVCC**: Multi-Version Concurrency Control for non-blocking reads.
-//! - **Async I/O**: Built on `tokio` and `io_uring` (on Linux) for high throughput.
-//! - **SIMD Acceleration**: Vectorized execution for query processing.
-//! - **Persistent Memory**: Direct Access (DAX) support for PMEM.
+//! - **Vector search**: `F32_BLOB(n)` columns, `vector32('[...]')` literals and
+//!   `vector_distance_cos/l2/dot` functions with exact, parallel KNN
+//!   (`ORDER BY vector_distance_cos(...) LIMIT k`).
+//! - **Async API**: Turso-style `Builder` / `AsyncDatabase` / `AsyncConnection`
+//!   built on tokio (`async_api` module, `async-io` feature).
+//! - **Parallel execution**: rayon-parallel WHERE filtering, ORDER BY sorting,
+//!   and vector distance computation for larger row sets.
+//! - **Change Data Capture**: real-time tracking of INSERT/UPDATE/DELETE with
+//!   sequence numbers (`Database::enable_cdc` / `changes_since`).
+//! - **Schema management**: `ALTER TABLE` ADD/DROP/RENAME COLUMN and RENAME TO.
 //!
 //! ## Quick Start
 //!
@@ -43,6 +49,11 @@ pub mod executor;
 pub mod transaction;
 pub mod types;
 pub mod wal;
+pub mod vector;   // Vector search: distance metrics, literals, parallel KNN
+pub mod cdc;      // Change Data Capture: real-time change tracking
+
+#[cfg(feature = "async-io")]
+pub mod async_api; // Turso-style async API (Builder / AsyncDatabase / AsyncConnection)
 
 // EXPERIMENTAL MODULES
 // ---------------------------------------------------------------------------
@@ -64,6 +75,11 @@ pub mod pmem;            // Persistent memory (PMEM/DAX) support (experimental)
 // Re-export commonly used types
 pub use storage::Database;
 pub use types::{QueryResult, Value, Row, Column};
+pub use vector::DistanceMetric;
+pub use cdc::{CdcManager, ChangeEvent, ChangeOp};
+
+#[cfg(feature = "async-io")]
+pub use async_api::{AsyncConnection, AsyncDatabase, Builder};
 
 // Re-export modern features
 pub use mvcc::{MvccManager, Snapshot, VersionedRecord};

@@ -1,8 +1,10 @@
 # VelociDB
 
-An embedded SQL database written in Rust. Single-writer, page-based storage
-with a B-tree primary index, write-ahead log for crash safety, and an
-interactive REPL.
+An embedded SQL database written in Rust, inspired by
+[Turso](https://github.com/tursodatabase/turso). Page-based storage with a
+B-tree primary index, write-ahead log for crash safety, native **async API**,
+**parallel query execution**, **vector search**, **change data capture**, and
+an interactive REPL.
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -43,9 +45,10 @@ CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
 
 REPL niceties: arrow-key history, persistent history file
 (`~/.velocidb_history`, or `$VELOCIDB_HISTORY`), multi-line statements
-terminated by `;`, and `.help`, `.tables`, `.schema [name]`, `.exit`.
+terminated by `;`, and `.help`, `.tables`, `.schema [name]`, `.cdc on|off`,
+`.changes [seq]`, `.exit`.
 
-### As a Library
+### As a Library (sync)
 
 ```rust
 use velocidb::Database;
@@ -61,6 +64,78 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+### As a Library (async, Turso-style)
+
+```rust
+use velocidb::Builder;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let db = Builder::new_local("my_database.db").build().await?;
+    let conn = db.connect()?;
+
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)").await?;
+    conn.execute("INSERT INTO users VALUES (1, 'Alice')").await?;
+
+    let results = conn.query("SELECT * FROM users ORDER BY id").await?;
+    println!("Found {} users", results.rows.len());
+    Ok(())
+}
+```
+
+Every call is offloaded to the tokio blocking pool, so async tasks never
+stall the reactor; concurrent read futures execute in parallel.
+
+### Vector search
+
+Exact (brute-force) K-nearest-neighbour search with Turso/libSQL-style
+syntax. Distance computation, filtering, and sorting are parallelized with
+rayon on larger tables.
+
+```sql
+CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, embedding F32_BLOB(3));
+INSERT INTO docs VALUES (1, 'alpha', vector32('[1.0, 0.0, 0.0]'));
+INSERT INTO docs VALUES (2, 'beta',  vector32('[0.0, 1.0, 0.0]'));
+
+-- KNN: nearest 5 documents by cosine distance
+SELECT id, title, vector_distance_cos(embedding, vector32('[1, 0, 0]'))
+FROM docs
+ORDER BY vector_distance_cos(embedding, vector32('[1, 0, 0]'))
+LIMIT 5;
+```
+
+Supported metrics: `vector_distance_cos`, `vector_distance_l2`,
+`vector_distance_dot`. The same search is available programmatically:
+
+```rust
+use velocidb::{Database, DistanceMetric};
+
+let db = Database::open("my_database.db")?;
+let neighbors = db.vector_search("docs", "embedding", &[1.0, 0.0, 0.0], 5, DistanceMetric::Cosine)?;
+for (distance, row) in neighbors {
+    println!("{distance:.4}: {:?}", row.values);
+}
+```
+
+### Change Data Capture
+
+```rust
+let db = Database::open("my_database.db")?;
+db.enable_cdc();
+
+db.execute("INSERT INTO users VALUES (2, 'Bob')")?;
+db.execute("DELETE FROM users WHERE id = 1")?;
+
+for change in db.changes_since(0) {
+    println!("#{} {} {} rowid={}", change.seq, change.op, change.table, change.rowid);
+}
+```
+
+Every committed INSERT / UPDATE / DELETE is captured with a monotonically
+increasing sequence number and before/after row images — useful for
+replication, cache invalidation, or audit trails. In the REPL: `.cdc on`,
+`.changes [seq]`.
 
 ## What works today
 
@@ -81,15 +156,38 @@ Indexing
 
 SQL surface
 
-- `CREATE TABLE` (INTEGER / REAL / TEXT / BLOB columns; `PRIMARY KEY`,
-  `NOT NULL`, `UNIQUE` constraints)
+- `CREATE TABLE` (INTEGER / REAL / TEXT / BLOB / `F32_BLOB(n)` / `VECTOR(n)`
+  columns; `PRIMARY KEY`, `NOT NULL`, `UNIQUE` constraints)
 - `DROP TABLE`
-- `INSERT INTO ... VALUES (...)` with optional explicit column list
-- `SELECT [* | cols | COUNT(*)] FROM t [WHERE ...] [ORDER BY col [ASC|DESC]] [LIMIT n]`
+- `ALTER TABLE t RENAME TO new | RENAME COLUMN a TO b | ADD COLUMN c type
+  | DROP COLUMN c`
+- `INSERT INTO ... VALUES (...)` with optional explicit column list;
+  vector literals via `vector32('[...]')`, `vector('[...]')` or bare `[...]`
+- `SELECT [* | cols | COUNT(*) | vector_distance_*(col, vec)] FROM t
+  [WHERE ...] [ORDER BY col | vector_distance_*(col, vec) [ASC|DESC]] [LIMIT n]`
 - `UPDATE t SET col = val [, ...] [WHERE ...]`
 - `DELETE FROM t [WHERE ...]`
 - `WHERE` supports `=`, `!=`, `<>`, `>`, `<`, `>=`, `<=`, `LIKE`, with `AND`
 - `BEGIN` / `COMMIT` / `ROLLBACK` (see limitations below)
+
+Vector search (Turso-inspired)
+
+- `F32_BLOB(n)` / `VECTOR(n)` column type with dimension enforcement.
+- Distance metrics: cosine, euclidean (L2), dot product.
+- Exact KNN via `ORDER BY vector_distance_*(...) LIMIT k` (top-k selection,
+  not a full sort) or `Database::vector_search` / `AsyncConnection::vector_search`.
+
+Async and parallel (Turso-inspired)
+
+- Native async API: `Builder` → `AsyncDatabase` → `AsyncConnection`
+  (`async-io` feature, enabled by default).
+- WHERE filtering, ORDER BY sorting and vector distance computation run on
+  the rayon thread pool once a query touches ≥ 1024 rows.
+
+Change Data Capture (Turso-inspired)
+
+- Opt-in change log of committed INSERT / UPDATE / DELETE with sequence
+  numbers and before/after row images; poll with `changes_since(seq)`.
 
 Concurrency
 
@@ -109,9 +207,15 @@ Concurrency
   statement is its own WAL group; a future change can fold an explicit
   transaction into a single WAL group.)
 - **No `JOIN`, `GROUP BY`, sub-queries**, no indexes other than the primary
-  key, no `ALTER TABLE`.
+  key.
 - **Single primary key column.** Composite primary keys are not supported.
-- **No async or networked access.** The library is embedded only.
+- **Vector search is exact.** Every query scans all candidate rows
+  (in parallel). Approximate indexing (HNSW/DiskANN-style) is future work,
+  mirroring Turso's own roadmap.
+- **Embedded only.** The async API runs in-process; there is no network
+  server.
+- **CDC is in-memory.** The change log is bounded (default 65,536 events)
+  and not persisted across restarts.
 
 ## Experimental modules (not on the active path)
 

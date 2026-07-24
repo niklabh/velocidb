@@ -4,10 +4,12 @@
 //! providing the foundation for B-Tree indexes and MVCC record storage.
 
 use crate::btree::BTree;
+use crate::cdc::{CdcManager, ChangeEvent};
 use crate::executor::Executor;
 use crate::parser::{Parser, Statement};
 use crate::transaction::TransactionManager;
-use crate::types::{DataType, PageId, QueryResult, Result, VelociError};
+use crate::types::{DataType, PageId, QueryResult, Result, Row, VelociError};
+use crate::vector::{self, DistanceMetric};
 use crate::wal::WalManager;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
@@ -331,6 +333,9 @@ pub struct Database {
     transaction_manager: Arc<TransactionManager>,
     schema: Arc<RwLock<Schema>>,
     executor: RwLock<Option<Arc<Executor>>>,
+    /// Change Data Capture log (Turso-inspired). Disabled by default; see
+    /// [`Database::enable_cdc`].
+    cdc: Arc<CdcManager>,
     /// Serializes write groups across statements so only one writer creates an
     /// active WAL group at a time. Read paths (`query`) do not acquire this
     /// mutex.
@@ -369,6 +374,7 @@ impl Database {
             transaction_manager,
             schema,
             executor: RwLock::new(None),
+            cdc: Arc::new(CdcManager::new()),
             writer: Mutex::new(()),
         });
 
@@ -517,18 +523,39 @@ impl Database {
                 offset += col_name_len;
 
                 let data_type_byte = data[offset];
+                offset += 1;
                 let data_type = match data_type_byte {
                     0 => DataType::Integer,
                     1 => DataType::Real,
                     2 => DataType::Text,
                     3 => DataType::Blob,
+                    5 => {
+                        // Vector columns carry a 4-byte dimension.
+                        if offset + 4 > data.len() {
+                            return Err(VelociError::Corruption(format!(
+                                "Schema truncated at vector dimension for column '{}'",
+                                col_name
+                            )));
+                        }
+                        let dim = u32::from_le_bytes(
+                            data[offset..offset + 4].try_into().map_err(|_| {
+                                VelociError::Corruption("Failed to read vector dimension".to_string())
+                            })?,
+                        );
+                        offset += 4;
+                        DataType::Vector(dim)
+                    }
                     _ => return Err(VelociError::Corruption(format!(
                         "Unknown data type byte {} for column '{}' in table '{}'",
                         data_type_byte, col_name, table_name
                     ))),
                 };
-                offset += 1;
 
+                if offset + 9 > data.len() {
+                    return Err(VelociError::Corruption(format!(
+                        "Schema truncated at column flags for table '{}'", table_name
+                    )));
+                }
                 let flags = data[offset];
                 let primary_key = (flags & 1) != 0;
                 let not_null = (flags & 2) != 0;
@@ -619,15 +646,18 @@ impl Database {
                     buffer.extend_from_slice(&(col_name_bytes.len() as u32).to_le_bytes());
                     buffer.extend_from_slice(col_name_bytes);
 
-                    // Data type
-                    let data_type_byte = match column.data_type {
-                        DataType::Integer => 0u8,
-                        DataType::Real => 1u8,
-                        DataType::Text => 2u8,
-                        DataType::Blob => 3u8,
-                        DataType::Null => 4u8,
-                    };
-                    buffer.push(data_type_byte);
+                    // Data type (vector columns append their dimension)
+                    match column.data_type {
+                        DataType::Integer => buffer.push(0u8),
+                        DataType::Real => buffer.push(1u8),
+                        DataType::Text => buffer.push(2u8),
+                        DataType::Blob => buffer.push(3u8),
+                        DataType::Null => buffer.push(4u8),
+                        DataType::Vector(dim) => {
+                            buffer.push(5u8);
+                            buffer.extend_from_slice(&dim.to_le_bytes());
+                        }
+                    }
 
                     // Flags
                     let mut flags = 0u8;
@@ -710,6 +740,7 @@ impl Database {
             Arc::clone(&self.btrees),
             Arc::clone(&self.schema),
             Arc::clone(&self.transaction_manager),
+            Arc::clone(&self.cdc),
         ));
         *self.executor.write() = Some(Arc::clone(&exec));
         exec
@@ -745,7 +776,9 @@ impl Database {
 
         let needs_schema_save = matches!(
             statement,
-            Statement::CreateTable { .. } | Statement::DropTable { .. }
+            Statement::CreateTable { .. }
+                | Statement::DropTable { .. }
+                | Statement::AlterTable { .. }
         );
 
         // Capture root pages before the statement so we can detect any
@@ -837,6 +870,102 @@ impl Database {
         Ok(())
     }
 
+    /// Enables Change Data Capture. Subsequent committed INSERT / UPDATE /
+    /// DELETE statements are recorded and can be polled with
+    /// [`Database::changes_since`].
+    pub fn enable_cdc(&self) {
+        self.cdc.enable();
+    }
+
+    /// Disables Change Data Capture and clears the change log.
+    pub fn disable_cdc(&self) {
+        self.cdc.disable();
+    }
+
+    /// Returns whether CDC is currently enabled.
+    pub fn cdc_enabled(&self) -> bool {
+        self.cdc.is_enabled()
+    }
+
+    /// Returns all captured changes with sequence number greater than `since`.
+    /// Pass 0 to receive everything currently retained.
+    pub fn changes_since(&self, since: u64) -> Vec<ChangeEvent> {
+        self.cdc.changes_since(since)
+    }
+
+    /// The sequence number of the most recent captured change (0 if none).
+    pub fn cdc_latest_seq(&self) -> u64 {
+        self.cdc.latest_seq()
+    }
+
+    /// Exact K-nearest-neighbour search over a vector column.
+    ///
+    /// Returns up to `k` `(distance, row)` pairs ordered by ascending
+    /// distance. Distance computation is parallelized for large tables.
+    ///
+    /// Equivalent SQL:
+    /// `SELECT * FROM <table> ORDER BY vector_distance_cos(<column>, vector32('[...]')) LIMIT k`
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use velocidb::{Database, vector::DistanceMetric};
+    /// # let db = Database::open("test.db").unwrap();
+    /// let neighbors = db
+    ///     .vector_search("docs", "embedding", &[0.1, 0.2, 0.3], 5, DistanceMetric::Cosine)
+    ///     .unwrap();
+    /// for (distance, row) in neighbors {
+    ///     println!("{:.4}: {:?}", distance, row.values);
+    /// }
+    /// ```
+    pub fn vector_search(
+        &self,
+        table: &str,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        metric: DistanceMetric,
+    ) -> Result<Vec<(f64, Row)>> {
+        let table_schema = {
+            let schema = self.schema.read();
+            schema.get_table(table)?.clone()
+        };
+
+        let col_index = table_schema
+            .columns
+            .iter()
+            .position(|c| c.name == column)
+            .ok_or_else(|| {
+                VelociError::NotFound(format!(
+                    "Column '{}' not found in table '{}'",
+                    column, table
+                ))
+            })?;
+
+        if let DataType::Vector(dim) = table_schema.columns[col_index].data_type {
+            if dim as usize != query.len() {
+                return Err(VelociError::TypeMismatch {
+                    expected: format!("query vector of dimension {}", dim),
+                    actual: format!("dimension {}", query.len()),
+                });
+            }
+        }
+
+        let all_rows = {
+            let btrees = self.btrees.read();
+            let btree_arc = btrees.get(table).ok_or_else(|| {
+                VelociError::NotFound(format!("Table '{}' not initialized", table))
+            })?;
+            let btree = btree_arc.read();
+            btree.scan()?
+        };
+
+        Ok(vector::knn(all_rows, col_index, query, metric, k)
+            .into_iter()
+            .map(|(d, _, row)| (d, row))
+            .collect())
+    }
+
     /// Lists all tables in the database.
     pub fn list_tables(&self) -> Vec<String> {
         self.schema.read().list_tables()
@@ -853,11 +982,12 @@ impl Database {
                 out.push_str(", ");
             }
             let type_str = match col.data_type {
-                DataType::Integer => "INTEGER",
-                DataType::Real => "REAL",
-                DataType::Text => "TEXT",
-                DataType::Blob => "BLOB",
-                DataType::Null => "NULL",
+                DataType::Integer => "INTEGER".to_string(),
+                DataType::Real => "REAL".to_string(),
+                DataType::Text => "TEXT".to_string(),
+                DataType::Blob => "BLOB".to_string(),
+                DataType::Null => "NULL".to_string(),
+                DataType::Vector(dim) => format!("F32_BLOB({})", dim),
             };
             out.push_str(&format!("{} {}", col.name, type_str));
             if col.primary_key {
@@ -915,6 +1045,12 @@ impl Schema {
     pub fn get_table(&self, name: &str) -> Result<&TableSchema> {
         self.tables
             .get(name)
+            .ok_or_else(|| VelociError::NotFound(format!("Table '{}' not found", name)))
+    }
+
+    pub fn get_table_mut(&mut self, name: &str) -> Result<&mut TableSchema> {
+        self.tables
+            .get_mut(name)
             .ok_or_else(|| VelociError::NotFound(format!("Table '{}' not found", name)))
     }
 

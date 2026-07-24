@@ -1372,6 +1372,13 @@ impl BTree {
                     buffer.extend_from_slice(&(b.len() as u32).to_le_bytes());
                     buffer.extend_from_slice(b);
                 }
+                Value::Vector(v) => {
+                    buffer.push(5);
+                    buffer.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    for x in v {
+                        buffer.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
             }
         }
         
@@ -1436,6 +1443,28 @@ impl BTree {
                     let b = data[offset..offset + len].to_vec();
                     offset += len;
                     values.push(Value::Blob(b));
+                }
+                5 => {
+                    let dim = u32::from_le_bytes(
+                        data[offset..offset + 4]
+                            .try_into()
+                            .map_err(|_| VelociError::Corruption("Invalid vector dimension".to_string()))?,
+                    ) as usize;
+                    offset += 4;
+                    if offset + dim * 4 > data.len() {
+                        return Err(VelociError::Corruption("Vector data truncated".to_string()));
+                    }
+                    let mut v = Vec::with_capacity(dim);
+                    for i in 0..dim {
+                        let start = offset + i * 4;
+                        v.push(f32::from_le_bytes(
+                            data[start..start + 4]
+                                .try_into()
+                                .map_err(|_| VelociError::Corruption("Invalid vector component".to_string()))?,
+                        ));
+                    }
+                    offset += dim * 4;
+                    values.push(Value::Vector(v));
                 }
                 _ => return Err(VelociError::Corruption(format!("Invalid type tag: {}", type_tag))),
             }

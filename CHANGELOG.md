@@ -4,6 +4,45 @@ All notable changes to VelociDB are documented in this file.
 
 ## [Unreleased]
 
+### Added (Turso-inspired features)
+
+- **Vector search** (`src/vector.rs`). Vector columns via `F32_BLOB(n)` /
+  `VECTOR(n)`, `vector32('[...]')` literals in INSERT, and distance
+  functions `vector_distance_cos`, `vector_distance_l2`,
+  `vector_distance_dot` usable both in SELECT projections and in
+  `ORDER BY ... LIMIT k` (exact KNN, top-k selection instead of a full
+  sort). Dimension is enforced on INSERT and persisted in the schema.
+  Also exposed as `Database::vector_search(table, column, query, k, metric)`.
+- **Async API** (`src/async_api.rs`, `async-io` feature, on by default).
+  Turso-style `Builder::new_local(path).build().await`,
+  `AsyncDatabase::connect()`, and `AsyncConnection` with async `execute`,
+  `query`, `vector_search`, `begin`/`commit`/`rollback`, and
+  `changes_since`. Calls run on the tokio blocking pool so async tasks
+  never stall the reactor; concurrent read futures execute in parallel.
+- **Parallel query execution.** WHERE filtering, ORDER BY sorting and
+  vector distance computation switch to rayon once a query touches
+  ≥ 1024 rows.
+- **Change Data Capture** (`src/cdc.rs`). `Database::enable_cdc()` starts
+  recording every committed INSERT / UPDATE / DELETE as a `ChangeEvent`
+  (sequence number, table, op, rowid, before/after row images).
+  Poll with `Database::changes_since(seq)`. REPL: `.cdc on|off`, `.changes`.
+- **ALTER TABLE**: `RENAME TO`, `RENAME COLUMN a TO b`, `ADD COLUMN`
+  (existing rows padded with NULL), `DROP COLUMN` (rows rewritten;
+  dropping the primary key is rejected). Schema changes persist across
+  reopen.
+- Integration test suite `tests/turso_features_tests.rs` (13 tests)
+  covering all of the above.
+- **Agent skills** (`.claude/skills/`, modeled on Turso's): storage-format,
+  transaction-correctness, async-io-model, vector-search, cdc, sql-parser,
+  testing, code-quality, and debugging — codebase knowledge for AI coding
+  agents (Claude Code, Cursor).
+
+### Changed
+
+- `src/main.rs` now builds against the `velocidb` library crate instead of
+  re-declaring the module tree.
+- `Executor::new` takes a `CdcManager`; `Statement` gained `AlterTable`.
+
 ### Added
 
 - **Write-ahead log** (`src/wal.rs`) with CRC32 records, group-commit
@@ -65,8 +104,9 @@ All notable changes to VelociDB are documented in this file.
 - Explicit-transaction `ROLLBACK` only releases locks; storage mutations
   made by previous statements in the transaction are not undone (each
   statement is its own WAL group).
-- No `JOIN`, `GROUP BY`, sub-queries, `ALTER TABLE`, or composite primary
-  keys.
+- No `JOIN`, `GROUP BY`, sub-queries, or composite primary keys.
+- Vector search is exact (brute-force, parallel); approximate indexing
+  (HNSW/DiskANN-style) is future work, mirroring Turso's roadmap.
 
 ## [0.1.0] — 2025-05-19
 

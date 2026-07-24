@@ -78,6 +78,8 @@ pub enum Value {
     Text(String),
     /// Binary data.
     Blob(Vec<u8>),
+    /// A dense f32 vector (embedding) for similarity search.
+    Vector(Vec<f32>),
 }
 
 impl Value {
@@ -118,6 +120,17 @@ impl Value {
         }
     }
     
+    /// Converts the value to a vector of f32 if possible.
+    pub fn as_vector(&self) -> Result<&[f32]> {
+        match self {
+            Value::Vector(v) => Ok(v),
+            _ => Err(VelociError::TypeMismatch {
+                expected: "Vector".to_string(),
+                actual: format!("{:?}", self),
+            }),
+        }
+    }
+
     /// Returns the size of the value in bytes when serialized.
     pub fn size_bytes(&self) -> usize {
         match self {
@@ -127,6 +140,7 @@ impl Value {
             Value::Real(_) => 9,    // 1 byte type + 8 bytes data
             Value::Text(s) => 1 + 4 + s.len(), // 1 byte type + 4 bytes length + data
             Value::Blob(b) => 1 + 4 + b.len(), // 1 byte type + 4 bytes length + data
+            Value::Vector(v) => 1 + 4 + v.len() * 4, // 1 byte type + 4 bytes dim + f32 data
         }
     }
 }
@@ -140,6 +154,16 @@ impl fmt::Display for Value {
             Value::Real(fl) => write!(f, "{}", fl),
             Value::Text(s) => write!(f, "{}", s),
             Value::Blob(b) => write!(f, "<blob {} bytes>", b.len()),
+            Value::Vector(v) => {
+                write!(f, "[")?;
+                for (i, x) in v.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "{}", x)?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }
@@ -152,12 +176,31 @@ pub enum DataType {
     Text,
     Blob,
     Null,
+    /// Fixed-dimension f32 vector column (Turso-style `F32_BLOB(n)` / `VECTOR(n)`).
+    Vector(u32),
 }
 
 impl DataType {
     /// Parses a data type from a string (case-insensitive).
+    ///
+    /// Vector columns use the Turso/libSQL syntax `F32_BLOB(n)` or the alias
+    /// `VECTOR(n)` where `n` is the dimension.
     pub fn from_str(s: &str) -> Self {
-        match s.to_uppercase().as_str() {
+        let upper = s.trim().to_uppercase();
+
+        // F32_BLOB(n) / VECTOR(n)
+        if let Some(rest) = upper
+            .strip_prefix("F32_BLOB(")
+            .or_else(|| upper.strip_prefix("VECTOR("))
+        {
+            if let Some(dim_str) = rest.strip_suffix(')') {
+                if let Ok(dim) = dim_str.trim().parse::<u32>() {
+                    return DataType::Vector(dim);
+                }
+            }
+        }
+
+        match upper.as_str() {
             "INTEGER" | "INT" => DataType::Integer,
             "REAL" | "FLOAT" | "DOUBLE" => DataType::Real,
             "TEXT" | "VARCHAR" | "STRING" => DataType::Text,

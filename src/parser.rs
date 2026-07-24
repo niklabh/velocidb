@@ -1,5 +1,6 @@
-//! SQL parser supporting DDL (CREATE TABLE, DROP TABLE), DML (INSERT, UPDATE,
-//! DELETE), and DQL (SELECT with WHERE, COUNT(\*) aggregation).
+//! SQL parser supporting DDL (CREATE TABLE, DROP TABLE, ALTER TABLE), DML
+//! (INSERT, UPDATE, DELETE), and DQL (SELECT with WHERE, COUNT(\*)
+//! aggregation, and vector distance expressions).
 //!
 //! Parses SQL text into an AST of [`Statement`] variants consumed by the executor.
 
@@ -15,6 +16,10 @@ pub enum Statement {
     },
     DropTable {
         name: String,
+    },
+    AlterTable {
+        table: String,
+        action: AlterAction,
     },
     Insert {
         table: String,
@@ -42,12 +47,25 @@ pub enum Statement {
     RollbackTransaction,
 }
 
+/// Actions supported by `ALTER TABLE` (Turso-inspired improved schema management).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterAction {
+    RenameTable { new_name: String },
+    RenameColumn { old_name: String, new_name: String },
+    AddColumn { column: Column },
+    DropColumn { name: String },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WhereClause {
     pub conditions: Vec<Condition>,
 }
 
-/// ORDER BY clause: which column to sort by and whether ascending.
+/// ORDER BY clause: what to sort by and whether ascending.
+///
+/// `column` is either a plain column name or a vector distance expression
+/// such as `vector_distance_cos(embedding, vector32('[1,2,3]'))` — the
+/// executor detects the latter and performs a (parallel) KNN sort.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderBy {
     pub column: String,
@@ -160,6 +178,106 @@ impl Operator {
     }
 }
 
+/// Finds the byte offset of a top-level `ORDER BY` keyword (outside quoted
+/// strings), or `None` if absent.
+fn find_order_by(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut in_string = false;
+    let mut quote = b'\'';
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == quote {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\'' || b == b'"' {
+            in_string = true;
+            quote = b;
+            i += 1;
+            continue;
+        }
+        // Try to match "ORDER" followed by whitespace and "BY", both bounded
+        // by whitespace (or start of string on the left).
+        if (b == b'O' || b == b'o')
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && s[i..].len() >= 8
+        {
+            let rest = &s[i..];
+            let upper: String = rest.chars().take(9).collect::<String>().to_uppercase();
+            if upper.starts_with("ORDER ") || upper.starts_with("ORDER\t") || upper.starts_with("ORDER\n") {
+                // Confirm "BY" follows the whitespace run.
+                let after_order = rest[5..].trim_start();
+                let upper_after: String = after_order.chars().take(3).collect::<String>().to_uppercase();
+                if upper_after.starts_with("BY")
+                    && after_order[2..]
+                        .chars()
+                        .next()
+                        .map(|c| c.is_whitespace())
+                        .unwrap_or(false)
+                {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Splits `s` on commas that are outside quoted strings, parentheses and
+/// square brackets.
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut quote = '\'';
+    let mut depth: usize = 0;
+
+    for ch in s.chars() {
+        if in_string {
+            current.push(ch);
+            if ch == quote {
+                in_string = false;
+            }
+        } else {
+            match ch {
+                '\'' | '"' => {
+                    in_string = true;
+                    quote = ch;
+                    current.push(ch);
+                }
+                '(' | '[' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' | ']' => {
+                    depth = depth.saturating_sub(1);
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    let part = current.trim().to_string();
+                    if !part.is_empty() {
+                        parts.push(part);
+                    }
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+    }
+
+    let part = current.trim().to_string();
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    parts
+}
+
 pub struct Parser {
     // Parser state can be added here if needed
 }
@@ -177,6 +295,8 @@ impl Parser {
             self.parse_create_table(sql)
         } else if upper.starts_with("DROP TABLE") {
             self.parse_drop_table(sql)
+        } else if upper.starts_with("ALTER TABLE") {
+            self.parse_alter_table(sql)
         } else if upper.starts_with("INSERT INTO") {
             self.parse_insert(sql)
         } else if upper.starts_with("SELECT") {
@@ -290,11 +410,105 @@ impl Parser {
         Ok(Statement::DropTable { name: table_name })
     }
 
+    fn parse_alter_table(&self, sql: &str) -> Result<Statement> {
+        // ALTER TABLE t RENAME TO new_name
+        // ALTER TABLE t RENAME COLUMN old TO new
+        // ALTER TABLE t ADD [COLUMN] name TYPE [constraints]
+        // ALTER TABLE t DROP [COLUMN] name
+        let sql = sql.trim().trim_end_matches(';').trim();
+
+        let rename_table_re = Regex::new(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+RENAME\s+TO\s+(\w+)$")
+            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        if let Some(caps) = rename_table_re.captures(sql) {
+            return Ok(Statement::AlterTable {
+                table: caps.get(1).unwrap().as_str().to_string(),
+                action: AlterAction::RenameTable {
+                    new_name: caps.get(2).unwrap().as_str().to_string(),
+                },
+            });
+        }
+
+        let rename_col_re =
+            Regex::new(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+RENAME\s+(?:COLUMN\s+)?(\w+)\s+TO\s+(\w+)$")
+                .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        if let Some(caps) = rename_col_re.captures(sql) {
+            return Ok(Statement::AlterTable {
+                table: caps.get(1).unwrap().as_str().to_string(),
+                action: AlterAction::RenameColumn {
+                    old_name: caps.get(2).unwrap().as_str().to_string(),
+                    new_name: caps.get(3).unwrap().as_str().to_string(),
+                },
+            });
+        }
+
+        let add_col_re = Regex::new(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+ADD\s+(?:COLUMN\s+)?(.+)$")
+            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        if let Some(caps) = add_col_re.captures(sql) {
+            let table = caps.get(1).unwrap().as_str().to_string();
+            let col_def = caps.get(2).unwrap().as_str().trim();
+
+            let (col_name, remainder) = self.parse_identifier(col_def)?;
+            let parts = self.split_sql_parts(remainder.trim());
+            if parts.is_empty() {
+                return Err(VelociError::ParseError(format!(
+                    "Missing data type in ADD COLUMN: {}",
+                    col_def
+                )));
+            }
+            let data_type = DataType::from_str(&parts[0]);
+            let upper_parts: Vec<String> = parts.iter().map(|s| s.to_uppercase()).collect();
+            if upper_parts.contains(&"PRIMARY".to_string()) {
+                return Err(VelociError::ParseError(
+                    "Cannot add a PRIMARY KEY column with ALTER TABLE".to_string(),
+                ));
+            }
+            let not_null = upper_parts.contains(&"NOT".to_string())
+                && upper_parts.contains(&"NULL".to_string());
+            if not_null {
+                return Err(VelociError::ParseError(
+                    "Cannot add a NOT NULL column without a default value".to_string(),
+                ));
+            }
+            let unique = upper_parts.contains(&"UNIQUE".to_string());
+
+            return Ok(Statement::AlterTable {
+                table,
+                action: AlterAction::AddColumn {
+                    column: Column {
+                        name: col_name,
+                        data_type,
+                        primary_key: false,
+                        not_null: false,
+                        unique,
+                    },
+                },
+            });
+        }
+
+        let drop_col_re = Regex::new(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+DROP\s+(?:COLUMN\s+)?(\w+)$")
+            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        if let Some(caps) = drop_col_re.captures(sql) {
+            return Ok(Statement::AlterTable {
+                table: caps.get(1).unwrap().as_str().to_string(),
+                action: AlterAction::DropColumn {
+                    name: caps.get(2).unwrap().as_str().to_string(),
+                },
+            });
+        }
+
+        Err(VelociError::ParseError(format!(
+            "Invalid ALTER TABLE syntax: {}",
+            sql
+        )))
+    }
+
     fn parse_insert(&self, sql: &str) -> Result<Statement> {
         // INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)
         // INSERT INTO users VALUES (1, 'Alice', 30)
         
-        let re = Regex::new(r"(?i)INSERT\s+INTO\s+(\w+)(?:\s*\(([^)]+)\))?\s+VALUES\s*\(([^)]+)\)")
+        // The VALUES capture is greedy up to the final ')' so nested function
+        // calls like vector32('[1, 2]') survive intact.
+        let re = Regex::new(r"(?i)INSERT\s+INTO\s+(\w+)(?:\s*\(([^)]+)\))?\s+VALUES\s*\((.+)\)\s*;?\s*$")
             .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
 
         let captures = re
@@ -345,16 +559,36 @@ impl Parser {
             None
         };
 
-        let order_re = Regex::new(r"(?i)\s+ORDER\s+BY\s+(\w+)(?:\s+(ASC|DESC))?\s*;?\s*$")
-            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
-        let order_by = if let Some(caps) = order_re.captures(&remaining) {
-            let col = caps.get(1).unwrap().as_str().to_string();
-            let ascending = caps
-                .get(2)
-                .map(|m| !m.as_str().eq_ignore_ascii_case("DESC"))
-                .unwrap_or(true);
-            remaining = order_re.replace(&remaining, "").to_string();
-            Some(OrderBy { column: col, ascending })
+        // ORDER BY accepts either a column name or an arbitrary expression
+        // (e.g. a vector distance function containing commas and parens), so
+        // it is located with a quote-aware scan rather than a regex.
+        let order_by = if let Some(idx) = find_order_by(&remaining) {
+            let clause = remaining[idx..].trim();
+            // Strip the leading "ORDER BY" (already validated by find_order_by).
+            let expr_start = {
+                let re = Regex::new(r"(?i)^ORDER\s+BY\s+")
+                    .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+                re.find(clause)
+                    .map(|m| m.end())
+                    .ok_or_else(|| VelociError::ParseError("Invalid ORDER BY".to_string()))?
+            };
+            let mut expr = clause[expr_start..].trim().trim_end_matches(';').trim().to_string();
+
+            let mut ascending = true;
+            let upper_expr = expr.to_uppercase();
+            if upper_expr.ends_with(" DESC") {
+                ascending = false;
+                expr.truncate(expr.len() - 5);
+            } else if upper_expr.ends_with(" ASC") {
+                expr.truncate(expr.len() - 4);
+            }
+            let expr = expr.trim().to_string();
+            if expr.is_empty() {
+                return Err(VelociError::ParseError("Empty ORDER BY expression".to_string()));
+            }
+
+            remaining = remaining[..idx].trim_end().to_string();
+            Some(OrderBy { column: expr, ascending })
         } else {
             None
         };
@@ -375,10 +609,9 @@ impl Parser {
         } else if columns_str.to_uppercase().starts_with("COUNT(") {
             vec![columns_str.to_string()]
         } else {
-            columns_str
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect()
+            // Paren-aware split so distance expressions like
+            // vector_distance_cos(embedding, vector32('[1,2]')) stay whole.
+            split_top_level_commas(columns_str)
         };
 
         let table_name = captures.get(2).unwrap().as_str().to_string();
@@ -545,6 +778,7 @@ impl Parser {
         let mut in_string = false;
         let mut string_char = '\'';
         let mut escaped = false;
+        let mut depth: usize = 0; // parens / brackets nesting outside strings
 
         for ch in values_str.chars() {
             if escaped {
@@ -560,7 +794,13 @@ impl Parser {
             } else if in_string && ch == string_char {
                 in_string = false;
                 current.push(ch);
-            } else if !in_string && ch == ',' {
+            } else if !in_string && (ch == '(' || ch == '[') {
+                depth += 1;
+                current.push(ch);
+            } else if !in_string && (ch == ')' || ch == ']') {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            } else if !in_string && depth == 0 && ch == ',' {
                 values.push(self.parse_value(current.trim())?);
                 current = String::new();
             } else {
@@ -581,6 +821,15 @@ impl Parser {
         // NULL
         if s.to_uppercase() == "NULL" {
             return Ok(Value::Null);
+        }
+
+        // Vector constructor: vector32('[...]'), vector('[...]') or bare [...]
+        if let Some(parsed) = crate::vector::parse_vector_constructor(s) {
+            // Quoted '[...]' strings stay Text unless explicitly constructed,
+            // so only accept unquoted forms here.
+            if !s.starts_with('\'') && !s.starts_with('"') {
+                return Ok(Value::Vector(parsed?));
+            }
         }
 
         // String (quoted) - handle escaped quotes
