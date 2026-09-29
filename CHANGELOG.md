@@ -34,6 +34,15 @@ All notable changes to VelociDB are documented in this file.
 - An aborted write group now restores the pager's page count, so pages
   allocated by the aborted group are not left referenced past end-of-file.
 
+### Performance
+
+- **Primary-key lookups.** `WHERE <pk> = <integer>` (alone or with other
+  ANDed conditions) uses `BTree::search` instead of a full scan for SELECT,
+  UPDATE and DELETE: ~850 → ~193,000 queries/s on a 2,000-row table.
+- **Parser regexes are compiled once** instead of on every statement.
+  Batched inserts went from ~4,600 to ~49,800 rows/s and non-key filtered
+  SELECTs roughly doubled. Numbers and method are in `docs/performance.md`.
+
 ### Changed
 
 - **Experimental modules are behind the `experimental` feature** (off by

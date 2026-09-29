@@ -43,11 +43,11 @@ Unblock almost every later SQL and concurrency feature.
 - [ ] **Parser fuzzing** (and/or property tests) for statement splitting and
       value parsing
 - [ ] **Concurrent-writer / deadlock stress tests** beyond the 30s lock timeout
-- [ ] **Primary-key point lookups** — use `BTree::search` for `WHERE pk = …`
+- [x] **Primary-key point lookups** — use `BTree::search` for `WHERE pk = …`
       instead of a full scan
 - [ ] **Fewer fsyncs per commit** — checkpoint the WAL periodically instead
       of truncating (and fsyncing) after every commit; measured auto-commit
-      INSERT is ~74 rows/s on macOS vs ~4,600 rows/s batched in one
+      INSERT is ~79 rows/s on macOS vs ~49,800 rows/s batched in one
       transaction (see `docs/performance.md`)
 
 ---
@@ -141,7 +141,7 @@ CHANGELOG.
 
 1. ~~CI + enforce `UNIQUE`~~ (done)
 2. ~~Multi-statement WAL groups + real `ROLLBACK`~~ (done)
-3. Primary-key point lookups + fewer fsyncs per commit (small changes, large wins)
+3. ~~Primary-key point lookups~~ (done) + fewer fsyncs per commit
 4. Lexer / parser + golden tests
 5. Secondary indexes + equality probe
 6. `OR` → `INNER JOIN` → `GROUP BY` aggregates

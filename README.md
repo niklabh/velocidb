@@ -218,8 +218,8 @@ Concurrency
 - **Auto-commit writes are fsync-bound.** Each commit does three fsyncs, so
   single-statement writes are slow (tens per second on macOS). Batch writes
   in `BEGIN` … `COMMIT` — see [docs/performance.md](docs/performance.md).
-- **Every `SELECT` scans the table**, including `WHERE id = …`; the
-  primary-key B-tree is not used for lookups yet.
+- **Only primary-key equality uses the index.** `WHERE pk = <integer>` is a
+  B-tree lookup; every other `WHERE` scans the table (no secondary indexes).
 - **No `JOIN`, `GROUP BY`, sub-queries**, no indexes other than the primary
   key.
 - **Single primary key column.** Composite primary keys are not supported.

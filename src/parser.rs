@@ -8,6 +8,16 @@ use crate::types::{Column, DataType, Result, Value, VelociError};
 use regex::Regex;
 use std::collections::HashMap;
 
+/// A `&'static Regex` compiled once on first use. Parsing runs on every
+/// `execute` / `query`, so recompiling patterns per call dominated the cost
+/// of small statements.
+macro_rules! regex {
+    ($pattern:literal) => {{
+        static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        RE.get_or_init(|| Regex::new($pattern).expect("static regex is valid"))
+    }};
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateTable {
@@ -328,8 +338,7 @@ impl Parser {
 
     fn parse_create_table(&self, sql: &str) -> Result<Statement> {
         // CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)
-        let re = Regex::new(r"(?i)CREATE\s+TABLE\s+(\w+)\s*\((.+)\)")
-            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        let re = regex!(r"(?i)CREATE\s+TABLE\s+(\w+)\s*\((.+)\)");
 
         let captures = re
             .captures(sql)
@@ -405,8 +414,7 @@ impl Parser {
 
     fn parse_drop_table(&self, sql: &str) -> Result<Statement> {
         // DROP TABLE users
-        let re = Regex::new(r"(?i)DROP\s+TABLE\s+(\w+)")
-            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        let re = regex!(r"(?i)DROP\s+TABLE\s+(\w+)");
 
         let captures = re
             .captures(sql)
@@ -424,8 +432,7 @@ impl Parser {
         // ALTER TABLE t DROP [COLUMN] name
         let sql = sql.trim().trim_end_matches(';').trim();
 
-        let rename_table_re = Regex::new(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+RENAME\s+TO\s+(\w+)$")
-            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        let rename_table_re = regex!(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+RENAME\s+TO\s+(\w+)$");
         if let Some(caps) = rename_table_re.captures(sql) {
             return Ok(Statement::AlterTable {
                 table: caps.get(1).unwrap().as_str().to_string(),
@@ -436,8 +443,7 @@ impl Parser {
         }
 
         let rename_col_re =
-            Regex::new(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+RENAME\s+(?:COLUMN\s+)?(\w+)\s+TO\s+(\w+)$")
-                .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+            regex!(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+RENAME\s+(?:COLUMN\s+)?(\w+)\s+TO\s+(\w+)$");
         if let Some(caps) = rename_col_re.captures(sql) {
             return Ok(Statement::AlterTable {
                 table: caps.get(1).unwrap().as_str().to_string(),
@@ -448,8 +454,7 @@ impl Parser {
             });
         }
 
-        let add_col_re = Regex::new(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+ADD\s+(?:COLUMN\s+)?(.+)$")
-            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        let add_col_re = regex!(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+ADD\s+(?:COLUMN\s+)?(.+)$");
         if let Some(caps) = add_col_re.captures(sql) {
             let table = caps.get(1).unwrap().as_str().to_string();
             let col_def = caps.get(2).unwrap().as_str().trim();
@@ -492,8 +497,7 @@ impl Parser {
             });
         }
 
-        let drop_col_re = Regex::new(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+DROP\s+(?:COLUMN\s+)?(\w+)$")
-            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        let drop_col_re = regex!(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+DROP\s+(?:COLUMN\s+)?(\w+)$");
         if let Some(caps) = drop_col_re.captures(sql) {
             return Ok(Statement::AlterTable {
                 table: caps.get(1).unwrap().as_str().to_string(),
@@ -515,8 +519,7 @@ impl Parser {
         
         // The VALUES capture is greedy up to the final ')' so nested function
         // calls like vector32('[1, 2]') survive intact.
-        let re = Regex::new(r"(?i)INSERT\s+INTO\s+(\w+)(?:\s*\(([^)]+)\))?\s+VALUES\s*\((.+)\)\s*;?\s*$")
-            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        let re = regex!(r"(?i)INSERT\s+INTO\s+(\w+)(?:\s*\(([^)]+)\))?\s+VALUES\s*\((.+)\)\s*;?\s*$");
 
         let captures = re
             .captures(sql)
@@ -551,8 +554,7 @@ impl Parser {
         // is a regular SELECT [...] FROM <table> [WHERE ...].
         let mut remaining = sql.trim().to_string();
 
-        let limit_re = Regex::new(r"(?i)\s+LIMIT\s+(\d+)\s*;?\s*$")
-            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        let limit_re = regex!(r"(?i)\s+LIMIT\s+(\d+)\s*;?\s*$");
         let limit = if let Some(caps) = limit_re.captures(&remaining) {
             let n = caps
                 .get(1)
@@ -573,8 +575,7 @@ impl Parser {
             let clause = remaining[idx..].trim();
             // Strip the leading "ORDER BY" (already validated by find_order_by).
             let expr_start = {
-                let re = Regex::new(r"(?i)^ORDER\s+BY\s+")
-                    .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+                let re = regex!(r"(?i)^ORDER\s+BY\s+");
                 re.find(clause)
                     .map(|m| m.end())
                     .ok_or_else(|| VelociError::ParseError("Invalid ORDER BY".to_string()))?
@@ -603,8 +604,7 @@ impl Parser {
         // Drop trailing semicolons left over from earlier stripping.
         let remaining = remaining.trim_end_matches(';').trim().to_string();
 
-        let re = Regex::new(r"(?i)^SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?$")
-            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        let re = regex!(r"(?i)^SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?$");
 
         let captures = re
             .captures(&remaining)
@@ -641,8 +641,7 @@ impl Parser {
     fn parse_update(&self, sql: &str) -> Result<Statement> {
         // UPDATE users SET age = 31 WHERE name = 'Alice'
         
-        let re = Regex::new(r"(?i)UPDATE\s+(\w+)\s+SET\s+(.+?)(?:\s+WHERE\s+(.+))?$")
-            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        let re = regex!(r"(?i)UPDATE\s+(\w+)\s+SET\s+(.+?)(?:\s+WHERE\s+(.+))?$");
 
         let captures = re
             .captures(sql)
@@ -682,8 +681,7 @@ impl Parser {
     fn parse_delete(&self, sql: &str) -> Result<Statement> {
         // DELETE FROM users WHERE id = 2
         
-        let re = Regex::new(r"(?i)DELETE\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?")
-            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        let re = regex!(r"(?i)DELETE\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?");
 
         let captures = re
             .captures(sql)
@@ -708,8 +706,7 @@ impl Parser {
         let parts = self.split_on_and(clause);
         let mut conditions = Vec::new();
 
-        let re = Regex::new(r"(\w+)\s*(>=|<=|!=|<>|LIKE|=|>|<)\s*(.+)")
-            .map_err(|e| VelociError::ParseError(format!("Regex error: {}", e)))?;
+        let re = regex!(r"(\w+)\s*(>=|<=|!=|<>|LIKE|=|>|<)\s*(.+)");
 
         for part in &parts {
             let part = part.trim();

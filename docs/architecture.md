@@ -122,8 +122,11 @@ internal nodes; deletes merge or redistribute on underflow and collapse the
 root when it empties. A proptest checks the invariants over random
 insert/delete sequences.
 
-There are no secondary indexes: `WHERE` is evaluated by scanning the table,
-and `UNIQUE` on a non-key column is checked by a scan.
+A `WHERE` containing `<pk> = <integer>` is answered by `BTree::search`
+(`candidate_rows` in `src/executor.rs`) for SELECT, UPDATE and DELETE; the
+full clause is still evaluated on the result. There are no secondary
+indexes: any other `WHERE` scans the table, and `UNIQUE` on a non-key column
+is checked by a scan.
 
 ## SQL
 

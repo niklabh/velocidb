@@ -11,9 +11,14 @@ Measured on an Apple M4 Max (APFS, internal SSD) with a release build and
 
 | Workload | Result |
 |----------|--------|
-| INSERT, auto-commit (one statement per write group) | ~74 rows/s |
-| INSERT, all 2,000 inside one `BEGIN` … `COMMIT` | ~4,600 rows/s |
-| `SELECT * FROM t WHERE id = ?` (full scan of 2,000 rows) | ~850 queries/s |
+| INSERT, auto-commit (one statement per write group) | ~79 rows/s |
+| INSERT, all 2,000 inside one `BEGIN` … `COMMIT` | ~49,800 rows/s |
+| `SELECT * FROM t WHERE id = ?` (primary-key lookup) | ~193,000 queries/s |
+| `SELECT * FROM t WHERE v = ?` (non-key column, scans 2,000 rows) | ~1,800 queries/s |
+
+Before the fixes in the Unreleased changelog (regexes compiled on every parse,
+no primary-key lookups), the same machine measured ~4,600 rows/s batched and
+~850 queries/s for a primary-key lookup.
 
 Treat these as a baseline, not a target. They are hardware- and
 filesystem-dependent. macOS `fsync` (`F_FULLFSYNC`) is much slower than
@@ -28,19 +33,23 @@ over newer data). Fsync latency dominates small writes.
 
 **Batch writes in an explicit transaction.** All statements then share one
 write group: one set of fsyncs, and each page is written to the WAL once
-however many times the transaction touched it. That is the ~60× gap above.
+however many times the transaction touched it. That is the ~600× gap above.
 
 Reducing per-commit fsyncs (checkpointing the WAL instead of truncating on
 every commit, as SQLite's WAL mode does) is on the roadmap.
 
-### Why point lookups are scans
+### Lookups and scans
 
-The executor does not yet use the primary-key B-tree for `WHERE id = …`: it
-scans the table and filters. There are no secondary indexes either. Index
-probes are roadmap item P1.
+A `WHERE` clause containing `<primary key> = <integer>` (alone or ANDed
+with other conditions) is answered with a B-tree lookup, for SELECT, UPDATE
+and DELETE. Any other `WHERE` scans the table and filters: there are no
+secondary indexes yet (roadmap P1).
 
 ## What the engine does today
 
+- **Cached SQL patterns.** The parser's regexes are compiled once per
+  process (`regex!` in `src/parser.rs`), not per statement.
+- **Primary-key lookups** for `WHERE pk = <integer>`.
 - **Buffered writes.** Pages modified in a write group stay in memory
   (`Pager::pending`) and hit the WAL once, at commit.
 - **Read cache.** A bounded `DashMap` of up to 1,024 pages (`CACHE_SIZE`).

@@ -361,3 +361,58 @@ fn test_large_dataset_with_splits() {
 }
 
 
+
+#[test]
+fn test_primary_key_point_lookups() {
+    // `WHERE <pk> = <int>` takes the B-tree lookup path; results must match
+    // the scan path exactly, including extra AND conditions.
+    let db = TestDb::new();
+    db.db
+        .execute("CREATE TABLE p (id INTEGER PRIMARY KEY, name TEXT, n INTEGER)")
+        .unwrap();
+    db.db.begin().unwrap();
+    for i in 0..300 {
+        db.db
+            .execute(&format!("INSERT INTO p VALUES ({}, 'r{}', {})", i, i, i % 7))
+            .unwrap();
+    }
+    db.db.commit().unwrap();
+
+    let r = db.db.query("SELECT name FROM p WHERE id = 123").unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].values[0], Value::Text("r123".to_string()));
+
+    // Missing key.
+    assert!(db.db.query("SELECT * FROM p WHERE id = 1000").unwrap().rows.is_empty());
+    // PK match plus a non-matching condition.
+    assert!(db
+        .db
+        .query("SELECT * FROM p WHERE id = 10 AND n = 0")
+        .unwrap()
+        .rows
+        .is_empty());
+    // PK match plus a matching condition, conditions in either order.
+    assert_eq!(db.db.query("SELECT * FROM p WHERE n = 3 AND id = 10").unwrap().rows.len(), 1);
+    // Contradictory PK conditions.
+    assert!(db
+        .db
+        .query("SELECT * FROM p WHERE id = 1 AND id = 2")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        db.db.query("SELECT COUNT(*) FROM p WHERE id = 42").unwrap().rows[0].values[0],
+        Value::Integer(1)
+    );
+
+    // UPDATE and DELETE by primary key touch exactly one row.
+    db.db.execute("UPDATE p SET name = 'changed' WHERE id = 5").unwrap();
+    let r = db.db.query("SELECT * FROM p WHERE name = 'changed'").unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].values[0], Value::Integer(5));
+
+    db.db.execute("DELETE FROM p WHERE id = 5").unwrap();
+    db.db.execute("DELETE FROM p WHERE id = 9999").unwrap();
+    assert_eq!(db.db.query("SELECT * FROM p").unwrap().rows.len(), 299);
+    assert!(db.db.query("SELECT * FROM p WHERE id = 5").unwrap().rows.is_empty());
+}

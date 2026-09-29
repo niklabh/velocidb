@@ -79,8 +79,8 @@ db.commit()?;                        // both changes land atomically
 ```
 
 - `COMMIT` makes every change durable at once, with a single WAL write and
-  fsync. Batching thousands of inserts this way is tens of times faster than
-  auto-commit (see [performance.md](performance.md)).
+  fsync. Batching thousands of inserts this way is hundreds of times faster
+  than auto-commit (see [performance.md](performance.md)).
 - `ROLLBACK` discards every change since `BEGIN`, including `CREATE` /
   `ALTER` / `DROP TABLE`.
 - If a statement inside a transaction fails (e.g. a duplicate key), only that

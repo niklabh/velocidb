@@ -7,7 +7,7 @@
 
 use crate::btree::BTree;
 use crate::cdc::{CdcManager, ChangeOp};
-use crate::parser::{AlterAction, OrderBy, Statement, WhereClause};
+use crate::parser::{AlterAction, Operator, OrderBy, Statement, WhereClause};
 use crate::storage::{Pager, Schema, TableSchema};
 use crate::transaction::{LockManager, LockType, TransactionManager, Transaction};
 use crate::types::{Column, DataType, QueryResult, Result, Row, Value, VelociError};
@@ -480,7 +480,7 @@ impl Executor {
                 VelociError::NotFound(format!("Table '{}' not initialized", table))
             })?;
             let btree = btree_arc.read();
-            btree.scan()?
+            candidate_rows(&btree, where_clause.as_ref(), &table_schema)?
         };
 
         // Process data without holding any locks. Filtering runs in parallel
@@ -731,8 +731,7 @@ impl Executor {
             })?;
             let mut btree = btree_arc.write();
 
-            // Scan all rows
-            let all_rows = btree.scan()?;
+            let all_rows = candidate_rows(&btree, where_clause.as_ref(), &table_schema)?;
 
             // Find rows to update
             let rows_to_update: Vec<(i64, Row)> = if let Some(ref where_clause) = where_clause {
@@ -853,7 +852,7 @@ impl Executor {
             })?;
             let mut btree = btree_arc.write();
 
-            let all_rows = btree.scan()?;
+            let all_rows = candidate_rows(&btree, where_clause.as_ref(), &table_schema)?;
             let rows_to_delete: Vec<(i64, Row)> = if let Some(ref where_clause) = where_clause {
                 all_rows
                     .into_iter()
@@ -936,6 +935,31 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         // Different incomparable types: fall back to discriminant order so that
         // the sort is at least total and deterministic.
         _ => format!("{:?}", a).cmp(&format!("{:?}", b)),
+    }
+}
+
+/// Rows that can possibly match `where_clause`: the single row found by a
+/// B-tree lookup when the clause contains `<pk> = <integer>`, otherwise every
+/// row. Callers still evaluate the full clause on the result.
+fn candidate_rows(
+    btree: &BTree,
+    where_clause: Option<&WhereClause>,
+    table: &TableSchema,
+) -> Result<Vec<(i64, Row)>> {
+    let pk_name = table
+        .columns
+        .iter()
+        .find(|c| c.primary_key)
+        .map(|c| c.name.as_str());
+    let pk_key = where_clause.zip(pk_name).and_then(|(wc, pk)| {
+        wc.conditions.iter().find_map(|c| match (&c.operator, &c.value) {
+            (Operator::Equal, Value::Integer(key)) if c.column == pk => Some(*key),
+            _ => None,
+        })
+    });
+    match pk_key {
+        Some(key) => Ok(btree.search(key)?.map(|row| (key, row)).into_iter().collect()),
+        None => btree.scan(),
     }
 }
 
