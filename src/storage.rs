@@ -13,6 +13,7 @@ use crate::vector::{self, DistanceMetric};
 use crate::wal::WalManager;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -95,6 +96,7 @@ impl Pager {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
 
         let metadata = file.metadata()?;
@@ -343,8 +345,8 @@ impl Pager {
             self.begin_group()?;
         }
         if let Some(sp) = self.savepoint.as_mut() {
-            if !sp.undo.contains_key(&page_id) {
-                sp.undo.insert(page_id, self.pending.get(&page_id).cloned());
+            if let Entry::Vacant(e) = sp.undo.entry(page_id) {
+                e.insert(self.pending.get(&page_id).cloned());
             }
         }
 
@@ -1208,6 +1210,12 @@ pub struct TableSchema {
 
 pub struct Schema {
     tables: HashMap<String, TableSchema>,
+}
+
+impl Default for Schema {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Schema {

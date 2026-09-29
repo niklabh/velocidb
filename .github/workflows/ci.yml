@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit, integration, recovery and transaction tests
+        run: cargo test --all-targets
+      - name: Doc tests
+        run: cargo test --doc
+
+  lint:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Default features = the active SQL path. Experimental modules are
+      # excluded and must not add warnings here.
+      - name: Clippy (active path)
+        run: cargo clippy --all-targets -- -D warnings
+
+  experimental:
+    name: Experimental modules build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Experimental modules only need to keep compiling and passing their
+      # own unit tests; warnings are tolerated until each is graduated or cut.
+      - name: Build and test with --features experimental
+        run: cargo test --lib --features experimental

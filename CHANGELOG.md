@@ -34,11 +34,33 @@ All notable changes to VelociDB are documented in this file.
 - An aborted write group now restores the pager's page count, so pages
   allocated by the aborted group are not left referenced past end-of-file.
 
+### Changed
+
+- **Experimental modules are behind the `experimental` feature** (off by
+  default): `mvcc`, `async_io`, `lockfree`, `simd`, `btree_optimized`,
+  `crdt`, `cloud_vfs`, `hybrid_storage`, `pmem`. They are no longer compiled
+  or re-exported from the crate root by default. **Breaking** for anyone
+  importing e.g. `velocidb::MvccManager` — enable `experimental` and use the
+  module path (`velocidb::mvcc::MvccManager`).
+- Docs describe the engine that exists: `docs/architecture.md`,
+  `docs/quickstart.md` and `docs/performance.md` are rewritten (the old
+  versions presented experimental modules as integrated and quoted
+  unmeasured speedups); `docs/implementation.md` is replaced by
+  `docs/experimental.md`. `performance.md` now has a measured baseline.
+- REPL / `--version` print the crate version instead of a hard-coded
+  `v0.1.0`.
+- Active-path code is clippy-clean (`cargo clippy --all-targets -- -D warnings`).
+
 ### Added
 
+- CI (`.github/workflows/ci.yml`): tests on Linux and macOS, doc tests,
+  clippy with `-D warnings`, and a build + unit-test job for
+  `--features experimental`.
 - `tests/transaction_tests.rs` (12 tests): rollback of DML and DDL, commit
   and reopen, uncommitted-on-close, rollback across B-tree splits,
   savepoints, CDC publication, `UNIQUE` on insert/update/reopen.
+
+## [0.3.0] — 2026-07-24
 
 ### Added (Turso-inspired features)
 
@@ -141,7 +163,21 @@ All notable changes to VelociDB are documented in this file.
 - Vector search is exact (brute-force, parallel); approximate indexing
   (HNSW/DiskANN-style) is future work, mirroring Turso's roadmap.
 
-## [0.1.0] — 2025-05-19
+## [0.2.0] — 2026-05-19
+
+### Fixed
+
+- B-tree delete underflow: leaves redistribute from or merge with a
+  sibling (left or right); internal-node underflow promotes / demotes the
+  root. `split_leaf_node` no longer rewrites the left page mid-split.
+- `find_sibling_info` corruption is reported as `VelociError::Corruption`
+  instead of silently leaving the tree underflowed.
+- Page-cache size accounting races (double decrements, missing increments
+  on `write_page`).
+- Executor propagates transaction commit / abort errors instead of
+  discarding them.
+
+## [0.1.0] — 2025-11-19
 
 ### Added
 

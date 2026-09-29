@@ -29,7 +29,7 @@ pub struct NodeHeader {
 impl NodeHeader {
     const SIZE: usize = 8;
 
-    pub fn new(node_type: NodeType) -> Self {
+    fn new(node_type: NodeType) -> Self {
         Self {
             node_type: node_type as u8,
             num_keys: 0,
@@ -523,6 +523,7 @@ impl BTree {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn merge_leaves(&self, pager: &mut Pager, page_id: PageId, sibling_id: PageId, parent_id: PageId, _separator_key: i64, root_page: PageId, sibling_is_left: bool) -> Result<()> {
         // Canonical merge: always merge right page into left page
         let (left_id, right_id) = if sibling_is_left {
@@ -609,7 +610,7 @@ impl BTree {
             return Ok(());
         }
 
-        for i in 0..parent_header.num_keys {
+        for _ in 0..parent_header.num_keys {
             let next_child = u64::from_le_bytes(
                 parent_clone.data()[offset + 8..offset + 16].try_into().map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
             ) as PageId;
@@ -735,11 +736,11 @@ impl BTree {
             ));
         }
         let mut offset = NodeHeader::SIZE;
-        page.data_mut()[offset..offset + 8].copy_from_slice(&(children[0] as u64).to_le_bytes());
+        page.data_mut()[offset..offset + 8].copy_from_slice(&children[0].to_le_bytes());
         offset += 8;
         for (k, c) in keys.iter().zip(children.iter().skip(1)) {
             page.data_mut()[offset..offset + 8].copy_from_slice(&k.to_le_bytes());
-            page.data_mut()[offset + 8..offset + 16].copy_from_slice(&(*c as u64).to_le_bytes());
+            page.data_mut()[offset + 8..offset + 16].copy_from_slice(&(*c).to_le_bytes());
             offset += 16;
         }
         Ok(())
@@ -821,6 +822,7 @@ impl BTree {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn merge_internal(
         &self,
         pager: &mut Pager,
@@ -1149,7 +1151,7 @@ impl BTree {
         let mut offset = NodeHeader::SIZE;
 
         // Left child pointer
-        root_page.data_mut()[offset..offset + 8].copy_from_slice(&(left_page as u64).to_le_bytes());
+        root_page.data_mut()[offset..offset + 8].copy_from_slice(&left_page.to_le_bytes());
         offset += 8;
 
         // Key
@@ -1157,7 +1159,7 @@ impl BTree {
         offset += 8;
 
         // Right child pointer
-        root_page.data_mut()[offset..offset + 8].copy_from_slice(&(right_page as u64).to_le_bytes());
+        root_page.data_mut()[offset..offset + 8].copy_from_slice(&right_page.to_le_bytes());
 
         // Write new root
         pager.write_page(root_page_id, &root_page)?;
@@ -1231,7 +1233,7 @@ impl BTree {
 
         // Insert new key and right child
         page.data_mut()[insert_offset..insert_offset + 8].copy_from_slice(&key.to_le_bytes());
-        page.data_mut()[insert_offset + 8..insert_offset + 16].copy_from_slice(&(right_page as u64).to_le_bytes());
+        page.data_mut()[insert_offset + 8..insert_offset + 16].copy_from_slice(&right_page.to_le_bytes());
 
         header.num_keys += 1;
         header.serialize(page.data_mut());
@@ -1301,12 +1303,12 @@ impl BTree {
         sibling_header.serialize(sibling_page.data_mut());
 
         let mut offset = NodeHeader::SIZE;
-        sibling_page.data_mut()[offset..offset + 8].copy_from_slice(&(right_children[0] as u64).to_le_bytes());
+        sibling_page.data_mut()[offset..offset + 8].copy_from_slice(&right_children[0].to_le_bytes());
         offset += 8;
 
         for i in 0..right_keys.len() {
             sibling_page.data_mut()[offset..offset + 8].copy_from_slice(&right_keys[i].to_le_bytes());
-            sibling_page.data_mut()[offset + 8..offset + 16].copy_from_slice(&(right_children[i + 1] as u64).to_le_bytes());
+            sibling_page.data_mut()[offset + 8..offset + 16].copy_from_slice(&right_children[i + 1].to_le_bytes());
             offset += 16;
         }
 
@@ -1328,12 +1330,12 @@ impl BTree {
         new_left_header.serialize(new_left_page.data_mut());
 
         let mut offset = NodeHeader::SIZE;
-        new_left_page.data_mut()[offset..offset + 8].copy_from_slice(&(left_children[0] as u64).to_le_bytes());
+        new_left_page.data_mut()[offset..offset + 8].copy_from_slice(&left_children[0].to_le_bytes());
         offset += 8;
 
         for i in 0..left_keys.len() {
             new_left_page.data_mut()[offset..offset + 8].copy_from_slice(&left_keys[i].to_le_bytes());
-            new_left_page.data_mut()[offset + 8..offset + 16].copy_from_slice(&(left_children[i + 1] as u64).to_le_bytes());
+            new_left_page.data_mut()[offset + 8..offset + 16].copy_from_slice(&left_children[i + 1].to_le_bytes());
             offset += 16;
         }
 
@@ -1489,7 +1491,7 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let pager = Arc::new(RwLock::new(Pager::new(temp_file.path()).unwrap()));
         let btree = BTree::new(pager).unwrap();
-        assert!(btree.root_page() >= 0);
+        assert!(btree.scan().unwrap().is_empty());
     }
 
     #[test]
@@ -1603,11 +1605,11 @@ mod tests {
 
         // Re-insert some of the deleted keys with different payloads.
         for i in (0..2_000i64).step_by(7) {
-            if !model.contains_key(&i) {
+            model.entry(i).or_insert_with(|| {
                 let row = Row::new(vec![Value::Integer(i), Value::Text(format!("X{}", i))]);
                 btree.insert(i, &row).unwrap();
-                model.insert(i, row);
-            }
+                row
+            });
         }
 
         // Point lookups must agree.
@@ -1649,10 +1651,10 @@ mod tests {
             for (is_insert, key) in ops {
                 if is_insert {
                     let row = Row::new(vec![Value::Integer(key)]);
-                    if !model.contains_key(&key) {
+                    model.entry(key).or_insert_with(|| {
                         btree.insert(key, &row).unwrap();
-                        model.insert(key, key);
-                    }
+                        key
+                    });
                 } else if model.remove(&key).is_some() {
                     assert!(btree.delete(key).unwrap());
                 }

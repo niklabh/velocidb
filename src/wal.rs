@@ -3,10 +3,11 @@
 //! # Semantics
 //!
 //! VelociDB uses a "no-steal, force" WAL: page writes performed while a write
-//! group is active are buffered in memory (the pager's `pending` map) and the
-//! same writes are appended to the WAL. On commit, the WAL is fsynced *before*
-//! any data file mutation, so a crash before the commit fsync leaves no trace
-//! in the WAL and the data file in its previous state. After a successful
+//! group is active are buffered in memory (the pager's `pending` map). On
+//! commit the final image of every buffered page is appended to the WAL,
+//! followed by a COMMIT record, and the WAL is fsynced *before* any data file
+//! mutation, so a crash before the commit fsync leaves no committed group in
+//! the WAL and the data file in its previous state. After a successful
 //! commit fsync the pager applies the pending pages to the data file, fsyncs
 //! the data file, and then truncates the WAL.
 //!
@@ -56,13 +57,14 @@ pub struct WalManager {
 
 impl WalManager {
     /// Opens (creating if needed) the WAL companion file for the given DB path.
-    /// The WAL path is `<db>.wal`.
+    /// The WAL path is `<db>-wal`.
     pub fn open(db_path: &Path) -> Result<Self> {
         let wal_path = wal_path_for(db_path);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false) // committed groups must survive for recovery
             .open(&wal_path)?;
         Ok(Self {
             path: wal_path,
@@ -103,7 +105,7 @@ impl WalManager {
             )));
         }
         let mut payload = Vec::with_capacity(8 + PAGE_SIZE);
-        payload.extend_from_slice(&(page_id as u64).to_le_bytes());
+        payload.extend_from_slice(&page_id.to_le_bytes());
         payload.extend_from_slice(data);
         self.append_record(REC_PAGE_WRITE, group_id, &payload)
     }
@@ -336,7 +338,7 @@ mod tests {
 
         // Simulate a crash mid-record by truncating the file by 5 bytes.
         let path = wal_path_for(&db);
-        let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
         let len = f.metadata().unwrap().len();
         f.set_len(len - 5).unwrap();
         drop(f);

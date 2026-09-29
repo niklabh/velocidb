@@ -448,9 +448,7 @@ impl Executor {
         }; // btrees and btree locks released here
 
         // Handle result
-        if let Err(e) = result {
-            return Err(e);
-        }
+        result?;
 
         self.cdc
             .stage(table, ChangeOp::Insert, pk_value, None, Some(row));
@@ -783,13 +781,14 @@ impl Executor {
                 }
 
                 // If primary key is being updated, check for uniqueness
-                if pk_being_updated && new_pk_value != *key {
-                    if btree.search(new_pk_value)?.is_some() {
-                        return Err(VelociError::ConstraintViolation(format!(
-                            "Primary key {} already exists in table '{}'",
-                            new_pk_value, table
-                        )));
-                    }
+                if pk_being_updated
+                    && new_pk_value != *key
+                    && btree.search(new_pk_value)?.is_some()
+                {
+                    return Err(VelociError::ConstraintViolation(format!(
+                        "Primary key {} already exists in table '{}'",
+                        new_pk_value, table
+                    )));
                 }
 
                 updates.push((*key, new_pk_value, row.clone(), updated_row));
@@ -826,9 +825,7 @@ impl Executor {
         }; // btrees and btree locks released
 
         // Handle errors
-        if let Err(e) = result {
-            return Err(e);
-        }
+        result?;
 
         for (key, before, after) in cdc_events {
             self.cdc
@@ -875,9 +872,7 @@ impl Executor {
             Ok(())
         };
 
-        if let Err(e) = result {
-            return Err(e);
-        }
+        result?;
 
         for (key, before) in cdc_events {
             self.cdc

@@ -12,6 +12,7 @@ description: How to run and write VelociDB tests - test suite layout, commands, 
 | Unit tests | `#[cfg(test)] mod tests` in each `src/*.rs` | parser, btree (incl. proptest), wal, vector, cdc, async_api, storage |
 | `tests/integration_tests.rs` | full SQL path | CRUD, WHERE, ORDER BY, LIMIT, constraints |
 | `tests/recovery_tests.rs` | crash safety | WAL replay, torn tails, uncommitted groups, reopen persistence |
+| `tests/transaction_tests.rs` | transactions + constraints | ROLLBACK of DML/DDL, uncommitted-on-close, savepoints, CDC publication, `UNIQUE` |
 | `tests/advanced_features_tests.rs` | Turso-inspired features | vector search, KNN, async API, CDC, ALTER TABLE, parallel paths |
 | `benches/benchmarks.rs` | criterion | perf only, not part of `cargo test` |
 
@@ -23,7 +24,14 @@ cargo test --test advanced_features_tests    # one integration suite
 cargo test --lib vector                    # unit tests of one module
 cargo test test_cdc_capture_and_poll      # single test by name
 cargo check --all-targets                  # fast type-check incl. tests
+cargo clippy --all-targets -- -D warnings  # CI gate (active path)
+cargo test --lib --features experimental   # experimental modules' unit tests
 ```
+
+CI (`.github/workflows/ci.yml`) runs all of the above on Linux and macOS for
+every pull request. Most suite time is fsync latency from auto-commit
+statements; wrap bulk setup in `db.begin()` / `db.commit()` to keep new tests
+fast.
 
 The full `cargo test` takes ~2 minutes (lib proptest + integration suites are
 the slow parts). All suites must pass before a change is complete.

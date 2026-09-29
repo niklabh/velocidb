@@ -91,6 +91,7 @@ pub enum Operator {
 }
 
 impl Operator {
+    #[allow(clippy::should_implement_trait)] // returns our Result, not FromStr::Err
     pub fn from_str(s: &str) -> Result<Self> {
         match s {
             "=" => Ok(Operator::Equal),
@@ -280,6 +281,12 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
 
 pub struct Parser {
     // Parser state can be added here if needed
+}
+
+impl Default for Parser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Parser {

@@ -185,6 +185,7 @@ impl DataType {
     ///
     /// Vector columns use the Turso/libSQL syntax `F32_BLOB(n)` or the alias
     /// `VECTOR(n)` where `n` is the dimension.
+    #[allow(clippy::should_implement_trait)] // infallible: unknown type names default to TEXT
     pub fn from_str(s: &str) -> Self {
         let upper = s.trim().to_uppercase();
 

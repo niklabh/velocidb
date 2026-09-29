@@ -13,7 +13,10 @@ an interactive REPL.
 
 - **[Quick Start](docs/quickstart.md)**
 - **[Architecture](docs/architecture.md)**
+- **[Performance](docs/performance.md)** — measured baseline and tuning advice
 - **[REPL Usage](docs/repl_usage.md)**
+- **[Experimental modules](docs/experimental.md)**
+- **[Roadmap](ROADMAP.md)** · **[Changelog](CHANGELOG.md)**
 - **[Contributing](docs/contributing.md)**
 
 ## Quick Start
@@ -25,7 +28,7 @@ cargo run --release
 ```
 
 ```
-VelociDB v0.1.0
+VelociDB v0.3.0
 Database: veloci.db
 Type '.help' for help, '.exit' to quit. Statements end with ';'.
 
@@ -142,7 +145,7 @@ replication, cache invalidation, or audit trails. In the REPL: `.cdc on`,
 Storage and durability
 
 - 4 KB page-based storage on a single data file.
-- **Write-ahead log** (`<db>.wal`) with CRC32-checked records. Each write
+- **Write-ahead log** (`<db>-wal`) with CRC32-checked records. Each write
   statement — or each explicit `BEGIN` … `COMMIT` transaction — runs as one
   atomic group: modified pages are buffered in memory, written to the WAL and
   fsynced on commit, then applied to the data file, fsynced, and the WAL
@@ -212,6 +215,11 @@ Concurrency
   are held in memory until COMMIT.
 - **`UNIQUE` checks scan the table.** Without secondary indexes, inserting
   into or updating a `UNIQUE` column is O(rows).
+- **Auto-commit writes are fsync-bound.** Each commit does three fsyncs, so
+  single-statement writes are slow (tens per second on macOS). Batch writes
+  in `BEGIN` … `COMMIT` — see [docs/performance.md](docs/performance.md).
+- **Every `SELECT` scans the table**, including `WHERE id = …`; the
+  primary-key B-tree is not used for lookups yet.
 - **No `JOIN`, `GROUP BY`, sub-queries**, no indexes other than the primary
   key.
 - **Single primary key column.** Composite primary keys are not supported.
@@ -225,19 +233,11 @@ Concurrency
 
 ## Experimental modules (not on the active path)
 
-The crate exports several modules that explore advanced storage and
-concurrency techniques. They are **not** used by the SQL engine today and
-are exported only so the experimentation is visible:
-
-- `mvcc` — Multi-version concurrency control
-- `async_io` — Tokio / `io_uring` page I/O
-- `lockfree` — Lock-free page cache and queues
-- `simd` — Vectorized filter / aggregation kernels
-- `btree_optimized` — Cache-conscious B-tree node layout
-- `crdt` — CRDT synchronization primitives
-- `cloud_vfs` — S3 / Azure / GCS-backed VFS
-- `hybrid_storage` — Row/columnar hybrid table layout
-- `pmem` — Persistent-memory / DAX VFS
+The source tree also contains research modules — `mvcc`, `async_io`,
+`lockfree`, `simd`, `btree_optimized`, `crdt`, `cloud_vfs`,
+`hybrid_storage`, `pmem`. They are **not** used by the SQL engine, have no
+measured performance impact, and are compiled only with
+`--features experimental`. See [docs/experimental.md](docs/experimental.md).
 
 ## Installation
 

@@ -114,6 +114,12 @@ pub struct TransactionManager {
     active_transactions: RwLock<HashMap<TransactionId, Arc<Transaction>>>,
 }
 
+impl Default for TransactionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TransactionManager {
     pub fn new() -> Self {
         Self {
@@ -211,6 +217,12 @@ pub enum LockType {
     Exclusive,
 }
 
+impl Default for LockManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LockManager {
     pub fn new() -> Self {
         Self {
@@ -257,7 +269,7 @@ impl LockManager {
     }
 
     fn try_acquire_lock_once(&self, resource: &str, txn_id: TransactionId, lock_type: LockType) -> Result<()> {
-        let mut entry = self.locks.entry(resource.to_string()).or_insert_with(Vec::new);
+        let mut entry = self.locks.entry(resource.to_string()).or_default();
         let entries = entry.value_mut();
 
         // Check existing locks

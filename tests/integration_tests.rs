@@ -198,8 +198,6 @@ fn test_text_data() {
 
 #[test]
 fn test_persistence() {
-    // Note: Schema persistence not yet implemented
-    // This test verifies page-level persistence only
     let temp_file = NamedTempFile::new().unwrap();
     let path = temp_file.path().to_path_buf();
 
@@ -211,29 +209,10 @@ fn test_persistence() {
 
     {
         let db = Database::open(&path).unwrap();
-        // Schema should be persisted, so creating table again should fail or we should just query
-        // Let's try to query directly.
-        let result = db.query("SELECT * FROM users");
-        if result.is_err() {
-             // If query fails (maybe schema not loaded?), try create
-             db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
-             db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
-        } else {
-             // If query succeeds, check data
-             let rows = result.unwrap();
-             if rows.rows.is_empty() {
-                 // If empty, maybe data wasn't persisted but schema was?
-                 // Or maybe we need to insert again?
-                 // But the previous block inserted.
-                 // If persistence works, we should have 1 row.
-                 // If we have 0 rows, then data persistence failed.
-                 // Let's assert we have 1 row if we expect full persistence.
-                 // But wait, the error was "Table 'users' already exists".
-                 // So schema IS persisted.
-                 // So we should just query.
-             }
-             assert_eq!(rows.rows.len(), 1);
-        }
+        // Schema and data both persist across reopen.
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0].values[1], Value::Text("Alice".to_string()));
     }
 }
 

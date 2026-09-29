@@ -410,6 +410,6 @@ mod tests {
         let result = knn(rows, 1, &[3.0, 0.0], DistanceMetric::Euclidean, 3);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].1, 3); // exact match first
-        assert!(result[0].0 < result[1].0 || result[0].0 == result[1].0);
+        assert!(result[0].0 <= result[1].0);
     }
 }

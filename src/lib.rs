@@ -1,7 +1,8 @@
 //! # VelociDB
 //!
-//! VelociDB is a high-performance, embedded database engine written in Rust.
-//! It features a modern architecture designed for NVMe storage and multi-core systems.
+//! VelociDB is an embedded SQL database engine written in Rust, inspired by
+//! Turso: page-based storage, a B-tree primary index, a write-ahead log with
+//! crash recovery, and atomic `BEGIN` / `COMMIT` / `ROLLBACK`.
 //!
 //! ## Key Features
 //!
@@ -57,20 +58,28 @@ pub mod async_api; // Turso-style async API (Builder / AsyncDatabase / AsyncConn
 
 // EXPERIMENTAL MODULES
 // ---------------------------------------------------------------------------
-// The modules below are standalone implementations of advanced storage and
-// concurrency techniques. They are exported for experimentation and to keep
-// the engineering work visible, but they are NOT currently on the active
-// SQL/storage path. The Database engine uses `storage`, `btree`, `executor`,
-// `parser`, and `transaction` only.
-pub mod mvcc;            // Multi-Version Concurrency Control (experimental)
-pub mod async_io;        // Asynchronous I/O with Tokio/io_uring (experimental)
-pub mod lockfree;        // Lock-free data structures (experimental)
-pub mod simd;            // Vectorized execution with SIMD (experimental)
-pub mod btree_optimized; // Cache-conscious B-tree (experimental)
-pub mod crdt;            // CRDT-based synchronization (experimental)
-pub mod cloud_vfs;       // Cloud storage VFS (experimental)
-pub mod hybrid_storage;  // Hybrid row/columnar storage (experimental)
-pub mod pmem;            // Persistent memory (PMEM/DAX) support (experimental)
+// Standalone explorations of advanced storage and concurrency techniques.
+// They are NOT on the SQL/storage path — the engine uses only the modules
+// above — and are compiled only with `--features experimental`. See
+// ROADMAP.md (P4) for whether each one graduates, is archived, or is removed.
+#[cfg(feature = "experimental")]
+pub mod mvcc;            // Multi-Version Concurrency Control
+#[cfg(feature = "experimental")]
+pub mod async_io;        // Asynchronous I/O with Tokio/io_uring
+#[cfg(feature = "experimental")]
+pub mod lockfree;        // Lock-free data structures
+#[cfg(feature = "experimental")]
+pub mod simd;            // Vectorized execution with SIMD
+#[cfg(feature = "experimental")]
+pub mod btree_optimized; // Cache-conscious B-tree
+#[cfg(feature = "experimental")]
+pub mod crdt;            // CRDT-based synchronization
+#[cfg(feature = "experimental")]
+pub mod cloud_vfs;       // Cloud storage VFS
+#[cfg(feature = "experimental")]
+pub mod hybrid_storage;  // Hybrid row/columnar storage
+#[cfg(feature = "experimental")]
+pub mod pmem;            // Persistent memory (PMEM/DAX) support
 
 // Re-export commonly used types
 pub use storage::Database;
@@ -80,15 +89,3 @@ pub use cdc::{CdcManager, ChangeEvent, ChangeOp};
 
 #[cfg(feature = "async-io")]
 pub use async_api::{AsyncConnection, AsyncDatabase, Builder};
-
-// Re-export modern features
-pub use mvcc::{MvccManager, Snapshot, VersionedRecord};
-pub use async_io::{AsyncPager, AsyncVfs, TokioVfs, BatchIoExecutor};
-pub use lockfree::{LockFreePageCache, LockFreeIoQueue, LockFreeCounter};
-pub use simd::{VectorBatch, VectorizedFilter, VectorizedAggregation};
-pub use btree_optimized::{CacheOptimizedNode, CachePrefetcher};
-pub use crdt::{CrdtStore, CrdtOperation, SyncProtocol};
-pub use cloud_vfs::{CloudVfs, CloudVfsConfig};
-pub use hybrid_storage::{HybridTable, StorageLayout, ColumnStorage};
-pub use pmem::{DaxVfs, PmemTransactionLog};
-

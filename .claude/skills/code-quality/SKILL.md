@@ -11,11 +11,13 @@ The SQL engine uses ONLY: `storage`, `btree`, `parser`, `executor`,
 `transaction`, `types`, `wal`, `vector`, `cdc`, `async_api`.
 
 `mvcc`, `async_io`, `lockfree`, `simd`, `btree_optimized`, `crdt`,
-`cloud_vfs`, `hybrid_storage`, `pmem` are **experimental**: exported for
-visibility, not wired in. Do not add dependencies from active-path modules
-to experimental ones, and do not "fix" experimental-module warnings as part
-of unrelated changes. If a feature graduates, say so explicitly in
-`src/lib.rs` and the README.
+`cloud_vfs`, `hybrid_storage`, `pmem` are **experimental**: compiled only with
+`--features experimental`, never re-exported from the crate root, not wired
+in. Do not add dependencies from active-path modules to experimental ones,
+and do not "fix" experimental-module warnings as part of unrelated changes.
+Graduation rules are in `docs/experimental.md`; a graduating module is
+un-gated in `src/lib.rs` and documented in the README and
+`docs/architecture.md` in the same change.
 
 ## Error handling
 
@@ -46,11 +48,15 @@ of unrelated changes. If a feature graduates, say so explicitly in
   `BTREE_ORDER`, `PARALLEL_THRESHOLD`, `DEFAULT_CDC_CAPACITY`).
 - New feature = update README ("What works today" / "Limitations") and
   CHANGELOG in the same change. Known limitations are documented, not hidden.
+- Performance claims in docs need a measurement (criterion bench or a stated
+  machine + method). No projected or aspirational numbers.
 - `src/main.rs` builds against the `velocidb` library crate — never re-add
   `mod` declarations there.
 
 ## Warnings
 
-Do not introduce new warnings in active-path modules; `cargo check
---all-targets` output for files you touched should be clean. Pre-existing
-experimental-module warnings stay as-is.
+The active path is clippy-clean and CI enforces
+`cargo clippy --all-targets -- -D warnings` (default features, i.e. without
+experimental modules). Keep it that way; prefer fixing a lint over
+`#[allow]`, and justify any `#[allow]` in a comment. Experimental-module
+warnings are tolerated.

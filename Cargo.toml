@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2021"
 rust-version = "1.70"
 authors = ["Nikhil Ranjan <niklabh811@gmail.com>"]
-description = "A high-performance SQLite reimplementation in Rust optimized for modern hardware"
+description = "An embedded SQL database in Rust with a WAL, vector search, CDC and an async API"
 license = "MIT"
 repository = "https://github.com/niklabh/velocidb"
 homepage = "https://niklabh.github.io/velocidb/"
@@ -65,6 +65,8 @@ io-uring = ["tokio-uring"]
 pmem-support = ["pmem"]
 crdt-sync = ["automerge"]
 cloud-vfs = ["object_store"]
+# Research modules not used by the SQL engine (mvcc, simd, lockfree, ...).
+experimental = ["async-io"]
 
 [[bench]]
 name = "benchmarks"

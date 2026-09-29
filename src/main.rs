@@ -12,7 +12,6 @@ use std::env;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use tracing::{error, info, Level};
-use tracing_subscriber;
 
 use velocidb::Database;
 
@@ -277,7 +276,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             "--version" | "-v" => {
-                println!("VelociDB v0.1.0");
+                println!("VelociDB v{}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             "--db" | "-d" => {
@@ -304,8 +303,8 @@ fn main() -> Result<()> {
         .with_max_level(Level::WARN)
         .init();
 
-    info!("VelociDB v0.1.0 - Interactive SQL Shell");
-    println!("VelociDB v0.1.0");
+    info!("VelociDB v{} - Interactive SQL Shell", env!("CARGO_PKG_VERSION"));
+    println!("VelociDB v{}", env!("CARGO_PKG_VERSION"));
     println!("Database: {}", db_filename);
     println!("Type '.help' for help, '.exit' to quit. Statements end with ';'.");
     println!();
@@ -450,7 +449,7 @@ fn main() -> Result<()> {
 }
 
 fn print_help() {
-    println!("VelociDB v0.1.0");
+    println!("VelociDB v{}", env!("CARGO_PKG_VERSION"));
     println!();
     println!("USAGE:");
     println!("    velocidb [OPTIONS] [DATABASE]");

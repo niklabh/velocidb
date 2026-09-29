@@ -19,12 +19,13 @@ Ship before expanding the SQL surface or advertising full ACID.
       mutations, not only locks
 - [x] **Enforce `UNIQUE`** on non-primary-key columns (INSERT / UPDATE); add
       regression tests; keep `.schema` / README in sync
-- [ ] **CI on every PR** — `cargo test --all-targets`, `cargo clippy` on the
+- [x] **CI on every PR** — `cargo test --all-targets`, `cargo clippy` on the
       active path (docs workflow alone is not enough)
-- [ ] **Docs / API honesty** — align older docs
-      (`docs/architecture.md`, `docs/performance.md`, `docs/implementation.md`)
+- [x] **Docs / API honesty** — align older docs
+      (`docs/architecture.md`, `docs/performance.md`, `docs/implementation.md`
+      → `docs/experimental.md`)
       with README; stop implying experimental modules are integrated
-- [ ] **Stop crate-root re-exports of experimental types** (or gate them
+- [x] **Stop crate-root re-exports of experimental types** (or gate them
       behind an `experimental` feature) so the public API matches the engine
 
 ---
@@ -42,6 +43,12 @@ Unblock almost every later SQL and concurrency feature.
 - [ ] **Parser fuzzing** (and/or property tests) for statement splitting and
       value parsing
 - [ ] **Concurrent-writer / deadlock stress tests** beyond the 30s lock timeout
+- [ ] **Primary-key point lookups** — use `BTree::search` for `WHERE pk = …`
+      instead of a full scan
+- [ ] **Fewer fsyncs per commit** — checkpoint the WAL periodically instead
+      of truncating (and fsyncing) after every commit; measured auto-commit
+      INSERT is ~74 rows/s on macOS vs ~4,600 rows/s batched in one
+      transaction (see `docs/performance.md`)
 
 ---
 
@@ -132,10 +139,11 @@ CHANGELOG.
 
 ## Suggested sequence
 
-1. CI + enforce `UNIQUE`
-2. Multi-statement WAL groups + real `ROLLBACK`
-3. Lexer / parser + golden tests
-4. Secondary indexes + equality probe
-5. `OR` → `INNER JOIN` → `GROUP BY` aggregates
-6. Durable CDC + approximate vector index
-7. Graduate or archive experimental modules
+1. ~~CI + enforce `UNIQUE`~~ (done)
+2. ~~Multi-statement WAL groups + real `ROLLBACK`~~ (done)
+3. Primary-key point lookups + fewer fsyncs per commit (small changes, large wins)
+4. Lexer / parser + golden tests
+5. Secondary indexes + equality probe
+6. `OR` → `INNER JOIN` → `GROUP BY` aggregates
+7. Durable CDC + approximate vector index
+8. Graduate or archive experimental modules

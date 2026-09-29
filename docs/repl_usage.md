@@ -17,7 +17,7 @@ Or after building:
 The REPL provides an interactive SQL shell where you can execute commands in real-time:
 
 ```
-VelociDB v0.1.0
+VelociDB v0.3.0
 Type 'help' for help, 'exit' or 'quit' to exit
 
 velocidb>
