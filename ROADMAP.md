@@ -34,14 +34,17 @@ Ship before expanding the SQL surface or advertising full ACID.
 
 Unblock almost every later SQL and concurrency feature.
 
-- [ ] **Replace the regex parser** with a lexer + recursive-descent (or
+- [x] **Replace the regex parser** with a lexer + recursive-descent (or
       pest/lalrpop) AST; keep current SQL as golden tests
+      (`tests/parser_golden.rs`)
 - [ ] **Typed expression AST** — stop carrying distance calls / predicates as
       opaque strings
-- [ ] **Secondary indexes** — `CREATE INDEX` / `DROP INDEX` on one column;
-      maintain on write; equality probe in the executor (range scans later)
-- [ ] **Parser fuzzing** (and/or property tests) for statement splitting and
-      value parsing
+- [x] **Secondary indexes** — `CREATE INDEX` / `DROP INDEX` on one column;
+      maintain on write; equality probe in the executor (range scans later:
+      the hash-keyed format answers equality only)
+- [x] **Parser fuzzing** (and/or property tests) for statement splitting and
+      value parsing (`tests/parser_proptest.rs`: AST → SQL → AST round-trip,
+      split round-trip, no panics on arbitrary input)
 - [ ] **Concurrent-writer / deadlock stress tests** beyond the 30s lock timeout
 - [x] **Primary-key point lookups** — use `BTree::search` for `WHERE pk = …`
       instead of a full scan
@@ -67,7 +70,7 @@ Assumes a real parser (or at least a typed expression layer) is underway.
       `COUNT(*)`)
 - [ ] Prepared statements / bind parameters
 - [ ] Composite `PRIMARY KEY` and multi-column `UNIQUE`
-- [ ] Quoted identifiers
+- [x] Quoted identifiers (`"x"`, `` `x` ``, `[x]` wherever a name is expected)
 - [ ] Subqueries / `IN (SELECT …)` (non-correlated first)
 - [ ] `ORDER BY` / `SELECT` expressions beyond vector distance helpers
 
@@ -146,8 +149,8 @@ CHANGELOG.
 1. ~~CI + enforce `UNIQUE`~~ (done)
 2. ~~Multi-statement WAL groups + real `ROLLBACK`~~ (done)
 3. ~~Primary-key point lookups + fewer fsyncs per commit~~ (done)
-4. Lexer / parser + golden tests
-5. Secondary indexes + equality probe
+4. ~~Lexer / parser + golden tests~~ (done)
+5. ~~Secondary indexes + equality probe~~ (done)
 6. `OR` → `INNER JOIN` → `GROUP BY` aggregates
 7. Durable CDC + approximate vector index
 8. Graduate or archive experimental modules

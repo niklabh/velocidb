@@ -10,6 +10,9 @@ description: How to run and write VelociDB tests - test suite layout, commands, 
 | Suite | Location | Covers |
 |-------|----------|--------|
 | Unit tests | `#[cfg(test)] mod tests` in each `src/*.rs` | parser, btree (incl. proptest), wal, vector, cdc, async_api, storage |
+| `tests/parser_golden.rs` | parser | AST of ~180 statements vs `tests/golden/parser.golden` (`UPDATE_GOLDEN=1` to regenerate) |
+| `tests/parser_proptest.rs` | parser | AST → SQL → AST round-trip, `split_statements`, no panics |
+| `tests/index_tests.rs` | secondary indexes | DDL, maintenance, reopen/crash, rollback, differential proptest (indexed vs unindexed table) |
 | `tests/integration_tests.rs` | full SQL path | CRUD, WHERE, ORDER BY, LIMIT, constraints |
 | `tests/recovery_tests.rs` | crash safety | WAL replay, torn tails, uncommitted groups, reopen persistence |
 | `tests/transaction_tests.rs` | transactions + constraints | ROLLBACK of DML/DDL, uncommitted-on-close, savepoints, CDC publication, `UNIQUE` |
@@ -55,7 +58,7 @@ the slow parts). All suites must pass before a change is complete.
 
 ## What to test for each kind of change
 
-- Parser change → unit test in `src/parser.rs` + one end-to-end query test.
+- Parser change → golden case in `tests/parser_golden.rs` (+ lexer unit test if tokens change) + one end-to-end query test.
 - Write-path / executor change → integration test + `recovery_tests` must
   still pass.
 - On-disk format change → reopen test + all of `recovery_tests`.

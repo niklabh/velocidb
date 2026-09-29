@@ -474,6 +474,8 @@ impl Drop for Pager {
 pub struct Database {
     pager: Arc<RwLock<Pager>>,
     btrees: Arc<RwLock<HashMap<String, Arc<RwLock<BTree>>>>>,
+    /// Secondary index B-trees, keyed by index name.
+    indexes: Arc<RwLock<HashMap<String, Arc<RwLock<BTree>>>>>,
     transaction_manager: Arc<TransactionManager>,
     schema: Arc<RwLock<Schema>>,
     executor: RwLock<Option<Arc<Executor>>>,
@@ -515,6 +517,7 @@ impl Database {
         let db = Arc::new(Self {
             pager,
             btrees,
+            indexes: Arc::new(RwLock::new(HashMap::new())),
             transaction_manager,
             schema,
             executor: RwLock::new(None),
@@ -560,41 +563,7 @@ impl Database {
     }
 
     fn load_schema(&self) -> Result<()> {
-        // Read all schema pages (starting from page 1) until we hit the last one
-        let mut data_copy = Vec::new();
-        let mut schema_page = 1u64;
-
-        loop {
-            let pager_read = self.pager.read();
-            if pager_read.num_pages() <= schema_page {
-                break;
-            }
-            drop(pager_read);
-
-            let page_data: Vec<u8> = {
-                let mut pager = self.pager.write();
-                let page_arc = pager.read_page(schema_page)?;
-                let page = page_arc.read();
-                page.data().to_vec()
-            };
-
-            if page_data.len() < 4 {
-                break;
-            }
-
-            let chunk_len =
-                u32::from_le_bytes(page_data[0..4].try_into().map_err(|_| {
-                    VelociError::Corruption("Failed to read chunk length".to_string())
-                })?) as usize;
-
-            let chunk_end = std::cmp::min(4 + chunk_len, page_data.len());
-            data_copy.extend_from_slice(&page_data[4..chunk_end]);
-
-            if chunk_len < PAGE_SIZE - 4 {
-                break; // Last page (partial chunk)
-            }
-            schema_page += 1;
-        }
+        let data_copy = self.read_schema_buffer()?;
 
         if data_copy.len() < 4 {
             return Ok(()); // Empty schema
@@ -792,8 +761,38 @@ impl Database {
                 name: table_name,
                 columns,
                 root_page: btree_root,
+                indexes: Vec::new(),
             };
             self.schema.write().create_table(table_schema)?;
+        }
+
+        // Optional trailing index section (absent in files written before
+        // secondary indexes existed):
+        // [INDEX_SECTION_MAGIC][num_indexes: u32] then per index
+        // [table_len: u32][table][name_len: u32][name][col_len: u32][col][root: u64]
+        // Older versions could leave stale bytes after the tables (see
+        // `save_schema`), so trailing data without the magic is ignored.
+        let mut reader = SchemaReader { data, offset };
+        if data.get(offset..offset + INDEX_SECTION_MAGIC.len()) == Some(INDEX_SECTION_MAGIC) {
+            reader.bytes(INDEX_SECTION_MAGIC.len(), "index section")?;
+            let num_indexes = reader.u32("index count")?;
+            for _ in 0..num_indexes {
+                let table = reader.string("index table")?;
+                let name = reader.string("index name")?;
+                let column = reader.string("index column")?;
+                let root_page = reader.u64("index root page")?;
+                let btree = BTree::from_root(root_page, Arc::clone(&self.pager));
+                self.indexes
+                    .write()
+                    .insert(name.clone(), Arc::new(RwLock::new(btree)));
+                self.schema.write().get_table_mut(&table)?.indexes.push(
+                    crate::index::IndexSchema {
+                        name,
+                        column,
+                        root_page,
+                    },
+                );
+            }
         }
 
         Ok(())
@@ -805,6 +804,7 @@ impl Database {
     fn reload_schema(&self) -> Result<()> {
         *self.schema.write() = Schema::new();
         self.btrees.write().clear();
+        self.indexes.write().clear();
         self.load_schema()
     }
 
@@ -879,6 +879,31 @@ impl Database {
             }
         }
 
+        let indexed: Vec<(&String, &crate::index::IndexSchema)> = schema
+            .list_tables()
+            .iter()
+            .filter_map(|t| schema.get_table(t).ok())
+            .flat_map(|t| t.indexes.iter().map(move |i| (&t.name, i)))
+            .collect();
+        buffer.extend_from_slice(INDEX_SECTION_MAGIC);
+        buffer.extend_from_slice(&(indexed.len() as u32).to_le_bytes());
+        for (table, index) in indexed {
+            let root_page = match self.indexes.read().get(&index.name) {
+                Some(bt) => bt.read().root_page(),
+                None => {
+                    return Err(VelociError::Corruption(format!(
+                        "No B-tree for index '{}'",
+                        index.name
+                    )))
+                }
+            };
+            for part in [table, &index.name, &index.column] {
+                buffer.extend_from_slice(&(part.len() as u32).to_le_bytes());
+                buffer.extend_from_slice(part.as_bytes());
+            }
+            buffer.extend_from_slice(&root_page.to_le_bytes());
+        }
+
         drop(schema);
 
         let mut pager = self.pager.write();
@@ -886,32 +911,80 @@ impl Database {
             pager.in_group(),
             "save_schema must run inside a write group"
         );
-        let usable_size = PAGE_SIZE - 4; // Reserve 4 bytes for chunk length header
-        let num_pages_needed = if buffer.is_empty() {
-            1
+        // Reuse the current chain's overflow pages, then allocate more.
+        // Never write to pages the chain does not own: they belong to
+        // B-trees.
+        let mut pages = vec![SCHEMA_HEAD_PAGE];
+        pages.extend(schema_chain(&mut pager)?.into_iter().skip(1));
+        let chunks: Vec<&[u8]> = if buffer.is_empty() {
+            vec![&[]]
         } else {
-            (buffer.len() + usable_size - 1) / usable_size
+            buffer.chunks(SCHEMA_CHUNK).collect()
         };
-
-        while pager.num_pages() < 1 + num_pages_needed as u64 {
-            pager.allocate_page()?;
+        while pages.len() < chunks.len() {
+            pages.push(pager.allocate_page()?);
         }
 
-        for page_idx in 0..num_pages_needed {
-            let start = page_idx * usable_size;
-            let end = std::cmp::min(start + usable_size, buffer.len());
-            let chunk = &buffer[start..end];
-
+        for (i, chunk) in chunks.iter().enumerate() {
+            let next = pages
+                .get(i + 1)
+                .filter(|_| i + 1 < chunks.len())
+                .copied()
+                .unwrap_or(0);
             let mut page = crate::storage::Page::new();
-            let chunk_len = chunk.len() as u32;
-            page.data_mut()[0..4].copy_from_slice(&chunk_len.to_le_bytes());
-            page.data_mut()[4..4 + chunk.len()].copy_from_slice(chunk);
-
-            let schema_page_id = 1 + page_idx as u64;
-            pager.write_page(schema_page_id, &page)?;
+            let data = page.data_mut();
+            data[0..4].copy_from_slice(&(chunk.len() as u32 | SCHEMA_LINKED).to_le_bytes());
+            data[4..12].copy_from_slice(&next.to_le_bytes());
+            data[SCHEMA_PAGE_HEADER..SCHEMA_PAGE_HEADER + chunk.len()].copy_from_slice(chunk);
+            pager.write_page(pages[i], &page)?;
         }
+        // Overflow pages no longer needed are leaked (there is no free list).
 
         Ok(())
+    }
+
+    /// Reads the serialized schema from its page chain (either format).
+    fn read_schema_buffer(&self) -> Result<Vec<u8>> {
+        let mut pager = self.pager.write();
+        if pager.num_pages() <= SCHEMA_HEAD_PAGE {
+            return Ok(Vec::new());
+        }
+        let head = pager.read_page(SCHEMA_HEAD_PAGE)?.read().data().to_vec();
+        let raw_len = u32::from_le_bytes(head[0..4].try_into().unwrap());
+        let mut out = Vec::new();
+
+        if raw_len & SCHEMA_LINKED == 0 {
+            // Legacy format (before 0.4): `[len: u32][chunk]` on consecutive
+            // pages from page 1, ending at the first short chunk. Those
+            // pages past page 1 may since have been reused by B-trees, so
+            // only the data is read; a later save rewrites it as a chain.
+            let mut page_id = SCHEMA_HEAD_PAGE;
+            let mut data = head;
+            loop {
+                let len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                let len = len.min(PAGE_SIZE - 4);
+                out.extend_from_slice(&data[4..4 + len]);
+                page_id += 1;
+                if len < PAGE_SIZE - 4 || page_id >= pager.num_pages() {
+                    return Ok(out);
+                }
+                data = pager.read_page(page_id)?.read().data().to_vec();
+            }
+        }
+
+        for page_id in schema_chain(&mut pager)? {
+            let data = pager.read_page(page_id)?.read().data().to_vec();
+            let len =
+                (u32::from_le_bytes(data[0..4].try_into().unwrap()) & !SCHEMA_LINKED) as usize;
+            if len > SCHEMA_CHUNK {
+                return Err(VelociError::Corruption(format!(
+                    "Schema page {} has invalid length {}",
+                    page_id, len
+                )));
+            }
+            out.extend_from_slice(&data[SCHEMA_PAGE_HEADER..SCHEMA_PAGE_HEADER + len]);
+        }
+        Ok(out)
     }
 
     fn get_or_create_executor(&self) -> Arc<Executor> {
@@ -924,6 +997,7 @@ impl Database {
         let exec = Arc::new(Executor::new(
             Arc::clone(&self.pager),
             Arc::clone(&self.btrees),
+            Arc::clone(&self.indexes),
             Arc::clone(&self.schema),
             Arc::clone(&self.transaction_manager),
             Arc::clone(&self.cdc),
@@ -977,6 +1051,8 @@ impl Database {
             Statement::CreateTable { .. }
                 | Statement::DropTable { .. }
                 | Statement::AlterTable { .. }
+                | Statement::CreateIndex { .. }
+                | Statement::DropIndex { .. }
         );
 
         // Capture root pages before the statement so we can detect any
@@ -1032,11 +1108,14 @@ impl Database {
         }
     }
 
-    fn snapshot_roots(&self) -> HashMap<String, PageId> {
-        let btrees = self.btrees.read();
-        let mut out = HashMap::with_capacity(btrees.len());
-        for (name, bt) in btrees.iter() {
-            out.insert(name.clone(), bt.read().root_page());
+    /// Root page of every table (`false`, name) and index (`true`, name).
+    fn snapshot_roots(&self) -> HashMap<(bool, String), PageId> {
+        let mut out = HashMap::new();
+        for (name, bt) in self.btrees.read().iter() {
+            out.insert((false, name.clone()), bt.read().root_page());
+        }
+        for (name, bt) in self.indexes.read().iter() {
+            out.insert((true, name.clone()), bt.read().root_page());
         }
         out
     }
@@ -1237,6 +1316,7 @@ impl Database {
     }
 
     /// Returns a human-readable `CREATE TABLE` statement for the named table,
+    /// followed by a `CREATE INDEX` statement per index (`;`-separated),
     /// suitable for display in `.schema`-style REPL commands.
     pub fn describe_table(&self, name: &str) -> Result<String> {
         let schema = self.schema.read();
@@ -1266,6 +1346,12 @@ impl Database {
             }
         }
         out.push(')');
+        for index in &table.indexes {
+            out.push_str(&format!(
+                ";\nCREATE INDEX {} ON {} ({})",
+                index.name, table.name, index.column
+            ));
+        }
         Ok(out)
     }
 }
@@ -1277,12 +1363,93 @@ impl Drop for Database {
     }
 }
 
+/// The schema chain starts at page 1 (page 0 is reserved).
+const SCHEMA_HEAD_PAGE: PageId = 1;
+/// Flag in a schema page's length word marking the linked format:
+/// `[len | SCHEMA_LINKED: u32][next_page: u64][chunk]`, `next_page` 0 at the
+/// end. Legacy pages (`[len: u32][chunk]`, consecutive) never set it.
+const SCHEMA_LINKED: u32 = 0x8000_0000;
+const SCHEMA_PAGE_HEADER: usize = 12;
+const SCHEMA_CHUNK: usize = PAGE_SIZE - SCHEMA_PAGE_HEADER;
+
+/// Pages of a linked-format schema chain, head first. Empty for a legacy or
+/// blank head page (which owns no overflow pages).
+fn schema_chain(pager: &mut Pager) -> Result<Vec<PageId>> {
+    let mut chain = Vec::new();
+    let mut page_id = SCHEMA_HEAD_PAGE;
+    while page_id != 0 {
+        if page_id >= pager.num_pages() || chain.len() as u64 > pager.num_pages() {
+            return Err(VelociError::Corruption(format!(
+                "Schema chain points at invalid page {}",
+                page_id
+            )));
+        }
+        let arc = pager.read_page(page_id)?;
+        let page = arc.read();
+        let data = page.data();
+        if u32::from_le_bytes(data[0..4].try_into().unwrap()) & SCHEMA_LINKED == 0 {
+            if chain.is_empty() {
+                return Ok(chain);
+            }
+            return Err(VelociError::Corruption(format!(
+                "Schema chain page {} is not a schema page",
+                page_id
+            )));
+        }
+        chain.push(page_id);
+        page_id = u64::from_le_bytes(data[4..12].try_into().unwrap());
+    }
+    Ok(chain)
+}
+
+/// Marks the index section that follows the tables in the schema buffer.
+const INDEX_SECTION_MAGIC: &[u8] = b"VDBIDX01";
+
+/// Bounds-checked little-endian reader over the schema buffer.
+struct SchemaReader<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl SchemaReader<'_> {
+    fn bytes(&mut self, n: usize, what: &str) -> Result<&[u8]> {
+        let bytes = self
+            .data
+            .get(self.offset..self.offset + n)
+            .ok_or_else(|| VelociError::Corruption(format!("Schema truncated at {}", what)))?;
+        self.offset += n;
+        Ok(bytes)
+    }
+
+    fn u32(&mut self, what: &str) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.bytes(4, what)?.try_into().unwrap()))
+    }
+
+    fn u64(&mut self, what: &str) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.bytes(8, what)?.try_into().unwrap()))
+    }
+
+    fn string(&mut self, what: &str) -> Result<String> {
+        let len = self.u32(what)? as usize;
+        String::from_utf8(self.bytes(len, what)?.to_vec())
+            .map_err(|_| VelociError::Corruption(format!("Invalid UTF-8 in {}", what)))
+    }
+}
+
 // Schema management
 #[derive(Debug, Clone)]
 pub struct TableSchema {
     pub name: String,
     pub columns: Vec<crate::types::Column>,
     pub root_page: PageId,
+    /// Secondary indexes on this table's columns.
+    pub indexes: Vec<crate::index::IndexSchema>,
+}
+
+impl TableSchema {
+    pub fn index_on(&self, column: &str) -> Option<&crate::index::IndexSchema> {
+        self.indexes.iter().find(|i| i.column == column)
+    }
 }
 
 pub struct Schema {
@@ -1334,6 +1501,13 @@ impl Schema {
 
     pub fn list_tables(&self) -> Vec<String> {
         self.tables.keys().cloned().collect()
+    }
+
+    /// The table that owns index `name`, if any.
+    pub fn table_of_index(&self, name: &str) -> Option<&TableSchema> {
+        self.tables
+            .values()
+            .find(|t| t.indexes.iter().any(|i| i.name == name))
     }
 }
 

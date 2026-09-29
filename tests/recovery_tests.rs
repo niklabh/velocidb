@@ -412,3 +412,154 @@ fn test_repeated_crashes_between_commits() {
     let db = open_db(&path);
     assert_eq!(ids(&db), (0..100).collect::<Vec<_>>());
 }
+
+/// Regression for B-tree delete bugs: random deletes over rows with ~40-byte
+/// text failed after ~165 statements, and inserts after the tree shrank
+/// could lose rows. Deletes and reinserts, then checks every row after a
+/// reopen.
+#[test]
+fn test_random_deletes_and_reinserts_survive_reopen() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    let mut keys: Vec<i64> = (0..600).collect();
+    let mut state = 12345u64;
+    for i in (1..keys.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        keys.swap(i, (state % (i as u64 + 1)) as usize);
+    }
+    {
+        let db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)")
+            .unwrap();
+        db.begin().unwrap();
+        for k in 0..600 {
+            db.execute(&format!(
+                "INSERT INTO t VALUES ({}, '{}')",
+                k,
+                "x".repeat(40)
+            ))
+            .unwrap();
+        }
+        // Delete two thirds in random order, then reinsert half of those.
+        for &k in &keys[..400] {
+            db.execute(&format!("DELETE FROM t WHERE id = {}", k))
+                .unwrap();
+        }
+        for &k in &keys[..200] {
+            db.execute(&format!("INSERT INTO t VALUES ({}, 'back')", k))
+                .unwrap();
+        }
+        db.commit().unwrap();
+        db.close().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let rows = db.query("SELECT * FROM t ORDER BY id").unwrap().rows;
+    let mut expected: Vec<(i64, String)> = keys[..200]
+        .iter()
+        .map(|&k| (k, "back".to_string()))
+        .chain(keys[400..].iter().map(|&k| (k, "x".repeat(40))))
+        .collect();
+    expected.sort();
+    let actual: Vec<(i64, String)> = rows
+        .iter()
+        .map(|r| match (&r.values[0], &r.values[1]) {
+            (Value::Integer(k), Value::Text(s)) => (*k, s.clone()),
+            other => panic!("unexpected row {:?}", other),
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+/// Regression: schema pages were written to consecutive pages from page 1,
+/// so a schema larger than one page overwrote B-tree pages allocated after
+/// it; with 150 tables the first tables were unreadable after reopen.
+#[test]
+fn test_large_schema_does_not_overwrite_tables() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    {
+        let db = Database::open(&path).unwrap();
+        for t in 0..150 {
+            db.execute(&format!(
+                "CREATE TABLE table_{} (id INTEGER PRIMARY KEY, name TEXT, email TEXT, age INTEGER)",
+                t
+            ))
+            .unwrap();
+            db.execute(&format!(
+                "INSERT INTO table_{} VALUES ({}, 'n', 'e', 3)",
+                t, t
+            ))
+            .unwrap();
+        }
+        // Shrink and regrow the schema across page boundaries.
+        for t in 100..150 {
+            db.execute(&format!("DROP TABLE table_{}", t)).unwrap();
+        }
+        for t in 100..150 {
+            db.execute(&format!(
+                "CREATE TABLE table_{} (id INTEGER PRIMARY KEY)",
+                t
+            ))
+            .unwrap();
+            db.execute(&format!("INSERT INTO table_{} VALUES ({})", t, t))
+                .unwrap();
+        }
+        db.close().unwrap();
+    }
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.list_tables().len(), 150);
+    for t in 0..150 {
+        let rows = db
+            .query(&format!("SELECT id FROM table_{}", t))
+            .unwrap_or_else(|e| panic!("table_{}: {}", t, e))
+            .rows;
+        assert_eq!(rows.len(), 1, "table_{}", t);
+        assert_eq!(rows[0].values[0], Value::Integer(t), "table_{}", t);
+    }
+}
+
+/// A file written by 0.3 (legacy consecutive schema pages) opens, and the
+/// next schema change rewrites the schema as a linked chain.
+#[test]
+fn test_legacy_schema_format_opens_and_upgrades() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/legacy_schema_v0_3.db"
+        ),
+        &path,
+    )
+    .unwrap();
+
+    let check = |db: &Database| {
+        let users = db.query("SELECT * FROM users ORDER BY id").unwrap();
+        assert_eq!(users.rows.len(), 2);
+        assert_eq!(users.rows[0].values[1], Value::Text("Alice".into()));
+        assert_eq!(users.rows[1].values[2], Value::Null);
+        assert!(users.columns[1].not_null && users.columns[2].unique);
+        let docs = db.query("SELECT * FROM docs").unwrap();
+        assert_eq!(docs.rows[0].values[1], Value::Vector(vec![0.5, 1.5]));
+        assert!(db.describe_table("docs").unwrap().contains("F32_BLOB(2)"));
+    };
+    {
+        let db = Database::open(&path).unwrap();
+        check(&db);
+        db.execute("CREATE INDEX users_name ON users (name)")
+            .unwrap();
+        db.execute("CREATE TABLE extra (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        db.close().unwrap();
+    }
+    let db = Database::open(&path).unwrap();
+    check(&db);
+    assert_eq!(db.list_tables().len(), 3);
+    let alice = db
+        .query("SELECT id FROM users WHERE name = 'Alice'")
+        .unwrap();
+    assert_eq!(alice.rows[0].values[0], Value::Integer(1));
+}

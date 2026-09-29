@@ -156,8 +156,13 @@ Storage and durability
 
 Indexing
 
-- B-tree primary key index with full split + merge + redistribute paths for
-  both leaf and internal nodes (proptest covers random insert/delete sequences).
+- B-tree primary key index; inserts split and deletes merge / rebalance
+  along the root-to-leaf path. Property tests check the tree's invariants
+  over random insert/delete sequences with mixed row sizes.
+- Secondary indexes: `CREATE INDEX name ON t (col)` builds a single-column
+  equality index, maintained on every INSERT / UPDATE / DELETE and used for
+  `WHERE col = value` and `UNIQUE` checks (~500× faster than a scan for a
+  unique lookup in 20k rows, see [docs/performance.md](docs/performance.md)).
 
 SQL surface
 
@@ -165,6 +170,7 @@ SQL surface
   columns; `PRIMARY KEY`, `NOT NULL`, `UNIQUE` constraints — `UNIQUE` is
   enforced on INSERT and UPDATE, NULLs never conflict)
 - `DROP TABLE`
+- `CREATE INDEX [IF NOT EXISTS] name ON t (col)` / `DROP INDEX [IF EXISTS] name`
 - `ALTER TABLE t RENAME TO new | RENAME COLUMN a TO b | ADD COLUMN c type
   | DROP COLUMN c`
 - `INSERT INTO ... VALUES (...)` with optional explicit column list;
@@ -213,15 +219,19 @@ Concurrency
   database-wide: statements from any thread join it, and concurrent readers
   see its uncommitted writes (no isolation between threads). Its dirty pages
   are held in memory until COMMIT.
-- **`UNIQUE` checks scan the table.** Without secondary indexes, inserting
-  into or updating a `UNIQUE` column is O(rows).
+- **`UNIQUE` checks scan the table unless the column is indexed.** INSERT
+  uses an index on the column when there is one; UPDATE of a `UNIQUE`
+  column always scans.
 - **Auto-commit writes are fsync-bound.** Each commit does one full fsync
   (a few hundred commits per second on macOS). Batch writes in
   `BEGIN` … `COMMIT` — see [docs/performance.md](docs/performance.md).
-- **Only primary-key equality uses the index.** `WHERE pk = <integer>` is a
-  B-tree lookup; every other `WHERE` scans the table (no secondary indexes).
-- **No `JOIN`, `GROUP BY`, sub-queries**, no indexes other than the primary
-  key.
+- **Indexes answer equality only.** `WHERE pk = <integer>` and
+  `WHERE <indexed col> = <value>` are lookups; ranges (`<`, `>`, `LIKE`) and
+  unindexed columns scan the table. Indexes are single-column and
+  non-unique; `CREATE UNIQUE INDEX` is not supported (declare the column
+  `UNIQUE`).
+- **No `JOIN`, `GROUP BY`, sub-queries, `OR` in `WHERE`.** Unsupported
+  syntax is a parse error, never silently reinterpreted.
 - **Single primary key column.** Composite primary keys are not supported.
 - **Vector search is exact.** Every query scans all candidate rows
   (in parallel). Approximate indexing (HNSW/DiskANN-style) is future work,

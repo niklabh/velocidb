@@ -13,6 +13,7 @@ use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use tracing::{error, info, Level};
 
+use velocidb::parser::{has_complete_statement, split_statements};
 use velocidb::Database;
 
 /// Returns true to continue the REPL, false to exit.
@@ -56,8 +57,13 @@ fn process_command(db: &Database, input: &str) -> Result<bool> {
     }
 
     // Execute one or more SQL statements separated by `;`.
-    for statement in split_statements(trimmed) {
-        run_sql(db, &statement);
+    match split_statements(trimmed) {
+        Ok(statements) => {
+            for statement in statements {
+                run_sql(db, statement);
+            }
+        }
+        Err(e) => println!("Error: {}", e),
     }
 
     Ok(true)
@@ -150,62 +156,6 @@ fn handle_meta_command(db: &Database, cmd: &str) -> Result<bool> {
             Ok(true)
         }
     }
-}
-
-/// Splits a buffer on top-level `;` boundaries, respecting single/double quoted
-/// string literals. Empty statements are skipped.
-fn split_statements(buffer: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut in_string = false;
-    let mut quote = '\'';
-
-    for ch in buffer.chars() {
-        if in_string {
-            current.push(ch);
-            if ch == quote {
-                in_string = false;
-            }
-        } else if ch == '\'' || ch == '"' {
-            in_string = true;
-            quote = ch;
-            current.push(ch);
-        } else if ch == ';' {
-            let s = current.trim().to_string();
-            if !s.is_empty() {
-                out.push(s);
-            }
-            current.clear();
-        } else {
-            current.push(ch);
-        }
-    }
-
-    let s = current.trim().to_string();
-    if !s.is_empty() {
-        out.push(s);
-    }
-    out
-}
-
-/// Returns true if the buffered text contains at least one complete statement
-/// (a `;` outside of a quoted string).
-fn has_complete_statement(buffer: &str) -> bool {
-    let mut in_string = false;
-    let mut quote = '\'';
-    for ch in buffer.chars() {
-        if in_string {
-            if ch == quote {
-                in_string = false;
-            }
-        } else if ch == '\'' || ch == '"' {
-            in_string = true;
-            quote = ch;
-        } else if ch == ';' {
-            return true;
-        }
-    }
-    false
 }
 
 fn run_sql(db: &Database, sql: &str) {

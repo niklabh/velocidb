@@ -126,23 +126,57 @@ Lock ordering and the full commit protocol are documented in
 
 ## B-tree
 
-Each table is a B-tree keyed by its single `INTEGER PRIMARY KEY`
-(`BTREE_ORDER = 64` keys per node). Leaves hold serialized rows; internal
-nodes hold separator keys and child page ids. Inserts split leaves and
-internal nodes; deletes merge or redistribute on underflow and collapse the
-root when it empties. A proptest checks the invariants over random
-insert/delete sequences.
+Each table is a B-tree keyed by its single `INTEGER PRIMARY KEY`. Leaves
+hold serialized rows and are sized in bytes (a leaf is full when its cells
+fill the 4 KB page); internal nodes hold up to `BTREE_ORDER = 64` separator
+keys and child page ids.
 
-A `WHERE` containing `<pk> = <integer>` is answered by `BTree::search`
-(`candidate_rows` in `src/executor.rs`) for SELECT, UPDATE and DELETE; the
-full clause is still evaluated on the result. There are no secondary
-indexes: any other `WHERE` scans the table, and `UNIQUE` on a non-key column
-is checked by a scan.
+Insert and delete record the root-to-leaf path while descending and fix
+the tree along that path: inserts split upward, deletes merge or rebalance
+an underfull node with its sibling (leaves when under a quarter full,
+internal nodes under `MIN_KEYS = 32` keys) and collapse a single-child root.
+The `parent` field in node headers is not read (files from older versions
+may hold stale values there). `BTree::range` scans a key interval, visiting
+only overlapping subtrees. Property tests check structural invariants
+(`check_invariants`) over random insert/delete sequences with row sizes
+from a few bytes to 1.5 KB.
+
+## Secondary indexes
+
+`CREATE INDEX name ON t (col)` builds a B-tree (`src/index.rs`) whose keys
+are `(hash32(value) << 32) | (pk as u32)` and whose rows hold the pk. All
+entries for one value hash form a contiguous key range, so an equality
+probe is one `BTree::range`. The hash (FNV-1a, stable across releases) is
+over the value's `=` equivalence class: numbers by their `f64` value (so
+`1` and `1.0` match, as `=` does) and text by its bytes. NULL, blobs and
+vectors never satisfy `=` and get no entry. The pk in the low bits makes
+each entry directly addressable for maintenance; two pks with equal low 32
+bits in one bucket take the next free slot, and lookups fall back to
+scanning the bucket.
+
+The executor maintains every index of a table on INSERT, UPDATE (only when
+the indexed value or the pk changes) and DELETE, inside the statement's
+write group, so rollback, savepoints and crash recovery cover indexes with
+no extra machinery. Lock order is table B-tree, then index B-trees; index
+handles are cloned out of the `indexes` map before any B-tree lock is
+taken.
+
+`candidate_rows` picks the access path for SELECT, UPDATE and DELETE:
+`<pk> = <integer>` is a `BTree::search`; otherwise the first
+`<indexed col> = <value>` condition is probed and each matching pk looked
+up; otherwise the table is scanned. The full `WHERE` is always evaluated on
+the candidates, so hash collisions cost time, never correctness. INSERT
+checks `UNIQUE` through an index on the column when one exists.
+
+Index metadata lives in `TableSchema::indexes` and is persisted in a
+trailing section of the schema pages (see the storage-format skill); files
+from older versions have no section and open with no indexes.
 
 ## SQL
 
-`src/parser.rs` is a regex- and string-splitting parser (a real lexer/parser
-is roadmap item P1). It produces a `Statement` enum:
+`src/parser.rs` is a recursive-descent parser over the tokens produced by
+`src/parser/lexer.rs` (tokens carry byte spans into the source). It produces
+a `Statement` enum:
 
 - DDL: `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE` (rename table, rename /
   add / drop column)
@@ -151,6 +185,13 @@ is roadmap item P1). It produces a `Statement` enum:
   `WHERE` with comparison operators and `LIKE` joined by `AND`;
   `ORDER BY` a column or distance expression; `LIMIT`
 - `BEGIN` / `COMMIT` / `ROLLBACK`
+
+Identifiers may be quoted as `"name"`, `` `name` `` or `[name]`. String
+literals use `'...'` (`''` or `\'` for a quote). Anything the grammar does not
+cover — `OR`, parenthesized conditions, `AS`, multi-row `VALUES`, unknown
+column constraints such as `DEFAULT` — is a parse error rather than being
+misread. The grammar is documented on `Parser` in `src/parser.rs`, and
+`tests/parser_golden.rs` pins the AST for ~180 statements.
 
 Constraints: `PRIMARY KEY` (required, single integer column), `NOT NULL`,
 `UNIQUE` (NULLs never conflict), and vector dimension checks.
@@ -184,5 +225,5 @@ pool via `spawn_blocking`, so the reactor never blocks on disk I/O.
 ## Known limitations
 
 See the README's *Limitations* section and [ROADMAP.md](../ROADMAP.md) for
-the prioritized list (single writer, no JOIN / GROUP BY / secondary indexes,
+the prioritized list (single writer, no JOIN / GROUP BY, equality-only indexes,
 exact-only vector search, in-memory CDC).

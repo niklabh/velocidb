@@ -46,6 +46,7 @@
 pub mod btree;
 pub mod cdc;
 pub mod executor;
+pub mod index; // Secondary (single-column equality) indexes
 pub mod parser;
 pub mod storage;
 pub mod transaction;

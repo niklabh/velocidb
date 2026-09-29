@@ -4,6 +4,92 @@ All notable changes to VelociDB are documented in this file.
 
 ## [Unreleased]
 
+### Added (P1 secondary indexes)
+
+- **`CREATE INDEX [IF NOT EXISTS] name ON t (col)` / `DROP INDEX [IF
+  EXISTS] name`.** Single-column equality indexes (`src/index.rs`), built
+  from existing rows and maintained by INSERT / UPDATE / DELETE inside the
+  statement's write group (rollback and crash recovery included).
+  `WHERE col = value` on an indexed column is answered by an index probe
+  for SELECT, UPDATE and DELETE; INSERT checks `UNIQUE` through an index on
+  the column. A unique lookup in 20k rows drops from ~1.2 ms to ~2 µs.
+- Indexes are persisted in a new trailing section of the schema pages;
+  older files open with no indexes. `.schema` / `describe_table` list them.
+  An indexed column cannot be dropped; renaming the column or table keeps
+  the index; `DROP TABLE` drops its indexes.
+- A differential property test runs random writes against an indexed and
+  an unindexed table and requires identical results, before and after a
+  reopen.
+
+### Fixed (schema data loss)
+
+- **A schema larger than one page overwrote table data.** Schema pages
+  were written to consecutive pages from page 1, so once the schema
+  outgrew 4 KB (e.g. ~100 tables) saving it overwrote the B-tree pages
+  after page 1; with 150 tables the first tables were unreadable after a
+  reopen. The schema is now a linked page chain (head at page 1, overflow
+  pages allocated like any other page). Files in the old format still
+  open and are converted on the next schema change; data already
+  overwritten cannot be recovered.
+
+### Fixed (B-tree data loss)
+
+- **Deletes failed on ordinary tables.** Leaf underflow was decided by key
+  count while leaves fill by bytes, so with rows of a few dozen bytes
+  random deletes soon failed with "Cannot merge: target page full" or
+  "Parent-child link corruption" (a 600-row table with 40-character text
+  failed after ~165 deletes), leaving the row undeletable.
+- **Inserts could lose rows after the tree shrank.** When a delete
+  collapsed the root, the new root kept a stale parent pointer; a later
+  split of that node linked the new sibling into the dead page, making its
+  rows unreachable.
+- Insert and delete now navigate by the root-to-leaf path recorded while
+  descending and never read the on-disk `parent` field, so existing files
+  with stale parent pointers are handled correctly. Leaves split, merge and
+  rebalance by bytes; a row larger than a page is rejected ("Row too
+  large") instead of corrupting the leaf.
+- New `BTree::range(lo, hi)` scan. Property tests now check structural
+  invariants (key order, separator bounds, uniform depth, node sizes) over
+  random insert/delete sequences with row sizes up to 1.5 KB.
+
+### Changed (P1 parser)
+
+- **The regex parser is replaced by a lexer and recursive-descent parser**
+  (`src/parser.rs`, `src/parser/lexer.rs`). The `Statement` AST is
+  unchanged. `tests/parser_golden.rs` pins the parse of ~180 statements;
+  every difference from the old parser is one of the fixes below.
+- Fixed silent mis-parses:
+  - `WHERE a = 1 OR b = 2` compared `a` with the text `'1 OR b = 2'`, and
+    `WHERE (a = 1)` compared with `'1)'`. Both are now parse errors
+    (`OR` / parentheses are not supported yet).
+  - A trailing `;` on `UPDATE` / `DELETE` became part of the last value
+    (`DELETE FROM t WHERE id = 2;` deleted nothing).
+  - `UPDATE ... SET` values containing `,` or `=` (`'a, b'`), or
+    `vector32(...)`, were rejected.
+  - Multi-line `CREATE TABLE`, `BEGIN;` / `COMMIT;` / `ROLLBACK;` and
+    `f32_blob( 4 )` (spaces) failed or mis-typed the column.
+- **Stricter input.** Bare words as values (`WHERE name = Alice`) used to
+  become text; they are now an error, since they read as column
+  references. Unknown column constraints (`DEFAULT`, `AUTOINCREMENT`, ...)
+  and anything after the end of a statement are errors instead of being
+  ignored. Parse errors report the position of the offending token.
+- **REPL statement splitting uses the lexer** (`parser::split_statements`,
+  `parser::has_complete_statement`). A `;` inside `'it\'s; ok'`, a backtick
+  identifier or a `--` comment no longer splits a statement, and a string
+  left open across lines keeps the REPL reading.
+- `LIKE` wildcards (`%`, `_`) now match newlines.
+- `WHERE x='a'` (a column named `x` right before a string) is no longer
+  lexed as a blob literal; `X'..'` is a blob only where a value can start.
+- Property tests (`tests/parser_proptest.rs`) render random ASTs to SQL
+  with random whitespace, comments, case and quoting and check they parse
+  back identically, check statement splitting the same way, and feed
+  arbitrary input to the lexer and parser.
+- New: `''` escapes a quote in strings (`'it''s'`; `\'` still works),
+  `--` comments, `==`, lowercase `like`, `END [TRANSACTION]`, type
+  arguments such as `VARCHAR(255)` / `DECIMAL(10, 2)`, and quoted
+  identifiers (`"x"`, `` `x` ``, `[x]`) for table and column names in every
+  statement.
+
 ### Fixed (P0 correctness)
 
 - **Recovery could strand later commits.** If the WAL contained only a torn

@@ -453,3 +453,33 @@ fn test_primary_key_point_lookups() {
         .rows
         .is_empty());
 }
+
+/// Statements the regex parser mis-parsed silently; the tokenizer-based
+/// parser must either run them correctly or reject them.
+#[test]
+fn test_parser_edge_cases_end_to_end() {
+    let db = TestDb::new();
+    db.execute("CREATE TABLE t (\n    id INTEGER PRIMARY KEY,\n    name TEXT\n);");
+    db.execute("INSERT INTO t VALUES (1, 'it''s, fine');");
+    db.execute("INSERT INTO t VALUES (2, 'b')");
+
+    // Commas and '=' inside a SET value; trailing semicolons.
+    db.execute("UPDATE t SET name = 'a=b, c' WHERE id = 2;");
+    let r = db.query("SELECT name FROM t WHERE id = 2;");
+    assert_eq!(r.rows[0].values[0], Value::Text("a=b, c".to_string()));
+
+    let r = db.query("SELECT name FROM t WHERE id = 1");
+    assert_eq!(r.rows[0].values[0], Value::Text("it's, fine".to_string()));
+
+    // Used to delete nothing: the value parsed as the text "2;".
+    db.execute("DELETE FROM t WHERE id = 2;");
+    assert_eq!(db.query("SELECT * FROM t").rows.len(), 1);
+
+    // Used to compare `id` against the text "1 OR id = 2".
+    assert!(db
+        .db
+        .query("SELECT * FROM t WHERE id = 1 OR id = 2")
+        .is_err());
+    // Used to compare `name` against the text "fine".
+    assert!(db.db.query("SELECT * FROM t WHERE name = fine").is_err());
+}

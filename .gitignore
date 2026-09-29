@@ -7,6 +7,8 @@ Cargo.lock
 *.db
 *.db-wal
 *.db-shm
+# ...except checked-in format fixtures
+!tests/fixtures/*.db
 
 # IDE
 .vscode/
