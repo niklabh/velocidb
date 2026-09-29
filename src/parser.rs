@@ -20,6 +20,18 @@ pub enum Statement {
     DropTable {
         name: String,
     },
+    /// `CREATE INDEX [IF NOT EXISTS] name ON table (column)`
+    CreateIndex {
+        name: String,
+        table: String,
+        column: String,
+        if_not_exists: bool,
+    },
+    /// `DROP INDEX [IF EXISTS] name`
+    DropIndex {
+        name: String,
+        if_exists: bool,
+    },
     AlterTable {
         table: String,
         action: AlterAction,
@@ -238,6 +250,8 @@ pub fn has_complete_statement(sql: &str) -> bool {
 ///     coldef   := ident type [PRIMARY KEY | NOT NULL | NULL | UNIQUE]*
 ///     type     := word [ ( number [, number] ) ]
 /// DROP TABLE name
+/// CREATE INDEX [IF NOT EXISTS] name ON name ( ident )
+/// DROP INDEX [IF EXISTS] name
 /// ALTER TABLE name RENAME TO name
 ///                | RENAME [COLUMN] ident TO ident
 ///                | ADD [COLUMN] coldef
@@ -483,7 +497,9 @@ impl<'a> Cursor<'a> {
             return Err(self.error("Expected a SQL statement"));
         };
         match first.to_ascii_uppercase().as_str() {
-            "CREATE" => self.create_table(),
+            "CREATE" if self.is_keyword_at(1, "TABLE") => self.create_table(),
+            "CREATE" => self.create_index(),
+            "DROP" if self.is_keyword_at(1, "INDEX") => self.drop_index(),
             "DROP" => self.drop_table(),
             "ALTER" => self.alter_table(),
             "INSERT" => self.insert(),
@@ -572,6 +588,50 @@ impl<'a> Cursor<'a> {
             spelled = format!("{}({})", spelled, args.join(","));
         }
         Ok(DataType::from_str(&spelled))
+    }
+
+    fn create_index(&mut self) -> Result<Statement> {
+        self.expect_keyword("CREATE")?;
+        if self.is_keyword("UNIQUE") {
+            return Err(
+                self.error("UNIQUE indexes are not supported; declare the column UNIQUE instead")
+            );
+        }
+        self.expect_keyword("INDEX")?;
+        let if_not_exists = self.eat_keyword("IF");
+        if if_not_exists {
+            self.expect_keyword("NOT")?;
+            self.expect_keyword("EXISTS")?;
+        }
+        let name = self.identifier("index name")?;
+        self.expect_keyword("ON")?;
+        let table = self.identifier("table name")?;
+        self.expect(&TokenKind::LParen, "'(' after table name")?;
+        let column = self.identifier("column name")?;
+        if self.peek_kind() == Some(&TokenKind::Comma) {
+            return Err(self.error("Multi-column indexes are not supported"));
+        }
+        if self.is_keyword("ASC") || self.is_keyword("DESC") {
+            return Err(self.error("Index sort order is not supported"));
+        }
+        self.expect(&TokenKind::RParen, "')' after index column")?;
+        Ok(Statement::CreateIndex {
+            name,
+            table,
+            column,
+            if_not_exists,
+        })
+    }
+
+    fn drop_index(&mut self) -> Result<Statement> {
+        self.expect_keyword("DROP")?;
+        self.expect_keyword("INDEX")?;
+        let if_exists = self.eat_keyword("IF");
+        if if_exists {
+            self.expect_keyword("EXISTS")?;
+        }
+        let name = self.identifier("index name")?;
+        Ok(Statement::DropIndex { name, if_exists })
     }
 
     fn drop_table(&mut self) -> Result<Statement> {

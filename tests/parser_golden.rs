@@ -193,6 +193,20 @@ const CASES: &[&str] = &[
     "END",
     "END TRANSACTION",
     "BEGIN IMMEDIATE",
+    // --- Indexes ---
+    "CREATE INDEX idx_city ON users (city)",
+    "create index if not exists i on t(c);",
+    "CREATE INDEX \"my idx\" ON [my table] (`my col`)",
+    "DROP INDEX idx_city",
+    "drop index if exists i;",
+    "CREATE UNIQUE INDEX i ON t (c)",
+    "CREATE INDEX i ON t (a, b)",
+    "CREATE INDEX i ON t (a DESC)",
+    "CREATE INDEX i ON t",
+    "CREATE INDEX ON t (a)",
+    "CREATE INDEX IF EXISTS i ON t (a)",
+    "DROP INDEX",
+    "DROP INDEX IF NOT EXISTS i",
 ];
 
 /// Renders a parse result as one deterministic line. `UPDATE` assignments

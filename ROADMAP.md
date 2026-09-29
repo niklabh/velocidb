@@ -39,8 +39,9 @@ Unblock almost every later SQL and concurrency feature.
       (`tests/parser_golden.rs`)
 - [ ] **Typed expression AST** — stop carrying distance calls / predicates as
       opaque strings
-- [ ] **Secondary indexes** — `CREATE INDEX` / `DROP INDEX` on one column;
-      maintain on write; equality probe in the executor (range scans later)
+- [x] **Secondary indexes** — `CREATE INDEX` / `DROP INDEX` on one column;
+      maintain on write; equality probe in the executor (range scans later:
+      the hash-keyed format answers equality only)
 - [x] **Parser fuzzing** (and/or property tests) for statement splitting and
       value parsing (`tests/parser_proptest.rs`: AST → SQL → AST round-trip,
       split round-trip, no panics on arbitrary input)
@@ -149,7 +150,7 @@ CHANGELOG.
 2. ~~Multi-statement WAL groups + real `ROLLBACK`~~ (done)
 3. ~~Primary-key point lookups + fewer fsyncs per commit~~ (done)
 4. ~~Lexer / parser + golden tests~~ (done)
-5. Secondary indexes + equality probe
+5. ~~Secondary indexes + equality probe~~ (done)
 6. `OR` → `INNER JOIN` → `GROUP BY` aggregates
 7. Durable CDC + approximate vector index
 8. Graduate or archive experimental modules

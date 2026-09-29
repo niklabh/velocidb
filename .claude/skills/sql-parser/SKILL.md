@@ -48,7 +48,8 @@ description: Extending VelociDB's SQL parser in src/parser.rs - the lexer (src/p
 ## Known limitations (documented; don't accidentally regress)
 
 - No JOIN, GROUP BY, sub-queries, OR / parentheses in WHERE, `AS`,
-  multi-row VALUES, `DEFAULT`.
+  multi-row VALUES, `DEFAULT`, `CREATE UNIQUE INDEX`, multi-column or
+  ordered (`ASC`/`DESC`) index columns.
 - Aggregates: only `COUNT(*)`.
 - WHERE compares a column with a literal only (no column-to-column).
 

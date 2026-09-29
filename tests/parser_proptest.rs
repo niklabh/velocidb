@@ -65,6 +65,8 @@ fn is_plain_ident(name: &str) -> bool {
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name))
+        // `CREATE INDEX if ...` / `DROP INDEX if ...` read IF as the keyword.
+        && !name.eq_ignore_ascii_case("IF")
 }
 
 fn ident(name: &str, s: &mut Style) -> String {
@@ -219,6 +221,30 @@ fn render_tokens(stmt: &Statement, s: &mut Style) -> Vec<String> {
         }
         Statement::DropTable { name } => {
             kw(s, &mut out, &["DROP", "TABLE"]);
+            out.push(ident(name, s));
+        }
+        Statement::CreateIndex {
+            name,
+            table,
+            column,
+            if_not_exists,
+        } => {
+            kw(s, &mut out, &["CREATE", "INDEX"]);
+            if *if_not_exists {
+                kw(s, &mut out, &["IF", "NOT", "EXISTS"]);
+            }
+            out.push(ident(name, s));
+            kw(s, &mut out, &["ON"]);
+            out.push(ident(table, s));
+            out.push("(".into());
+            out.push(ident(column, s));
+            out.push(")".into());
+        }
+        Statement::DropIndex { name, if_exists } => {
+            kw(s, &mut out, &["DROP", "INDEX"]);
+            if *if_exists {
+                kw(s, &mut out, &["IF", "EXISTS"]);
+            }
             out.push(ident(name, s));
         }
         Statement::AlterTable { table, action } => {
@@ -506,6 +532,16 @@ fn statement() -> impl Strategy<Value = Statement> {
         (name(), prop::collection::vec(column_strategy(true), 1..5))
             .prop_map(|(name, columns)| Statement::CreateTable { name, columns }),
         name().prop_map(|name| Statement::DropTable { name }),
+        (name(), name(), name(), any::<bool>()).prop_map(|(name, table, column, if_not_exists)| {
+            Statement::CreateIndex {
+                name,
+                table,
+                column,
+                if_not_exists,
+            }
+        }),
+        (name(), any::<bool>())
+            .prop_map(|(name, if_exists)| Statement::DropIndex { name, if_exists }),
         (name(), alter).prop_map(|(table, action)| Statement::AlterTable { table, action }),
         (
             name(),

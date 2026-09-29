@@ -100,12 +100,25 @@ ALTER TABLE users RENAME TO members;
 DROP TABLE members;
 ```
 
+Indexes speed up `WHERE col = value` (equality only) and are kept up to
+date by every write:
+
+```sql
+CREATE INDEX users_email ON users (email);
+SELECT * FROM users WHERE email = 'alice@example.com';   -- index lookup
+DROP INDEX users_email;
+```
+
+An indexed column cannot be dropped until its index is; renaming the
+column or table keeps the index. `.schema` in the REPL lists indexes.
+
 ## 5. Constraints
 
 - `PRIMARY KEY` — required, a single `INTEGER` column.
 - `NOT NULL`
 - `UNIQUE` — enforced on INSERT and UPDATE. Multiple NULLs are allowed.
-  Without secondary indexes the check scans the table.
+  INSERT checks through an index on the column if there is one; otherwise
+  the check scans the table.
 - Vector columns enforce their dimension.
 
 Violations return `VelociError::ConstraintViolation`.
@@ -173,5 +186,6 @@ Each call runs on tokio's blocking pool.
 ## What's not supported yet
 
 `JOIN`, `GROUP BY` / aggregates other than `COUNT(*)`, `OR` and parentheses
-in `WHERE`, subqueries, secondary indexes, composite keys, and prepared
+in `WHERE`, subqueries, range / multi-column / unique indexes, composite
+keys, and prepared
 statements. See [ROADMAP.md](../ROADMAP.md).

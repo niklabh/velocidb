@@ -4,6 +4,34 @@ All notable changes to VelociDB are documented in this file.
 
 ## [Unreleased]
 
+### Added (P1 secondary indexes)
+
+- **`CREATE INDEX [IF NOT EXISTS] name ON t (col)` / `DROP INDEX [IF
+  EXISTS] name`.** Single-column equality indexes (`src/index.rs`), built
+  from existing rows and maintained by INSERT / UPDATE / DELETE inside the
+  statement's write group (rollback and crash recovery included).
+  `WHERE col = value` on an indexed column is answered by an index probe
+  for SELECT, UPDATE and DELETE; INSERT checks `UNIQUE` through an index on
+  the column. A unique lookup in 20k rows drops from ~1.2 ms to ~2 µs.
+- Indexes are persisted in a new trailing section of the schema pages;
+  older files open with no indexes. `.schema` / `describe_table` list them.
+  An indexed column cannot be dropped; renaming the column or table keeps
+  the index; `DROP TABLE` drops its indexes.
+- A differential property test runs random writes against an indexed and
+  an unindexed table and requires identical results, before and after a
+  reopen.
+
+### Fixed (schema data loss)
+
+- **A schema larger than one page overwrote table data.** Schema pages
+  were written to consecutive pages from page 1, so once the schema
+  outgrew 4 KB (e.g. ~100 tables) saving it overwrote the B-tree pages
+  after page 1; with 150 tables the first tables were unreadable after a
+  reopen. The schema is now a linked page chain (head at page 1, overflow
+  pages allocated like any other page). Files in the old format still
+  open and are converted on the next schema change; data already
+  overwritten cannot be recovered.
+
 ### Fixed (B-tree data loss)
 
 - **Deletes failed on ordinary tables.** Leaf underflow was decided by key

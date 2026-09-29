@@ -18,7 +18,7 @@ reader, and add a reopen test in `tests/` (see `test_vector_schema_survives_reop
 ## Page allocation
 
 - Page 0: reserved root page.
-- Page 1..N: schema pages (chained; see below).
+- Page 1: head of the schema page chain; overflow pages anywhere (see below).
 - Remaining pages: B-tree nodes, one node per page.
 
 ## WAL record format (`src/wal.rs`)
@@ -71,9 +71,24 @@ persistence below.
 
 ## Schema page encoding (`save_schema` / `load_schema` in `src/storage.rs`)
 
-Schema pages start at page 1 and chain: each page is
-`[chunk_len: u32][chunk bytes]`; a chunk shorter than `PAGE_SIZE - 4` is the
-last page. The concatenated buffer is:
+The schema buffer is stored in a linked chain of pages starting at page 1:
+
+```text
+[chunk_len | 0x8000_0000: u32][next_page: u64 (0 = last)][chunk bytes]
+```
+
+`save_schema` reuses the chain's existing pages and allocates new ones as
+it grows; it never writes a page the chain does not own. `schema_chain`
+walks the chain (with cycle / bounds checks).
+
+Legacy format (0.3 and earlier, read-only): `[chunk_len: u32][chunk]` on
+*consecutive* pages from 1, ending at the first chunk shorter than
+`PAGE_SIZE - 4`; recognized by the flag bit being clear. Writing it
+overwrote B-tree pages once the schema outgrew one page, so it is never
+written again — the next schema save converts to the chain (fixture:
+`tests/fixtures/legacy_schema_v0_3.db`).
+
+The concatenated buffer is:
 
 ```text
 [num_tables: u32]
@@ -87,6 +102,26 @@ per table:
     [root_page: u64]           -- B-tree root (same for every column of a table)
 ```
 
-The schema is re-saved after any CREATE/DROP/ALTER TABLE and whenever a
+After the tables comes an optional index section (files from before
+secondary indexes end after the tables; trailing bytes without the magic
+are ignored because older versions could leave a stale page there):
+
+```text
+["VDBIDX01"][num_indexes: u32]
+per index:
+  [table_len: u32][table][name_len: u32][name][col_len: u32][col][root_page: u64]
+```
+
+
+## Secondary index B-trees (`src/index.rs`)
+
+Ordinary B-trees: key = `(value_hash(value) << 32) | (pk & 0xFFFF_FFFF)`,
+row = `[Integer(pk)]`. `value_hash` is FNV-1a over a tag byte plus the
+`f64` bits (numbers, `-0.0` → `0.0`) or UTF-8 bytes (text), folded to 32
+bits; it is persisted in keys, so **never change it** without a format
+migration (a unit test pins one value). NULL / blob / vector values have
+no entry.
+
+The schema is re-saved after any CREATE/DROP/ALTER TABLE, CREATE/DROP INDEX and whenever a
 statement changes a B-tree root page (detected by `snapshot_roots` diffing in
 `Database::execute`).

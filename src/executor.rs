@@ -7,6 +7,7 @@
 
 use crate::btree::BTree;
 use crate::cdc::{CdcManager, ChangeOp};
+use crate::index::{self, IndexSchema};
 use crate::parser::{AlterAction, Operator, OrderBy, Statement, WhereClause};
 use crate::storage::{Pager, Schema, TableSchema};
 use crate::transaction::{LockManager, LockType, Transaction, TransactionManager};
@@ -23,6 +24,8 @@ const PARALLEL_THRESHOLD: usize = 1024;
 pub struct Executor {
     pager: Arc<RwLock<Pager>>,
     btrees: Arc<RwLock<HashMap<String, Arc<RwLock<BTree>>>>>,
+    /// Secondary index B-trees, keyed by index name.
+    indexes: Arc<RwLock<HashMap<String, Arc<RwLock<BTree>>>>>,
     schema: Arc<RwLock<Schema>>,
     transaction_manager: Arc<TransactionManager>,
     lock_manager: Arc<LockManager>,
@@ -34,6 +37,7 @@ impl Executor {
     pub fn new(
         pager: Arc<RwLock<Pager>>,
         btrees: Arc<RwLock<HashMap<String, Arc<RwLock<BTree>>>>>,
+        indexes: Arc<RwLock<HashMap<String, Arc<RwLock<BTree>>>>>,
         schema: Arc<RwLock<Schema>>,
         transaction_manager: Arc<TransactionManager>,
         cdc: Arc<CdcManager>,
@@ -41,6 +45,7 @@ impl Executor {
         Self {
             pager,
             btrees,
+            indexes,
             schema,
             transaction_manager,
             lock_manager: Arc::new(LockManager::new()),
@@ -53,6 +58,28 @@ impl Executor {
         match statement {
             Statement::CreateTable { name, columns } => self.execute_create_table(&name, columns),
             Statement::DropTable { name } => self.execute_drop_table(&name),
+            Statement::CreateIndex {
+                name,
+                table,
+                column,
+                if_not_exists,
+            } => self.with_table_lock(&table, LockType::Exclusive, || {
+                self.execute_create_index(&name, &table, &column, if_not_exists)
+            }),
+            Statement::DropIndex { name, if_exists } => {
+                let table = self
+                    .schema
+                    .read()
+                    .table_of_index(&name)
+                    .map(|t| t.name.clone());
+                match table {
+                    Some(table) => self.with_table_lock(&table, LockType::Exclusive, || {
+                        self.execute_drop_index(&table, &name)
+                    }),
+                    None if if_exists => Ok(()),
+                    None => Err(VelociError::NotFound(format!("Index '{}' not found", name))),
+                }
+            }
             Statement::AlterTable { table, action } => self.execute_alter_table(&table, action),
             Statement::Insert {
                 table,
@@ -202,6 +229,7 @@ impl Executor {
             name: name.to_string(),
             columns,
             root_page,
+            indexes: Vec::new(),
         };
 
         // Add to schema
@@ -217,9 +245,107 @@ impl Executor {
     }
 
     fn execute_drop_table(&self, name: &str) -> Result<()> {
+        let index_names: Vec<String> = {
+            let schema = self.schema.read();
+            schema
+                .get_table(name)?
+                .indexes
+                .iter()
+                .map(|i| i.name.clone())
+                .collect()
+        };
         self.schema.write().drop_table(name)?;
         self.btrees.write().remove(name);
+        let mut indexes = self.indexes.write();
+        for index_name in index_names {
+            indexes.remove(&index_name);
+        }
         Ok(())
+    }
+
+    fn execute_create_index(
+        &self,
+        name: &str,
+        table: &str,
+        column: &str,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        let (table_schema, exists) = {
+            let schema = self.schema.read();
+            let exists = schema.table_of_index(name).is_some();
+            (schema.get_table(table)?.clone(), exists)
+        };
+        if exists {
+            return if if_not_exists {
+                Ok(())
+            } else {
+                Err(VelociError::ConstraintViolation(format!(
+                    "Index '{}' already exists",
+                    name
+                )))
+            };
+        }
+        let col_index = column_index(&table_schema, column)?;
+
+        // Build the index from the table's current rows.
+        let mut index_tree = BTree::new(Arc::clone(&self.pager))?;
+        {
+            let btrees = self.btrees.read();
+            let table_tree = btrees.get(table).ok_or_else(|| {
+                VelociError::NotFound(format!("Table '{}' not initialized", table))
+            })?;
+            let rows = table_tree.read().scan()?;
+            for (pk, row) in rows {
+                if let Some(value) = row.values.get(col_index) {
+                    index::insert_entry(&mut index_tree, value, pk)?;
+                }
+            }
+        }
+
+        let root_page = index_tree.root_page();
+        self.indexes
+            .write()
+            .insert(name.to_string(), Arc::new(RwLock::new(index_tree)));
+        self.schema
+            .write()
+            .get_table_mut(table)?
+            .indexes
+            .push(IndexSchema {
+                name: name.to_string(),
+                column: column.to_string(),
+                root_page,
+            });
+        Ok(())
+    }
+
+    fn execute_drop_index(&self, table: &str, name: &str) -> Result<()> {
+        self.schema
+            .write()
+            .get_table_mut(table)?
+            .indexes
+            .retain(|i| i.name != name);
+        self.indexes.write().remove(name);
+        Ok(())
+    }
+
+    /// Handles for `table`'s indexes, each with the position of its column.
+    /// Taken before any B-tree lock; lock order is table tree, then indexes.
+    fn table_indexes(&self, table: &TableSchema) -> Result<Vec<TableIndex>> {
+        let handles = self.indexes.read();
+        table
+            .indexes
+            .iter()
+            .map(|i| {
+                let tree = handles.get(&i.name).cloned().ok_or_else(|| {
+                    VelociError::Corruption(format!("No B-tree for index '{}'", i.name))
+                })?;
+                Ok(TableIndex {
+                    column: column_index(table, &i.column)?,
+                    column_name: i.column.clone(),
+                    tree,
+                })
+            })
+            .collect()
     }
 
     fn execute_alter_table(&self, table: &str, action: AlterAction) -> Result<()> {
@@ -266,7 +392,12 @@ impl Executor {
                             old_name, table
                         ))
                     })?;
-                col.name = new_name;
+                col.name = new_name.clone();
+                for index in table_schema.indexes.iter_mut() {
+                    if index.column == old_name {
+                        index.column = new_name.clone();
+                    }
+                }
                 Ok(())
             }
             AlterAction::AddColumn { column } => {
@@ -322,6 +453,12 @@ impl Executor {
                         return Err(VelociError::ConstraintViolation(
                             "Cannot drop the primary key column".to_string(),
                         ));
+                    }
+                    if let Some(index) = table_schema.index_on(&name) {
+                        return Err(VelociError::ConstraintViolation(format!(
+                            "Cannot drop column '{}': index '{}' uses it (DROP INDEX first)",
+                            name, index.name
+                        )));
                     }
                     idx
                 };
@@ -446,6 +583,7 @@ impl Executor {
             }
         }
         let row = Row::new(row_values);
+        let indexes = self.table_indexes(&table_schema)?;
 
         // Single acquisition of btrees collection and btree with write intent
         // No lock upgrade, no multiple acquisitions
@@ -464,11 +602,14 @@ impl Executor {
                     "Primary key {} already exists in table '{}'",
                     pk_value, table
                 )))
-            } else if let Err(e) = check_insert_unique(&table_schema, &btree, &row) {
+            } else if let Err(e) = check_insert_unique(&table_schema, &btree, &indexes, &row) {
                 Err(e)
             } else {
                 // Insert into B-Tree for persistence
                 btree.insert(pk_value, &row)?;
+                for idx in &indexes {
+                    index::insert_entry(&mut idx.tree.write(), &row.values[idx.column], pk_value)?;
+                }
                 Ok(())
             }
         }; // btrees and btree locks released here
@@ -498,6 +639,8 @@ impl Executor {
             schema.get_table(table)?.clone()
         }; // schema lock released
 
+        let indexes = self.table_indexes(&table_schema)?;
+
         // The B-tree is authoritative. MVCC overlay is intentionally not used
         // until WAL-backed snapshot isolation lands.
         let all_rows: Vec<(i64, Row)> = {
@@ -506,7 +649,7 @@ impl Executor {
                 VelociError::NotFound(format!("Table '{}' not initialized", table))
             })?;
             let btree = btree_arc.read();
-            candidate_rows(&btree, where_clause.as_ref(), &table_schema)?
+            candidate_rows(&btree, where_clause.as_ref(), &table_schema, &indexes)?
         };
 
         // Process data without holding any locks. Filtering runs in parallel
@@ -747,6 +890,8 @@ impl Executor {
             schema.get_table(table)?.clone()
         }; // schema lock released
 
+        let indexes = self.table_indexes(&table_schema)?;
+
         // Change events collected during the update, recorded to CDC only
         // after the whole statement succeeds.
         let mut cdc_events: Vec<(i64, Row, Row)> = Vec::new();
@@ -759,7 +904,7 @@ impl Executor {
             })?;
             let mut btree = btree_arc.write();
 
-            let all_rows = candidate_rows(&btree, where_clause.as_ref(), &table_schema)?;
+            let all_rows = candidate_rows(&btree, where_clause.as_ref(), &table_schema, &indexes)?;
 
             // Find rows to update
             let rows_to_update: Vec<(i64, Row)> = if let Some(ref where_clause) = where_clause {
@@ -850,6 +995,14 @@ impl Executor {
             for (key, new_pk_value, row, updated_row) in updates {
                 btree.delete(key)?;
                 btree.insert(new_pk_value, &updated_row)?;
+                for idx in &indexes {
+                    let (old, new) = (&row.values[idx.column], &updated_row.values[idx.column]);
+                    if key != new_pk_value || old != new {
+                        let mut tree = idx.tree.write();
+                        index::remove_entry(&mut tree, old, key)?;
+                        index::insert_entry(&mut tree, new, new_pk_value)?;
+                    }
+                }
 
                 if self.cdc.is_enabled() {
                     cdc_events.push((key, row, updated_row));
@@ -878,6 +1031,8 @@ impl Executor {
             schema.get_table(table)?.clone()
         }; // schema lock released
 
+        let indexes = self.table_indexes(&table_schema)?;
+
         // Perform delete with single btree lock acquisition
         let mut cdc_events: Vec<(i64, Row)> = Vec::new();
         let result: Result<()> = {
@@ -887,7 +1042,7 @@ impl Executor {
             })?;
             let mut btree = btree_arc.write();
 
-            let all_rows = candidate_rows(&btree, where_clause.as_ref(), &table_schema)?;
+            let all_rows = candidate_rows(&btree, where_clause.as_ref(), &table_schema, &indexes)?;
             let rows_to_delete: Vec<(i64, Row)> = if let Some(ref where_clause) = where_clause {
                 all_rows
                     .into_iter()
@@ -902,6 +1057,9 @@ impl Executor {
 
             for (key, row) in rows_to_delete {
                 btree.delete(key)?;
+                for idx in &indexes {
+                    index::remove_entry(&mut idx.tree.write(), &row.values[idx.column], key)?;
+                }
                 if self.cdc.is_enabled() {
                     cdc_events.push((key, row));
                 }
@@ -975,13 +1133,38 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
 }
 
-/// Rows that can possibly match `where_clause`: the single row found by a
-/// B-tree lookup when the clause contains `<pk> = <integer>`, otherwise every
-/// row. Callers still evaluate the full clause on the result.
+/// A secondary index of the table being accessed.
+struct TableIndex {
+    /// Position of the indexed column in the table's rows.
+    column: usize,
+    column_name: String,
+    tree: Arc<RwLock<BTree>>,
+}
+
+fn column_index(table: &TableSchema, column: &str) -> Result<usize> {
+    table
+        .columns
+        .iter()
+        .position(|c| c.name == column)
+        .ok_or_else(|| {
+            VelociError::NotFound(format!(
+                "Column '{}' not found in table '{}'",
+                column, table.name
+            ))
+        })
+}
+
+/// Rows that can possibly match `where_clause`, in primary-key order:
+/// - `<pk> = <integer>`: a B-tree lookup;
+/// - `<indexed column> = <value>`: an index probe, then a lookup per match;
+/// - otherwise every row.
+///
+/// Callers still evaluate the full clause on the result.
 fn candidate_rows(
     btree: &BTree,
     where_clause: Option<&WhereClause>,
     table: &TableSchema,
+    indexes: &[TableIndex],
 ) -> Result<Vec<(i64, Row)>> {
     let pk_name = table
         .columns
@@ -996,14 +1179,39 @@ fn candidate_rows(
                 _ => None,
             })
     });
-    match pk_key {
-        Some(key) => Ok(btree
+    if let Some(key) = pk_key {
+        return Ok(btree
             .search(key)?
             .map(|row| (key, row))
             .into_iter()
-            .collect()),
-        None => btree.scan(),
+            .collect());
     }
+
+    for condition in where_clause.map_or(&[][..], |wc| &wc.conditions) {
+        if condition.operator != Operator::Equal {
+            continue;
+        }
+        let Some(idx) = indexes.iter().find(|i| i.column_name == condition.column) else {
+            continue;
+        };
+        if let Some(pks) = index::probe(&idx.tree.read(), &condition.value)? {
+            let mut rows = Vec::with_capacity(pks.len());
+            for pk in pks {
+                match btree.search(pk)? {
+                    Some(row) => rows.push((pk, row)),
+                    None => {
+                        return Err(VelociError::Corruption(format!(
+                            "Index on {}.{} points at missing row {}",
+                            table.name, condition.column, pk
+                        )))
+                    }
+                }
+            }
+            return Ok(rows);
+        }
+    }
+
+    btree.scan()
 }
 
 /// Indices of `UNIQUE` columns other than the primary key (the B-tree
@@ -1026,13 +1234,39 @@ fn unique_violation(table: &TableSchema, col_index: usize, value: &Value) -> Vel
 }
 
 /// Rejects `row` if a UNIQUE column's non-NULL value already exists in the
-/// table. Without secondary indexes this is a full scan, done only when the
-/// table has UNIQUE columns.
-fn check_insert_unique(table: &TableSchema, btree: &BTree, row: &Row) -> Result<()> {
-    let cols: Vec<usize> = unique_columns(table)
-        .into_iter()
-        .filter(|&ci| !matches!(row.values.get(ci), None | Some(Value::Null)))
-        .collect();
+/// table. Uses an index on the column when there is one; otherwise scans
+/// the table (only when it has UNIQUE columns).
+fn check_insert_unique(
+    table: &TableSchema,
+    btree: &BTree,
+    indexes: &[TableIndex],
+    row: &Row,
+) -> Result<()> {
+    let mut cols: Vec<usize> = Vec::new();
+    for ci in unique_columns(table) {
+        let value = match row.values.get(ci) {
+            None | Some(Value::Null) => continue,
+            Some(v) => v,
+        };
+        let probed = match indexes.iter().find(|i| i.column == ci) {
+            Some(idx) => index::probe(&idx.tree.read(), value)?,
+            None => None,
+        };
+        match probed {
+            Some(pks) => {
+                for pk in pks {
+                    if let Some(existing) = btree.search(pk)? {
+                        let v = &existing.values[ci];
+                        if compare_values(v, value) == std::cmp::Ordering::Equal {
+                            return Err(unique_violation(table, ci, v));
+                        }
+                    }
+                }
+            }
+            // No index, or a value the index cannot look up: scan.
+            None => cols.push(ci),
+        }
+    }
     if cols.is_empty() {
         return Ok(());
     }
@@ -1072,8 +1306,72 @@ fn check_unique(table: &TableSchema, cols: &[usize], rows: &[&Row]) -> Result<()
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::parser::Parser;
     use crate::storage::Database;
     use tempfile::NamedTempFile;
+
+    /// The index must narrow the candidate rows, not just return correct
+    /// results (a silent fallback to a scan would too).
+    #[test]
+    fn test_index_probe_narrows_candidates() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let pager = Arc::new(RwLock::new(Pager::new(temp_file.path()).unwrap()));
+        let exec = Executor::new(
+            Arc::clone(&pager),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(Schema::new())),
+            Arc::new(TransactionManager::new()),
+            Arc::new(CdcManager::new()),
+        );
+        pager.write().begin_group().unwrap();
+        let run = |sql: &str| {
+            exec.execute_statement(Parser::new().parse(sql).unwrap())
+                .unwrap()
+        };
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, w TEXT)");
+        for i in 0..200 {
+            run(&format!(
+                "INSERT INTO t VALUES ({}, {}, 'w{}')",
+                i,
+                i % 10,
+                i
+            ));
+        }
+        run("CREATE INDEX t_v ON t (v)");
+
+        let candidates = |sql: &str| {
+            let Statement::Select { where_clause, .. } = Parser::new().parse(sql).unwrap() else {
+                unreachable!()
+            };
+            let table = exec.schema.read().get_table("t").unwrap().clone();
+            let indexes = exec.table_indexes(&table).unwrap();
+            let btrees = exec.btrees.read();
+            let tree = btrees.get("t").unwrap().read();
+            candidate_rows(&tree, where_clause.as_ref(), &table, &indexes)
+                .unwrap()
+                .into_iter()
+                .map(|(pk, _)| pk)
+                .collect::<Vec<i64>>()
+        };
+        assert_eq!(
+            candidates("SELECT * FROM t WHERE v = 3"),
+            (0..20).map(|i| i * 10 + 3).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            candidates("SELECT * FROM t WHERE w = 'w5' AND v = 5").len(),
+            20
+        );
+        assert_eq!(
+            candidates("SELECT * FROM t WHERE v = 3 AND id = 13"),
+            vec![13]
+        );
+        // Unindexed column, non-equality, or unprobeable value: full scan.
+        assert_eq!(candidates("SELECT * FROM t WHERE w = 'w5'").len(), 200);
+        assert_eq!(candidates("SELECT * FROM t WHERE v > 3").len(), 200);
+        assert_eq!(candidates("SELECT * FROM t WHERE v = NULL").len(), 200);
+    }
 
     #[test]
     fn test_create_and_insert() {

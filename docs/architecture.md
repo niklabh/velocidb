@@ -141,11 +141,36 @@ only overlapping subtrees. Property tests check structural invariants
 (`check_invariants`) over random insert/delete sequences with row sizes
 from a few bytes to 1.5 KB.
 
-A `WHERE` containing `<pk> = <integer>` is answered by `BTree::search`
-(`candidate_rows` in `src/executor.rs`) for SELECT, UPDATE and DELETE; the
-full clause is still evaluated on the result. There are no secondary
-indexes: any other `WHERE` scans the table, and `UNIQUE` on a non-key column
-is checked by a scan.
+## Secondary indexes
+
+`CREATE INDEX name ON t (col)` builds a B-tree (`src/index.rs`) whose keys
+are `(hash32(value) << 32) | (pk as u32)` and whose rows hold the pk. All
+entries for one value hash form a contiguous key range, so an equality
+probe is one `BTree::range`. The hash (FNV-1a, stable across releases) is
+over the value's `=` equivalence class: numbers by their `f64` value (so
+`1` and `1.0` match, as `=` does) and text by its bytes. NULL, blobs and
+vectors never satisfy `=` and get no entry. The pk in the low bits makes
+each entry directly addressable for maintenance; two pks with equal low 32
+bits in one bucket take the next free slot, and lookups fall back to
+scanning the bucket.
+
+The executor maintains every index of a table on INSERT, UPDATE (only when
+the indexed value or the pk changes) and DELETE, inside the statement's
+write group, so rollback, savepoints and crash recovery cover indexes with
+no extra machinery. Lock order is table B-tree, then index B-trees; index
+handles are cloned out of the `indexes` map before any B-tree lock is
+taken.
+
+`candidate_rows` picks the access path for SELECT, UPDATE and DELETE:
+`<pk> = <integer>` is a `BTree::search`; otherwise the first
+`<indexed col> = <value>` condition is probed and each matching pk looked
+up; otherwise the table is scanned. The full `WHERE` is always evaluated on
+the candidates, so hash collisions cost time, never correctness. INSERT
+checks `UNIQUE` through an index on the column when one exists.
+
+Index metadata lives in `TableSchema::indexes` and is persisted in a
+trailing section of the schema pages (see the storage-format skill); files
+from older versions have no section and open with no indexes.
 
 ## SQL
 
@@ -200,5 +225,5 @@ pool via `spawn_blocking`, so the reactor never blocks on disk I/O.
 ## Known limitations
 
 See the README's *Limitations* section and [ROADMAP.md](../ROADMAP.md) for
-the prioritized list (single writer, no JOIN / GROUP BY / secondary indexes,
+the prioritized list (single writer, no JOIN / GROUP BY, equality-only indexes,
 exact-only vector search, in-memory CDC).

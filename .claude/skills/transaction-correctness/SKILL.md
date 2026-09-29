@@ -77,6 +77,10 @@ Checklist:
   already do) or that root-diffing catches it.
 - Use `Executor::with_table_lock` for lock + transaction lifecycle; it
   ends auto-commit transactions and releases their locks on every path.
+- Maintain the table's secondary indexes (`Executor::table_indexes`,
+  `index::insert_entry` / `remove_entry`) for every row the statement
+  writes, while still holding the table B-tree lock (take index handles
+  before any B-tree lock; lock the table tree before index trees).
 - Stage CDC events with `cdc.stage(...)` only after the statement succeeded
   (see cdc skill); `Database` publishes them on commit.
 

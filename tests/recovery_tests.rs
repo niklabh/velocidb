@@ -472,3 +472,94 @@ fn test_random_deletes_and_reinserts_survive_reopen() {
         .collect();
     assert_eq!(actual, expected);
 }
+
+/// Regression: schema pages were written to consecutive pages from page 1,
+/// so a schema larger than one page overwrote B-tree pages allocated after
+/// it; with 150 tables the first tables were unreadable after reopen.
+#[test]
+fn test_large_schema_does_not_overwrite_tables() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    {
+        let db = Database::open(&path).unwrap();
+        for t in 0..150 {
+            db.execute(&format!(
+                "CREATE TABLE table_{} (id INTEGER PRIMARY KEY, name TEXT, email TEXT, age INTEGER)",
+                t
+            ))
+            .unwrap();
+            db.execute(&format!(
+                "INSERT INTO table_{} VALUES ({}, 'n', 'e', 3)",
+                t, t
+            ))
+            .unwrap();
+        }
+        // Shrink and regrow the schema across page boundaries.
+        for t in 100..150 {
+            db.execute(&format!("DROP TABLE table_{}", t)).unwrap();
+        }
+        for t in 100..150 {
+            db.execute(&format!(
+                "CREATE TABLE table_{} (id INTEGER PRIMARY KEY)",
+                t
+            ))
+            .unwrap();
+            db.execute(&format!("INSERT INTO table_{} VALUES ({})", t, t))
+                .unwrap();
+        }
+        db.close().unwrap();
+    }
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.list_tables().len(), 150);
+    for t in 0..150 {
+        let rows = db
+            .query(&format!("SELECT id FROM table_{}", t))
+            .unwrap_or_else(|e| panic!("table_{}: {}", t, e))
+            .rows;
+        assert_eq!(rows.len(), 1, "table_{}", t);
+        assert_eq!(rows[0].values[0], Value::Integer(t), "table_{}", t);
+    }
+}
+
+/// A file written by 0.3 (legacy consecutive schema pages) opens, and the
+/// next schema change rewrites the schema as a linked chain.
+#[test]
+fn test_legacy_schema_format_opens_and_upgrades() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/legacy_schema_v0_3.db"
+        ),
+        &path,
+    )
+    .unwrap();
+
+    let check = |db: &Database| {
+        let users = db.query("SELECT * FROM users ORDER BY id").unwrap();
+        assert_eq!(users.rows.len(), 2);
+        assert_eq!(users.rows[0].values[1], Value::Text("Alice".into()));
+        assert_eq!(users.rows[1].values[2], Value::Null);
+        assert!(users.columns[1].not_null && users.columns[2].unique);
+        let docs = db.query("SELECT * FROM docs").unwrap();
+        assert_eq!(docs.rows[0].values[1], Value::Vector(vec![0.5, 1.5]));
+        assert!(db.describe_table("docs").unwrap().contains("F32_BLOB(2)"));
+    };
+    {
+        let db = Database::open(&path).unwrap();
+        check(&db);
+        db.execute("CREATE INDEX users_name ON users (name)")
+            .unwrap();
+        db.execute("CREATE TABLE extra (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        db.close().unwrap();
+    }
+    let db = Database::open(&path).unwrap();
+    check(&db);
+    assert_eq!(db.list_tables().len(), 3);
+    let alice = db
+        .query("SELECT id FROM users WHERE name = 'Alice'")
+        .unwrap();
+    assert_eq!(alice.rows[0].values[0], Value::Integer(1));
+}

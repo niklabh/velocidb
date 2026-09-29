@@ -49,14 +49,27 @@ times the transaction touched it. That is the ~250× gap above.
 
 A `WHERE` clause containing `<primary key> = <integer>` (alone or ANDed
 with other conditions) is answered with a B-tree lookup, for SELECT, UPDATE
-and DELETE. Any other `WHERE` scans the table and filters: there are no
-secondary indexes yet (roadmap P1).
+and DELETE. Otherwise a condition `<indexed column> = <value>` is answered
+from a secondary index; any other `WHERE` scans the table and filters.
+
+20,000 rows `(id INTEGER PRIMARY KEY, email TEXT, grp INTEGER)`, `grp`
+cycling through 100 values; release build, Apple Silicon, 200 queries each:
+
+| Query | Scan | Indexed |
+|-------|------|---------|
+| `WHERE email = 'user12345@x'` (1 row) | 1,198 µs | 2.3 µs |
+| `WHERE grp = 42` (200 rows) | 1,286 µs | 60 µs |
+
+Building both indexes over the 20,000 rows took 182 ms. An index costs one
+extra B-tree insert per INSERT and a delete + insert per UPDATE that changes
+the indexed value.
 
 ## What the engine does today
 
 - **Single-pass parsing.** The parser tokenizes each statement once and
   parses it by recursive descent; no regexes are involved.
-- **Primary-key lookups** for `WHERE pk = <integer>`.
+- **Primary-key lookups** for `WHERE pk = <integer>`, and **secondary
+  index lookups** for `WHERE <indexed col> = <value>`.
 - **Buffered writes.** Pages modified in a write group stay in memory
   (`Pager::pending`) and hit the WAL once, at commit, in a single write.
 - **Checkpointing.** Committed pages are served from memory

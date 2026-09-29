@@ -505,3 +505,42 @@
 "BEGIN IMMEDIATE"
 => ERR
 
+"CREATE INDEX idx_city ON users (city)"
+=> CreateIndex { name: "idx_city", table: "users", column: "city", if_not_exists: false }
+
+"create index if not exists i on t(c);"
+=> CreateIndex { name: "i", table: "t", column: "c", if_not_exists: true }
+
+"CREATE INDEX \"my idx\" ON [my table] (`my col`)"
+=> CreateIndex { name: "my idx", table: "my table", column: "my col", if_not_exists: false }
+
+"DROP INDEX idx_city"
+=> DropIndex { name: "idx_city", if_exists: false }
+
+"drop index if exists i;"
+=> DropIndex { name: "i", if_exists: true }
+
+"CREATE UNIQUE INDEX i ON t (c)"
+=> ERR
+
+"CREATE INDEX i ON t (a, b)"
+=> ERR
+
+"CREATE INDEX i ON t (a DESC)"
+=> ERR
+
+"CREATE INDEX i ON t"
+=> ERR
+
+"CREATE INDEX ON t (a)"
+=> ERR
+
+"CREATE INDEX IF EXISTS i ON t (a)"
+=> ERR
+
+"DROP INDEX"
+=> ERR
+
+"DROP INDEX IF NOT EXISTS i"
+=> ERR
+
