@@ -127,21 +127,17 @@ impl DaxVfs {
         Ok(unsafe { mmap.as_mut_ptr().add(offset) })
     }
 
-    /// Persist data using cache line flushes (clflush/clflushopt/clwb)
+    /// Persist data using cache line flushes (`clflush`).
+    ///
+    /// `clwb` / `clflushopt` would avoid invalidating the flushed lines, but
+    /// their intrinsics are unstable in Rust, so only `clflush` is used.
     pub fn persist_page(&self, page_id: PageId) -> Result<()> {
         let ptr = self.get_page_ptr(page_id)?;
 
         #[cfg(all(target_arch = "x86_64", not(doc)))]
-        {
-            // Use CLWB (Cache Line Write Back) if available, otherwise CLFLUSHOPT
-            if is_x86_feature_detected!("clwb") {
-                unsafe { Self::persist_with_clwb(ptr, PAGE_SIZE) };
-            } else if is_x86_feature_detected!("clflushopt") {
-                unsafe { Self::persist_with_clflushopt(ptr, PAGE_SIZE) };
-            } else {
-                unsafe { Self::persist_with_clflush(ptr, PAGE_SIZE) };
-            }
-        }
+        unsafe {
+            Self::persist_with_clflush(ptr, PAGE_SIZE)
+        };
 
         #[cfg(any(not(target_arch = "x86_64"), doc))]
         {
@@ -154,30 +150,6 @@ impl DaxVfs {
         std::sync::atomic::fence(Ordering::SeqCst);
 
         Ok(())
-    }
-
-    /// Persist using CLWB (most efficient - doesn't invalidate cache line)
-    #[cfg(all(target_arch = "x86_64", not(doc)))]
-    #[target_feature(enable = "clwb")]
-    unsafe fn persist_with_clwb(ptr: *const u8, size: usize) {
-        use std::arch::x86_64::*;
-
-        const CACHE_LINE_SIZE: usize = 64;
-        for i in (0..size).step_by(CACHE_LINE_SIZE) {
-            _mm_clwb(ptr.add(i) as *const u8);
-        }
-    }
-
-    /// Persist using CLFLUSHOPT (optimized flush)
-    #[cfg(all(target_arch = "x86_64", not(doc)))]
-    #[target_feature(enable = "clflushopt")]
-    unsafe fn persist_with_clflushopt(ptr: *const u8, size: usize) {
-        use std::arch::x86_64::*;
-
-        const CACHE_LINE_SIZE: usize = 64;
-        for i in (0..size).step_by(CACHE_LINE_SIZE) {
-            _mm_clflushopt(ptr.add(i) as *const u8);
-        }
     }
 
     /// Persist using CLFLUSH (standard flush)
