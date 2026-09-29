@@ -4,6 +4,33 @@ All notable changes to VelociDB are documented in this file.
 
 ## [Unreleased]
 
+### Changed (P1 parser)
+
+- **The regex parser is replaced by a lexer and recursive-descent parser**
+  (`src/parser.rs`, `src/parser/lexer.rs`). The `Statement` AST is
+  unchanged. `tests/parser_golden.rs` pins the parse of ~180 statements;
+  every difference from the old parser is one of the fixes below.
+- Fixed silent mis-parses:
+  - `WHERE a = 1 OR b = 2` compared `a` with the text `'1 OR b = 2'`, and
+    `WHERE (a = 1)` compared with `'1)'`. Both are now parse errors
+    (`OR` / parentheses are not supported yet).
+  - A trailing `;` on `UPDATE` / `DELETE` became part of the last value
+    (`DELETE FROM t WHERE id = 2;` deleted nothing).
+  - `UPDATE ... SET` values containing `,` or `=` (`'a, b'`), or
+    `vector32(...)`, were rejected.
+  - Multi-line `CREATE TABLE`, `BEGIN;` / `COMMIT;` / `ROLLBACK;` and
+    `f32_blob( 4 )` (spaces) failed or mis-typed the column.
+- **Stricter input.** Bare words as values (`WHERE name = Alice`) used to
+  become text; they are now an error, since they read as column
+  references. Unknown column constraints (`DEFAULT`, `AUTOINCREMENT`, ...)
+  and anything after the end of a statement are errors instead of being
+  ignored. Parse errors report the position of the offending token.
+- New: `''` escapes a quote in strings (`'it''s'`; `\'` still works),
+  `--` comments, `==`, lowercase `like`, `END [TRANSACTION]`, type
+  arguments such as `VARCHAR(255)` / `DECIMAL(10, 2)`, and quoted
+  identifiers (`"x"`, `` `x` ``, `[x]`) for table and column names in every
+  statement.
+
 ### Fixed (P0 correctness)
 
 - **Recovery could strand later commits.** If the WAL contained only a torn

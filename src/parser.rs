@@ -4,19 +4,12 @@
 //!
 //! Parses SQL text into an AST of [`Statement`] variants consumed by the executor.
 
+mod lexer;
+
 use crate::types::{Column, DataType, Result, Value, VelociError};
+use lexer::{Token, TokenKind};
 use regex::Regex;
 use std::collections::HashMap;
-
-/// A `&'static Regex` compiled once on first use. Parsing runs on every
-/// `execute` / `query`, so recompiling patterns per call dominated the cost
-/// of small statements.
-macro_rules! regex {
-    ($pattern:literal) => {{
-        static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-        RE.get_or_init(|| Regex::new($pattern).expect("static regex is valid"))
-    }};
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -199,113 +192,36 @@ impl Operator {
     }
 }
 
-/// Finds the byte offset of a top-level `ORDER BY` keyword (outside quoted
-/// strings), or `None` if absent.
-fn find_order_by(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut in_string = false;
-    let mut quote = b'\'';
-    let mut i = 0;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_string {
-            if b == quote {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        if b == b'\'' || b == b'"' {
-            in_string = true;
-            quote = b;
-            i += 1;
-            continue;
-        }
-        // Try to match "ORDER" followed by whitespace and "BY", both bounded
-        // by whitespace (or start of string on the left).
-        if (b == b'O' || b == b'o')
-            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
-            && s[i..].len() >= 8
-        {
-            let rest = &s[i..];
-            let upper: String = rest.chars().take(9).collect::<String>().to_uppercase();
-            if upper.starts_with("ORDER ")
-                || upper.starts_with("ORDER\t")
-                || upper.starts_with("ORDER\n")
-            {
-                // Confirm "BY" follows the whitespace run.
-                let after_order = rest[5..].trim_start();
-                let upper_after: String = after_order
-                    .chars()
-                    .take(3)
-                    .collect::<String>()
-                    .to_uppercase();
-                if upper_after.starts_with("BY")
-                    && after_order[2..]
-                        .chars()
-                        .next()
-                        .map(|c| c.is_whitespace())
-                        .unwrap_or(false)
-                {
-                    return Some(i);
-                }
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Splits `s` on commas that are outside quoted strings, parentheses and
-/// square brackets.
-fn split_top_level_commas(s: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut in_string = false;
-    let mut quote = '\'';
-    let mut depth: usize = 0;
-
-    for ch in s.chars() {
-        if in_string {
-            current.push(ch);
-            if ch == quote {
-                in_string = false;
-            }
-        } else {
-            match ch {
-                '\'' | '"' => {
-                    in_string = true;
-                    quote = ch;
-                    current.push(ch);
-                }
-                '(' | '[' => {
-                    depth += 1;
-                    current.push(ch);
-                }
-                ')' | ']' => {
-                    depth = depth.saturating_sub(1);
-                    current.push(ch);
-                }
-                ',' if depth == 0 => {
-                    let part = current.trim().to_string();
-                    if !part.is_empty() {
-                        parts.push(part);
-                    }
-                    current.clear();
-                }
-                _ => current.push(ch),
-            }
-        }
-    }
-
-    let part = current.trim().to_string();
-    if !part.is_empty() {
-        parts.push(part);
-    }
-    parts
-}
-
+/// Recursive-descent SQL parser over the tokens produced by [`lexer`].
+///
+/// Grammar (keywords case-insensitive, one optional trailing `;`):
+///
+/// ```text
+/// CREATE TABLE name ( coldef [, coldef]* )
+///     coldef   := ident type [PRIMARY KEY | NOT NULL | NULL | UNIQUE]*
+///     type     := word [ ( number [, number] ) ]
+/// DROP TABLE name
+/// ALTER TABLE name RENAME TO name
+///                | RENAME [COLUMN] ident TO ident
+///                | ADD [COLUMN] coldef
+///                | DROP [COLUMN] ident
+/// INSERT INTO name [ ( ident [, ident]* ) ] VALUES ( value [, value]* )
+/// SELECT item [, item]* FROM name [WHERE cond [AND cond]*]
+///     [ORDER BY item [ASC | DESC]] [LIMIT integer]
+///     item     := * | ident | ident ( ... )
+/// UPDATE name SET ident = value [, ident = value]* [WHERE ...]
+/// DELETE FROM name [WHERE ...]
+/// BEGIN | COMMIT | END | ROLLBACK [TRANSACTION]
+///
+/// cond  := ident (= | != | <> | < | <= | > | >= | LIKE) value
+/// value := NULL | [+|-] number | 'string' | "string" | X'hex'
+///        | [ ... ] | vector( ... ) | vector32( ... ) | vector64( ... )
+/// ident := word | "quoted" | `quoted` | [bracketed]
+/// ```
+///
+/// Select-list items and the ORDER BY expression are returned as the exact
+/// source text they span; the executor interprets function calls in them
+/// (`COUNT(*)`, `vector_distance_*`).
 pub struct Parser {
     // Parser state can be added here if needed
 }
@@ -322,340 +238,432 @@ impl Parser {
     }
 
     pub fn parse(&self, sql: &str) -> Result<Statement> {
-        let sql = sql.trim();
-        let upper = sql.to_uppercase();
+        let tokens = lexer::tokenize(sql)?;
+        let mut cursor = Cursor {
+            sql,
+            tokens,
+            pos: 0,
+        };
+        let statement = cursor.statement()?;
+        cursor.eat(&TokenKind::Semicolon);
+        if let Some(tok) = cursor.peek() {
+            return Err(cursor.error_at(tok, "Unexpected trailing input"));
+        }
+        Ok(statement)
+    }
+}
 
-        if upper.starts_with("CREATE TABLE") {
-            self.parse_create_table(sql)
-        } else if upper.starts_with("DROP TABLE") {
-            self.parse_drop_table(sql)
-        } else if upper.starts_with("ALTER TABLE") {
-            self.parse_alter_table(sql)
-        } else if upper.starts_with("INSERT INTO") {
-            self.parse_insert(sql)
-        } else if upper.starts_with("SELECT") {
-            self.parse_select(sql)
-        } else if upper.starts_with("UPDATE") {
-            self.parse_update(sql)
-        } else if upper.starts_with("DELETE FROM") {
-            self.parse_delete(sql)
-        } else if upper == "BEGIN" || upper == "BEGIN TRANSACTION" {
-            Ok(Statement::BeginTransaction)
-        } else if upper == "COMMIT" || upper == "COMMIT TRANSACTION" {
-            Ok(Statement::CommitTransaction)
-        } else if upper == "ROLLBACK" || upper == "ROLLBACK TRANSACTION" {
-            Ok(Statement::RollbackTransaction)
+/// Words that may not be used as a bare table or column name because they
+/// would make clause boundaries ambiguous.
+const RESERVED: &[&str] = &[
+    "AND", "BY", "FROM", "LIKE", "LIMIT", "NOT", "NULL", "OR", "ORDER", "SET", "VALUES", "WHERE",
+];
+
+struct Cursor<'a> {
+    sql: &'a str,
+    tokens: Vec<Token>,
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    // ----- token helpers -------------------------------------------------
+
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
+    }
+
+    fn peek_kind(&self) -> Option<&TokenKind> {
+        self.peek().map(|t| &t.kind)
+    }
+
+    fn peek_kind_at(&self, offset: usize) -> Option<&TokenKind> {
+        self.tokens.get(self.pos + offset).map(|t| &t.kind)
+    }
+
+    fn advance(&mut self) -> Option<Token> {
+        let tok = self.tokens.get(self.pos).cloned();
+        if tok.is_some() {
+            self.pos += 1;
+        }
+        tok
+    }
+
+    fn eat(&mut self, kind: &TokenKind) -> bool {
+        if self.peek_kind() == Some(kind) {
+            self.pos += 1;
+            true
         } else {
-            Err(VelociError::ParseError(format!(
-                "Unsupported statement: {}",
-                sql
-            )))
+            false
         }
     }
 
-    fn parse_create_table(&self, sql: &str) -> Result<Statement> {
-        // CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)
-        let re = regex!(r"(?i)CREATE\s+TABLE\s+(\w+)\s*\((.+)\)");
-
-        let captures = re
-            .captures(sql)
-            .ok_or_else(|| VelociError::ParseError("Invalid CREATE TABLE syntax".to_string()))?;
-
-        let table_name = captures.get(1).unwrap().as_str().to_string();
-        let columns_str = captures.get(2).unwrap().as_str();
-
-        let mut columns = Vec::new();
-        for col_def in columns_str.split(',') {
-            let col_def = col_def.trim();
-            if col_def.is_empty() {
-                continue;
-            }
-
-            // Parse column name (handle quoted identifiers)
-            let (col_name, remainder) = self.parse_identifier(col_def)?;
-
-            // Parse data type and constraints
-            let remainder = remainder.trim();
-            if remainder.is_empty() {
-                return Err(VelociError::ParseError(format!(
-                    "Missing data type for column '{}'",
-                    col_name
-                )));
-            }
-
-            // Split remainder into parts, handling quoted strings
-            let parts = self.split_sql_parts(remainder);
-            if parts.is_empty() {
-                return Err(VelociError::ParseError(format!(
-                    "Invalid column definition: {}",
-                    col_def
-                )));
-            }
-
-            let data_type = DataType::from_str(&parts[0]);
-            let mut primary_key = false;
-            let mut not_null = false;
-            let mut unique = false;
-
-            // Check for constraints
-            let upper_parts: Vec<String> = parts.iter().map(|s| s.to_uppercase()).collect();
-            if upper_parts.contains(&"PRIMARY".to_string())
-                && upper_parts.contains(&"KEY".to_string())
-            {
-                primary_key = true;
-                not_null = true;
-            }
-            if upper_parts.contains(&"NOT".to_string()) && upper_parts.contains(&"NULL".to_string())
-            {
-                not_null = true;
-            }
-            if upper_parts.contains(&"UNIQUE".to_string()) {
-                unique = true;
-            }
-
-            columns.push(Column {
-                name: col_name,
-                data_type,
-                primary_key,
-                not_null,
-                unique,
-            });
+    fn expect(&mut self, kind: &TokenKind, what: &str) -> Result<Token> {
+        if self.peek_kind() == Some(kind) {
+            Ok(self.advance().unwrap())
+        } else {
+            Err(self.error(&format!("Expected {}", what)))
         }
-
-        Ok(Statement::CreateTable {
-            name: table_name,
-            columns,
-        })
     }
 
-    fn parse_drop_table(&self, sql: &str) -> Result<Statement> {
-        // DROP TABLE users
-        let re = regex!(r"(?i)DROP\s+TABLE\s+(\w+)");
-
-        let captures = re
-            .captures(sql)
-            .ok_or_else(|| VelociError::ParseError("Invalid DROP TABLE syntax".to_string()))?;
-
-        let table_name = captures.get(1).unwrap().as_str().to_string();
-
-        Ok(Statement::DropTable { name: table_name })
+    /// Consumes a numeric literal token, returning its text.
+    fn number_token(&mut self, what: &str) -> Result<String> {
+        match self.peek_kind() {
+            Some(TokenKind::Number(n)) => {
+                let n = n.clone();
+                self.pos += 1;
+                Ok(n)
+            }
+            _ => Err(self.error(&format!("Expected {}", what))),
+        }
     }
 
-    fn parse_alter_table(&self, sql: &str) -> Result<Statement> {
-        // ALTER TABLE t RENAME TO new_name
-        // ALTER TABLE t RENAME COLUMN old TO new
-        // ALTER TABLE t ADD [COLUMN] name TYPE [constraints]
-        // ALTER TABLE t DROP [COLUMN] name
-        let sql = sql.trim().trim_end_matches(';').trim();
+    fn is_keyword_at(&self, offset: usize, keyword: &str) -> bool {
+        matches!(self.peek_kind_at(offset), Some(TokenKind::Word(w)) if w.eq_ignore_ascii_case(keyword))
+    }
 
-        let rename_table_re = regex!(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+RENAME\s+TO\s+(\w+)$");
-        if let Some(caps) = rename_table_re.captures(sql) {
-            return Ok(Statement::AlterTable {
-                table: caps.get(1).unwrap().as_str().to_string(),
-                action: AlterAction::RenameTable {
-                    new_name: caps.get(2).unwrap().as_str().to_string(),
-                },
-            });
+    fn is_keyword(&self, keyword: &str) -> bool {
+        self.is_keyword_at(0, keyword)
+    }
+
+    fn eat_keyword(&mut self, keyword: &str) -> bool {
+        if self.is_keyword(keyword) {
+            self.pos += 1;
+            true
+        } else {
+            false
         }
+    }
 
-        let rename_col_re =
-            regex!(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+RENAME\s+(?:COLUMN\s+)?(\w+)\s+TO\s+(\w+)$");
-        if let Some(caps) = rename_col_re.captures(sql) {
-            return Ok(Statement::AlterTable {
-                table: caps.get(1).unwrap().as_str().to_string(),
-                action: AlterAction::RenameColumn {
-                    old_name: caps.get(2).unwrap().as_str().to_string(),
-                    new_name: caps.get(3).unwrap().as_str().to_string(),
-                },
-            });
+    fn expect_keyword(&mut self, keyword: &str) -> Result<()> {
+        if self.eat_keyword(keyword) {
+            Ok(())
+        } else {
+            Err(self.error(&format!("Expected {}", keyword)))
         }
+    }
 
-        let add_col_re = regex!(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+ADD\s+(?:COLUMN\s+)?(.+)$");
-        if let Some(caps) = add_col_re.captures(sql) {
-            let table = caps.get(1).unwrap().as_str().to_string();
-            let col_def = caps.get(2).unwrap().as_str().trim();
+    /// Error pointing at the current token (or end of input).
+    fn error(&self, msg: &str) -> VelociError {
+        match self.peek() {
+            Some(tok) => self.error_at(tok, msg),
+            None => VelociError::ParseError(format!("{} at end of input", msg)),
+        }
+    }
 
-            let (col_name, remainder) = self.parse_identifier(col_def)?;
-            let parts = self.split_sql_parts(remainder.trim());
-            if parts.is_empty() {
-                return Err(VelociError::ParseError(format!(
-                    "Missing data type in ADD COLUMN: {}",
-                    col_def
+    fn error_at(&self, tok: &Token, msg: &str) -> VelociError {
+        VelociError::ParseError(format!(
+            "{} at position {} near '{}'",
+            msg,
+            tok.start,
+            &self.sql[tok.start..tok.end]
+        ))
+    }
+
+    /// Source text from the start of token `from` to the end of the token
+    /// before the cursor.
+    fn source_since(&self, from: usize) -> &'a str {
+        let start = self.tokens[from].start;
+        let end = self.tokens[self.pos - 1].end;
+        &self.sql[start..end]
+    }
+
+    /// Consumes tokens up to and including the bracket matching the opening
+    /// `(` or `[` at the cursor.
+    fn skip_balanced(&mut self) -> Result<()> {
+        let open = self
+            .advance()
+            .expect("caller checked for an opening bracket");
+        let mut stack = vec![open.kind.clone()];
+        while let Some(tok) = self.advance() {
+            match tok.kind {
+                TokenKind::LParen | TokenKind::LBracket => stack.push(tok.kind),
+                TokenKind::RParen | TokenKind::RBracket => {
+                    let expected = match stack.pop() {
+                        Some(TokenKind::LParen) => TokenKind::RParen,
+                        _ => TokenKind::RBracket,
+                    };
+                    if tok.kind != expected {
+                        return Err(self.error_at(&tok, "Mismatched bracket"));
+                    }
+                    if stack.is_empty() {
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err(self.error_at(&open, "Unclosed bracket"))
+    }
+
+    // ----- identifiers ---------------------------------------------------
+
+    /// A table or column name: bare word, `"quoted"`, `` `quoted` `` or
+    /// `[bracketed]`.
+    fn identifier(&mut self, what: &str) -> Result<String> {
+        match self.peek_kind() {
+            Some(TokenKind::Word(w)) => {
+                if RESERVED.iter().any(|r| w.eq_ignore_ascii_case(r)) {
+                    return Err(self.error(&format!(
+                        "Expected {}, found reserved word (quote it to use it as a name)",
+                        what
+                    )));
+                }
+                let w = w.clone();
+                self.pos += 1;
+                Ok(w)
+            }
+            Some(TokenKind::QuotedIdent(s))
+            | Some(TokenKind::String {
+                value: s,
+                quote: '"',
+            }) => {
+                let s = s.clone();
+                self.pos += 1;
+                Ok(s)
+            }
+            Some(TokenKind::LBracket) => {
+                // [name with spaces]: take the raw text between the brackets.
+                let open = self.advance().unwrap();
+                while let Some(tok) = self.advance() {
+                    if tok.kind == TokenKind::RBracket {
+                        let name = self.sql[open.end..tok.start].trim();
+                        if name.is_empty() {
+                            return Err(self.error_at(&tok, &format!("Expected {}", what)));
+                        }
+                        return Ok(name.to_string());
+                    }
+                }
+                Err(self.error_at(&open, "Unterminated bracketed identifier"))
+            }
+            _ => Err(self.error(&format!("Expected {}", what))),
+        }
+    }
+
+    // ----- statements ----------------------------------------------------
+
+    fn statement(&mut self) -> Result<Statement> {
+        let Some(TokenKind::Word(first)) = self.peek_kind() else {
+            return Err(self.error("Expected a SQL statement"));
+        };
+        match first.to_ascii_uppercase().as_str() {
+            "CREATE" => self.create_table(),
+            "DROP" => self.drop_table(),
+            "ALTER" => self.alter_table(),
+            "INSERT" => self.insert(),
+            "SELECT" => self.select(),
+            "UPDATE" => self.update(),
+            "DELETE" => self.delete(),
+            "BEGIN" => self.transaction_control(Statement::BeginTransaction),
+            "COMMIT" | "END" => self.transaction_control(Statement::CommitTransaction),
+            "ROLLBACK" => self.transaction_control(Statement::RollbackTransaction),
+            _ => Err(self.error("Unsupported statement")),
+        }
+    }
+
+    fn transaction_control(&mut self, statement: Statement) -> Result<Statement> {
+        self.advance();
+        self.eat_keyword("TRANSACTION");
+        Ok(statement)
+    }
+
+    fn create_table(&mut self) -> Result<Statement> {
+        self.expect_keyword("CREATE")?;
+        self.expect_keyword("TABLE")?;
+        let name = self.identifier("table name")?;
+        self.expect(&TokenKind::LParen, "'(' after table name")?;
+        let mut columns = vec![self.column_def()?];
+        while self.eat(&TokenKind::Comma) {
+            columns.push(self.column_def()?);
+        }
+        self.expect(&TokenKind::RParen, "',' or ')' in column list")?;
+        Ok(Statement::CreateTable { name, columns })
+    }
+
+    fn column_def(&mut self) -> Result<Column> {
+        let name = self.identifier("column name")?;
+        let data_type = self.data_type(&name)?;
+        let mut column = Column {
+            name,
+            data_type,
+            primary_key: false,
+            not_null: false,
+            unique: false,
+        };
+        loop {
+            if self.eat_keyword("PRIMARY") {
+                self.expect_keyword("KEY")?;
+                column.primary_key = true;
+                column.not_null = true;
+            } else if self.eat_keyword("NOT") {
+                self.expect_keyword("NULL")?;
+                column.not_null = true;
+            } else if self.eat_keyword("NULL") {
+                // Explicitly nullable: the default.
+            } else if self.eat_keyword("UNIQUE") {
+                column.unique = true;
+            } else if matches!(
+                self.peek_kind(),
+                Some(TokenKind::Comma | TokenKind::RParen | TokenKind::Semicolon) | None
+            ) {
+                return Ok(column);
+            } else {
+                return Err(self.error(&format!(
+                    "Unsupported constraint on column '{}'",
+                    column.name
                 )));
             }
-            let data_type = DataType::from_str(&parts[0]);
-            let upper_parts: Vec<String> = parts.iter().map(|s| s.to_uppercase()).collect();
-            if upper_parts.contains(&"PRIMARY".to_string()) {
+        }
+    }
+
+    /// `INTEGER`, `VARCHAR(255)`, `F32_BLOB(3)`, ... Unknown names map to
+    /// TEXT (see [`DataType::from_str`]).
+    fn data_type(&mut self, column: &str) -> Result<DataType> {
+        let Some(TokenKind::Word(type_name)) = self.peek_kind() else {
+            return Err(self.error(&format!("Missing data type for column '{}'", column)));
+        };
+        let mut spelled = type_name.clone();
+        self.pos += 1;
+        if self.eat(&TokenKind::LParen) {
+            let mut args = Vec::new();
+            loop {
+                args.push(self.number_token("a number in type arguments")?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RParen, "')' after type arguments")?;
+            spelled = format!("{}({})", spelled, args.join(","));
+        }
+        Ok(DataType::from_str(&spelled))
+    }
+
+    fn drop_table(&mut self) -> Result<Statement> {
+        self.expect_keyword("DROP")?;
+        self.expect_keyword("TABLE")?;
+        let name = self.identifier("table name")?;
+        Ok(Statement::DropTable { name })
+    }
+
+    fn alter_table(&mut self) -> Result<Statement> {
+        self.expect_keyword("ALTER")?;
+        self.expect_keyword("TABLE")?;
+        let table = self.identifier("table name")?;
+
+        let action = if self.eat_keyword("RENAME") {
+            if self.eat_keyword("TO") {
+                AlterAction::RenameTable {
+                    new_name: self.identifier("new table name")?,
+                }
+            } else {
+                self.eat_keyword("COLUMN");
+                let old_name = self.identifier("column name")?;
+                self.expect_keyword("TO")?;
+                let new_name = self.identifier("new column name")?;
+                AlterAction::RenameColumn { old_name, new_name }
+            }
+        } else if self.eat_keyword("ADD") {
+            self.eat_keyword("COLUMN");
+            let column = self.column_def()?;
+            if column.primary_key {
                 return Err(VelociError::ParseError(
                     "Cannot add a PRIMARY KEY column with ALTER TABLE".to_string(),
                 ));
             }
-            let not_null = upper_parts.contains(&"NOT".to_string())
-                && upper_parts.contains(&"NULL".to_string());
-            if not_null {
+            if column.not_null {
                 return Err(VelociError::ParseError(
                     "Cannot add a NOT NULL column without a default value".to_string(),
                 ));
             }
-            let unique = upper_parts.contains(&"UNIQUE".to_string());
+            AlterAction::AddColumn { column }
+        } else if self.eat_keyword("DROP") {
+            self.eat_keyword("COLUMN");
+            AlterAction::DropColumn {
+                name: self.identifier("column name")?,
+            }
+        } else {
+            return Err(self.error("Expected RENAME, ADD or DROP after ALTER TABLE"));
+        };
 
-            return Ok(Statement::AlterTable {
-                table,
-                action: AlterAction::AddColumn {
-                    column: Column {
-                        name: col_name,
-                        data_type,
-                        primary_key: false,
-                        not_null: false,
-                        unique,
-                    },
-                },
-            });
-        }
-
-        let drop_col_re = regex!(r"(?i)^ALTER\s+TABLE\s+(\w+)\s+DROP\s+(?:COLUMN\s+)?(\w+)$");
-        if let Some(caps) = drop_col_re.captures(sql) {
-            return Ok(Statement::AlterTable {
-                table: caps.get(1).unwrap().as_str().to_string(),
-                action: AlterAction::DropColumn {
-                    name: caps.get(2).unwrap().as_str().to_string(),
-                },
-            });
-        }
-
-        Err(VelociError::ParseError(format!(
-            "Invalid ALTER TABLE syntax: {}",
-            sql
-        )))
+        Ok(Statement::AlterTable { table, action })
     }
 
-    fn parse_insert(&self, sql: &str) -> Result<Statement> {
-        // INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)
-        // INSERT INTO users VALUES (1, 'Alice', 30)
+    fn insert(&mut self) -> Result<Statement> {
+        self.expect_keyword("INSERT")?;
+        self.expect_keyword("INTO")?;
+        let table = self.identifier("table name")?;
 
-        // The VALUES capture is greedy up to the final ')' so nested function
-        // calls like vector32('[1, 2]') survive intact.
-        let re =
-            regex!(r"(?i)INSERT\s+INTO\s+(\w+)(?:\s*\(([^)]+)\))?\s+VALUES\s*\((.+)\)\s*;?\s*$");
+        let columns = if self.eat(&TokenKind::LParen) {
+            let mut columns = vec![self.identifier("column name")?];
+            while self.eat(&TokenKind::Comma) {
+                columns.push(self.identifier("column name")?);
+            }
+            self.expect(&TokenKind::RParen, "',' or ')' in column list")?;
+            Some(columns)
+        } else {
+            None
+        };
 
-        let captures = re
-            .captures(sql)
-            .ok_or_else(|| VelociError::ParseError("Invalid INSERT syntax".to_string()))?;
-
-        let table_name = captures.get(1).unwrap().as_str().to_string();
-
-        let columns = captures.get(2).map(|m| {
-            m.as_str()
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect()
-        });
-
-        let values_str = captures.get(3).unwrap().as_str();
-        let values = self.parse_values(values_str)?;
+        self.expect_keyword("VALUES")?;
+        self.expect(&TokenKind::LParen, "'(' after VALUES")?;
+        let mut values = vec![self.value()?];
+        while self.eat(&TokenKind::Comma) {
+            values.push(self.value()?);
+        }
+        self.expect(&TokenKind::RParen, "',' or ')' in VALUES list")?;
+        if self.peek_kind() == Some(&TokenKind::Comma) {
+            return Err(self.error("Multi-row VALUES is not supported"));
+        }
 
         Ok(Statement::Insert {
-            table: table_name,
+            table,
             columns,
             values,
         })
     }
 
-    fn parse_select(&self, sql: &str) -> Result<Statement> {
-        // SELECT * FROM users WHERE age > 25
-        // SELECT id, name FROM users
-        // SELECT COUNT(*) FROM users
-        // SELECT * FROM users WHERE age > 25 ORDER BY name DESC LIMIT 10
+    fn select(&mut self) -> Result<Statement> {
+        self.expect_keyword("SELECT")?;
 
-        // Strip trailing LIMIT n first, then ORDER BY clause, so the remainder
-        // is a regular SELECT [...] FROM <table> [WHERE ...].
-        let mut remaining = sql.trim().to_string();
+        let mut columns = vec![self.select_item()?];
+        while self.eat(&TokenKind::Comma) {
+            columns.push(self.select_item()?);
+        }
 
-        let limit_re = regex!(r"(?i)\s+LIMIT\s+(\d+)\s*;?\s*$");
-        let limit =
-            if let Some(caps) = limit_re.captures(&remaining) {
-                let n =
-                    caps.get(1).unwrap().as_str().parse::<u64>().map_err(|e| {
-                        VelociError::ParseError(format!("Invalid LIMIT value: {}", e))
-                    })?;
-                remaining = limit_re.replace(&remaining, "").to_string();
-                Some(n)
-            } else {
-                None
-            };
+        self.expect_keyword("FROM")?;
+        let table = self.identifier("table name")?;
+        let where_clause = self.where_clause()?;
 
-        // ORDER BY accepts either a column name or an arbitrary expression
-        // (e.g. a vector distance function containing commas and parens), so
-        // it is located with a quote-aware scan rather than a regex.
-        let order_by = if let Some(idx) = find_order_by(&remaining) {
-            let clause = remaining[idx..].trim();
-            // Strip the leading "ORDER BY" (already validated by find_order_by).
-            let expr_start = {
-                let re = regex!(r"(?i)^ORDER\s+BY\s+");
-                re.find(clause)
-                    .map(|m| m.end())
-                    .ok_or_else(|| VelociError::ParseError("Invalid ORDER BY".to_string()))?
-            };
-            let mut expr = clause[expr_start..]
-                .trim()
-                .trim_end_matches(';')
-                .trim()
-                .to_string();
-
-            let mut ascending = true;
-            let upper_expr = expr.to_uppercase();
-            if upper_expr.ends_with(" DESC") {
-                ascending = false;
-                expr.truncate(expr.len() - 5);
-            } else if upper_expr.ends_with(" ASC") {
-                expr.truncate(expr.len() - 4);
-            }
-            let expr = expr.trim().to_string();
-            if expr.is_empty() {
+        let order_by = if self.eat_keyword("ORDER") {
+            self.expect_keyword("BY")?;
+            let column = self.select_item()?;
+            if column == "*" {
                 return Err(VelociError::ParseError(
-                    "Empty ORDER BY expression".to_string(),
+                    "ORDER BY * is not valid".to_string(),
                 ));
             }
-
-            remaining = remaining[..idx].trim_end().to_string();
-            Some(OrderBy {
-                column: expr,
-                ascending,
-            })
+            let ascending = if self.eat_keyword("DESC") {
+                false
+            } else {
+                self.eat_keyword("ASC");
+                true
+            };
+            Some(OrderBy { column, ascending })
         } else {
             None
         };
 
-        // Drop trailing semicolons left over from earlier stripping.
-        let remaining = remaining.trim_end_matches(';').trim().to_string();
-
-        let re = regex!(r"(?i)^SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?$");
-
-        let captures = re
-            .captures(&remaining)
-            .ok_or_else(|| VelociError::ParseError("Invalid SELECT syntax".to_string()))?;
-
-        let columns_str = captures.get(1).unwrap().as_str().trim();
-        let columns = if columns_str == "*" {
-            vec!["*".to_string()]
-        } else if columns_str.to_uppercase().starts_with("COUNT(") {
-            vec![columns_str.to_string()]
-        } else {
-            // Paren-aware split so distance expressions like
-            // vector_distance_cos(embedding, vector32('[1,2]')) stay whole.
-            split_top_level_commas(columns_str)
-        };
-
-        let table_name = captures.get(2).unwrap().as_str().to_string();
-
-        let where_clause = if let Some(where_match) = captures.get(3) {
-            Some(self.parse_where_clause(where_match.as_str())?)
+        let limit = if self.eat_keyword("LIMIT") {
+            let n = self.number_token("a non-negative integer after LIMIT")?;
+            Some(
+                n.parse::<u64>()
+                    .map_err(|_| VelociError::ParseError(format!("Invalid LIMIT value: {}", n)))?,
+            )
         } else {
             None
         };
 
         Ok(Statement::Select {
-            table: table_name,
+            table,
             columns,
             where_clause,
             order_by,
@@ -663,351 +671,188 @@ impl Parser {
         })
     }
 
-    fn parse_update(&self, sql: &str) -> Result<Statement> {
-        // UPDATE users SET age = 31 WHERE name = 'Alice'
+    /// `*`, a column name, or a function call such as `COUNT(*)` or
+    /// `vector_distance_cos(col, vector32('[...]'))`, returned as written.
+    fn select_item(&mut self) -> Result<String> {
+        if self.eat(&TokenKind::Star) {
+            return Ok("*".to_string());
+        }
+        let start = self.pos;
+        if matches!(self.peek_kind(), Some(TokenKind::Word(_)))
+            && self.peek_kind_at(1) == Some(&TokenKind::LParen)
+        {
+            self.pos += 1;
+            self.skip_balanced()?;
+            return Ok(self.source_since(start).to_string());
+        }
+        self.identifier("column name or expression")
+    }
 
-        let re = regex!(r"(?i)UPDATE\s+(\w+)\s+SET\s+(.+?)(?:\s+WHERE\s+(.+))?$");
-
-        let captures = re
-            .captures(sql)
-            .ok_or_else(|| VelociError::ParseError("Invalid UPDATE syntax".to_string()))?;
-
-        let table_name = captures.get(1).unwrap().as_str().to_string();
-        let assignments_str = captures.get(2).unwrap().as_str();
+    fn update(&mut self) -> Result<Statement> {
+        self.expect_keyword("UPDATE")?;
+        let table = self.identifier("table name")?;
+        self.expect_keyword("SET")?;
 
         let mut assignments = HashMap::new();
-        for assignment in assignments_str.split(',') {
-            let parts: Vec<&str> = assignment.split('=').collect();
-            if parts.len() != 2 {
-                return Err(VelociError::ParseError(format!(
-                    "Invalid assignment: {}",
-                    assignment
-                )));
-            }
-
-            let column = parts[0].trim().to_string();
-            let value = self.parse_value(parts[1].trim())?;
+        loop {
+            let column = self.identifier("column name")?;
+            self.expect(&TokenKind::Eq, "'=' in SET assignment")?;
+            let value = self.value()?;
             assignments.insert(column, value);
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
         }
 
-        let where_clause = if let Some(where_match) = captures.get(3) {
-            Some(self.parse_where_clause(where_match.as_str())?)
-        } else {
-            None
-        };
-
+        let where_clause = self.where_clause()?;
         Ok(Statement::Update {
-            table: table_name,
+            table,
             assignments,
             where_clause,
         })
     }
 
-    fn parse_delete(&self, sql: &str) -> Result<Statement> {
-        // DELETE FROM users WHERE id = 2
-
-        let re = regex!(r"(?i)DELETE\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?");
-
-        let captures = re
-            .captures(sql)
-            .ok_or_else(|| VelociError::ParseError("Invalid DELETE syntax".to_string()))?;
-
-        let table_name = captures.get(1).unwrap().as_str().to_string();
-
-        let where_clause = if let Some(where_match) = captures.get(2) {
-            Some(self.parse_where_clause(where_match.as_str())?)
-        } else {
-            None
-        };
-
+    fn delete(&mut self) -> Result<Statement> {
+        self.expect_keyword("DELETE")?;
+        self.expect_keyword("FROM")?;
+        let table = self.identifier("table name")?;
+        let where_clause = self.where_clause()?;
         Ok(Statement::Delete {
-            table: table_name,
+            table,
             where_clause,
         })
     }
 
-    fn parse_where_clause(&self, clause: &str) -> Result<WhereClause> {
-        // Split on AND (case-insensitive), respecting quoted strings
-        let parts = self.split_on_and(clause);
-        let mut conditions = Vec::new();
+    // ----- WHERE ---------------------------------------------------------
 
-        let re = regex!(r"(\w+)\s*(>=|<=|!=|<>|LIKE|=|>|<)\s*(.+)");
-
-        for part in &parts {
-            let part = part.trim();
-            let captures = re.captures(part).ok_or_else(|| {
-                VelociError::ParseError(format!("Invalid WHERE condition: {}", part))
-            })?;
-
-            let column = captures.get(1).unwrap().as_str().to_string();
-            let operator_str = captures.get(2).unwrap().as_str();
-            let operator = Operator::from_str(operator_str)?;
-            let value = self.parse_value(captures.get(3).unwrap().as_str().trim())?;
-
-            conditions.push(Condition {
-                column,
-                operator,
-                value,
-            });
+    fn where_clause(&mut self) -> Result<Option<WhereClause>> {
+        if !self.eat_keyword("WHERE") {
+            return Ok(None);
         }
-
-        if conditions.is_empty() {
-            return Err(VelociError::ParseError(format!(
-                "Empty WHERE clause: {}",
-                clause
-            )));
+        let mut conditions = vec![self.condition()?];
+        while self.eat_keyword("AND") {
+            conditions.push(self.condition()?);
         }
-
-        Ok(WhereClause { conditions })
+        if self.is_keyword("OR") {
+            return Err(self.error("OR in WHERE is not supported yet"));
+        }
+        Ok(Some(WhereClause { conditions }))
     }
 
-    fn split_on_and(&self, clause: &str) -> Vec<String> {
-        let mut parts = Vec::new();
-        let mut current = String::new();
-        let mut in_string = false;
-        let mut string_char = '\'';
-        let chars: Vec<char> = clause.chars().collect();
-        let mut i = 0;
+    fn condition(&mut self) -> Result<Condition> {
+        if self.peek_kind() == Some(&TokenKind::LParen) {
+            return Err(self.error("Parenthesized WHERE conditions are not supported yet"));
+        }
+        let column = self.identifier("column name in WHERE")?;
+        let operator = match self.peek_kind() {
+            Some(TokenKind::Eq) => Operator::Equal,
+            Some(TokenKind::NotEq) => Operator::NotEqual,
+            Some(TokenKind::Lt) => Operator::LessThan,
+            Some(TokenKind::LtEq) => Operator::LessThanOrEqual,
+            Some(TokenKind::Gt) => Operator::GreaterThan,
+            Some(TokenKind::GtEq) => Operator::GreaterThanOrEqual,
+            Some(TokenKind::Word(w)) if w.eq_ignore_ascii_case("LIKE") => Operator::Like,
+            _ => return Err(self.error("Expected a comparison operator")),
+        };
+        self.pos += 1;
+        let value = self.value()?;
+        Ok(Condition {
+            column,
+            operator,
+            value,
+        })
+    }
 
-        while i < chars.len() {
-            if in_string {
-                if chars[i] == string_char {
-                    in_string = false;
-                }
-                current.push(chars[i]);
-                i += 1;
-            } else if chars[i] == '\'' || chars[i] == '"' {
-                in_string = true;
-                string_char = chars[i];
-                current.push(chars[i]);
-                i += 1;
-            } else if i + 4 < chars.len()
-                && chars[i].is_whitespace()
-                && (chars[i + 1] == 'A' || chars[i + 1] == 'a')
-                && (chars[i + 2] == 'N' || chars[i + 2] == 'n')
-                && (chars[i + 3] == 'D' || chars[i + 3] == 'd')
-                && chars[i + 4].is_whitespace()
+    // ----- literals ------------------------------------------------------
+
+    fn value(&mut self) -> Result<Value> {
+        let Some(tok) = self.peek().cloned() else {
+            return Err(self.error("Expected a value"));
+        };
+        match &tok.kind {
+            TokenKind::Word(w) if w.eq_ignore_ascii_case("NULL") => {
+                self.pos += 1;
+                Ok(Value::Null)
+            }
+            TokenKind::Word(w)
+                if ["vector", "vector32", "vector64"]
+                    .iter()
+                    .any(|f| w.eq_ignore_ascii_case(f))
+                    && self.peek_kind_at(1) == Some(&TokenKind::LParen) =>
             {
-                parts.push(current);
-                current = String::new();
-                i += 5; // skip " AND "
-            } else {
-                current.push(chars[i]);
-                i += 1;
+                let start = self.pos;
+                self.pos += 1;
+                self.skip_balanced()?;
+                self.vector_literal(start)
             }
+            TokenKind::LBracket => {
+                let start = self.pos;
+                self.skip_balanced()?;
+                self.vector_literal(start)
+            }
+            TokenKind::String { value, .. } => {
+                self.pos += 1;
+                Ok(Value::Text(value.clone()))
+            }
+            TokenKind::Blob(hex) => {
+                self.pos += 1;
+                parse_blob(hex)
+            }
+            TokenKind::Number(_) | TokenKind::Minus | TokenKind::Plus => self.number(),
+            TokenKind::Word(_) => Err(self.error_at(
+                &tok,
+                "Expected a value (column references are not supported here; quote strings with '...')",
+            )),
+            _ => Err(self.error_at(&tok, "Expected a value")),
         }
-
-        if !current.trim().is_empty() {
-            parts.push(current);
-        }
-
-        parts
     }
 
-    fn parse_values(&self, values_str: &str) -> Result<Vec<Value>> {
-        let mut values = Vec::new();
-        let mut current = String::new();
-        let mut in_string = false;
-        let mut string_char = '\'';
-        let mut escaped = false;
-        let mut depth: usize = 0; // parens / brackets nesting outside strings
-
-        for ch in values_str.chars() {
-            if escaped {
-                current.push(ch);
-                escaped = false;
-            } else if ch == '\\' && in_string {
-                escaped = true;
-                current.push(ch);
-            } else if !in_string && (ch == '\'' || ch == '"') {
-                in_string = true;
-                string_char = ch;
-                current.push(ch);
-            } else if in_string && ch == string_char {
-                in_string = false;
-                current.push(ch);
-            } else if !in_string && (ch == '(' || ch == '[') {
-                depth += 1;
-                current.push(ch);
-            } else if !in_string && (ch == ')' || ch == ']') {
-                depth = depth.saturating_sub(1);
-                current.push(ch);
-            } else if !in_string && depth == 0 && ch == ',' {
-                values.push(self.parse_value(current.trim())?);
-                current = String::new();
-            } else {
-                current.push(ch);
-            }
+    fn vector_literal(&self, start: usize) -> Result<Value> {
+        let text = self.source_since(start);
+        match crate::vector::parse_vector_constructor(text) {
+            Some(parsed) => Ok(Value::Vector(parsed?)),
+            None => Err(VelociError::ParseError(format!(
+                "Invalid vector literal: {}",
+                text
+            ))),
         }
-
-        if !current.trim().is_empty() {
-            values.push(self.parse_value(current.trim())?);
-        }
-
-        Ok(values)
     }
 
-    fn parse_value(&self, s: &str) -> Result<Value> {
-        let s = s.trim();
-
-        // NULL
-        if s.to_uppercase() == "NULL" {
-            return Ok(Value::Null);
-        }
-
-        // Vector constructor: vector32('[...]'), vector('[...]') or bare [...]
-        if let Some(parsed) = crate::vector::parse_vector_constructor(s) {
-            // Quoted '[...]' strings stay Text unless explicitly constructed,
-            // so only accept unquoted forms here.
-            if !s.starts_with('\'') && !s.starts_with('"') {
-                return Ok(Value::Vector(parsed?));
-            }
-        }
-
-        // String (quoted) - handle escaped quotes
-        if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
-            let quote_char = s.chars().next().unwrap();
-            let content = &s[1..s.len() - 1];
-
-            // Handle escaped quotes
-            let unescaped = content
-                .replace(&format!("\\{}", quote_char), &quote_char.to_string())
-                .replace("\\\\", "\\");
-
-            return Ok(Value::Text(unescaped));
-        }
-
-        // Try integer
-        if let Ok(i) = s.parse::<i64>() {
+    fn number(&mut self) -> Result<Value> {
+        let negative = if self.eat(&TokenKind::Minus) {
+            true
+        } else {
+            self.eat(&TokenKind::Plus);
+            false
+        };
+        let text = self.number_token("a number")?;
+        let text = if negative { format!("-{}", text) } else { text };
+        if let Ok(i) = text.parse::<i64>() {
             return Ok(Value::Integer(i));
         }
-
-        // Try float
-        if let Ok(f) = s.parse::<f64>() {
-            return Ok(Value::Float(f));
-        }
-
-        // BLOB literal (X'hexdigits' or x'hexdigits')
-        if s.len() >= 3 && (s.starts_with("X'") || s.starts_with("x'")) && s.ends_with('\'') {
-            let hex_part = &s[2..s.len() - 1];
-            if hex_part.len() % 2 != 0 {
-                return Err(VelociError::ParseError(
-                    "Invalid BLOB literal: odd number of hex digits".to_string(),
-                ));
-            }
-
-            let mut blob = Vec::new();
-            for i in (0..hex_part.len()).step_by(2) {
-                let byte_str = &hex_part[i..i + 2];
-                match u8::from_str_radix(byte_str, 16) {
-                    Ok(byte) => blob.push(byte),
-                    Err(_) => {
-                        return Err(VelociError::ParseError(format!(
-                            "Invalid hex digit in BLOB: {}",
-                            byte_str
-                        )))
-                    }
-                }
-            }
-            return Ok(Value::Blob(blob));
-        }
-
-        // Default to text without quotes
-        Ok(Value::Text(s.to_string()))
+        text.parse::<f64>()
+            .map(Value::Float)
+            .map_err(|_| VelociError::ParseError(format!("Invalid number: {}", text)))
     }
+}
 
-    fn parse_identifier<'a>(&self, s: &'a str) -> Result<(String, &'a str)> {
-        let s = s.trim();
-
-        // Quoted identifier
-        if s.starts_with('"') || s.starts_with('`') || s.starts_with('[') {
-            let quote_char = s.chars().next().unwrap();
-            let end_quote = match quote_char {
-                '"' => '"',
-                '`' => '`',
-                '[' => ']',
-                _ => {
-                    return Err(VelociError::ParseError(
-                        "Invalid quote character".to_string(),
-                    ))
-                }
-            };
-
-            let mut identifier = String::new();
-            let mut escaped = false;
-
-            // Iterate over chars with their byte positions
-            let mut chars_iter = s.char_indices();
-
-            // Skip the opening quote
-            chars_iter.next();
-
-            for (pos, ch) in chars_iter {
-                if escaped {
-                    identifier.push(ch);
-                    escaped = false;
-                } else if ch == '\\' {
-                    escaped = true;
-                } else if ch == end_quote {
-                    // Calculate the remainder starting after the closing quote
-                    let rest_start = pos + ch.len_utf8();
-                    return Ok((identifier, &s[rest_start..]));
-                } else {
-                    identifier.push(ch);
-                }
-            }
-
-            return Err(VelociError::ParseError(
-                "Unterminated quoted identifier".to_string(),
-            ));
-        }
-
-        // Unquoted identifier (stops at first whitespace)
-        if let Some(space_pos) = s.find(char::is_whitespace) {
-            let (ident, rest) = s.split_at(space_pos);
-            Ok((ident.to_string(), rest))
-        } else {
-            Ok((s.to_string(), ""))
-        }
+fn parse_blob(hex: &str) -> Result<Value> {
+    if hex.len() % 2 != 0 {
+        return Err(VelociError::ParseError(
+            "Invalid BLOB literal: odd number of hex digits".to_string(),
+        ));
     }
-
-    fn split_sql_parts(&self, s: &str) -> Vec<String> {
-        let mut parts = Vec::new();
-        let mut current = String::new();
-        let mut in_string = false;
-        let mut string_char = '"';
-        let mut escaped = false;
-
-        for ch in s.chars() {
-            if escaped {
-                current.push(ch);
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-                current.push(ch);
-            } else if !in_string && (ch == '"' || ch == '\'') {
-                in_string = true;
-                string_char = ch;
-                current.push(ch);
-            } else if in_string && ch == string_char {
-                in_string = false;
-                current.push(ch);
-            } else if !in_string && ch.is_whitespace() {
-                if !current.is_empty() {
-                    parts.push(current);
-                    current = String::new();
-                }
-            } else {
-                current.push(ch);
-            }
-        }
-
-        if !current.is_empty() {
-            parts.push(current);
-        }
-
-        parts
-    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            hex.get(i..i + 2)
+                .and_then(|byte| u8::from_str_radix(byte, 16).ok())
+                .ok_or_else(|| {
+                    VelociError::ParseError(format!("Invalid hex digit in BLOB: {}", hex))
+                })
+        })
+        .collect::<Result<Vec<u8>>>()
+        .map(Value::Blob)
 }
 
 #[cfg(test)]
@@ -1161,6 +1006,20 @@ mod tests {
             }
             _ => panic!("Wrong statement type"),
         }
+    }
+
+    #[test]
+    fn test_parse_errors_point_at_offending_token() {
+        let parser = Parser::new();
+        let err = |sql: &str| match parser.parse(sql) {
+            Err(VelociError::ParseError(msg)) => msg,
+            other => panic!("expected a parse error for {:?}, got {:?}", sql, other),
+        };
+        assert!(err("SELECT * FROM t LIMIT").ends_with("at end of input"));
+        assert!(err("INSERT INTO t VALUES (1, -").ends_with("at end of input"));
+        assert!(err("CREATE TABLE t (a VARCHAR(").ends_with("at end of input"));
+        assert!(err("SELECT * FROM t WHERE a = 1 OR b = 2").contains("near 'OR'"));
+        assert!(err("SELECT * FROM t LIMIT x").contains("position 22 near 'x'"));
     }
 
     #[test]

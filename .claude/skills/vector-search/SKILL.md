@@ -51,14 +51,11 @@ LIMIT 5;
 
 ## Parser pitfalls (learned the hard way)
 
-- `vector32('[1, 2]')` contains commas and parens. Value splitting
-  (`parse_values`) and SELECT-column splitting (`split_top_level_commas`)
-  are quote/paren/bracket aware — never replace them with a naive
-  `split(',')`.
-- The INSERT regex captures VALUES greedily to the final `)`; a lazy
-  `[^)]+` would cut nested calls short.
-- ORDER BY is located with a quote-aware scan (`find_order_by`), not a
-  regex, because the expression may contain anything.
+- `vector32('[1, 2]')` contains commas and parens. The parser skips it as
+  a balanced token run (`Cursor::skip_balanced`) and hands the exact source
+  slice to `vector::parse_vector_constructor`; never re-split the SQL text.
+- SELECT items and the ORDER BY expression are also source slices, so the
+  executor sees them exactly as written (including inner whitespace).
 
 ## Tests
 

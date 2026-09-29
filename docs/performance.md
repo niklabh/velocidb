@@ -54,8 +54,8 @@ secondary indexes yet (roadmap P1).
 
 ## What the engine does today
 
-- **Cached SQL patterns.** The parser's regexes are compiled once per
-  process (`regex!` in `src/parser.rs`), not per statement.
+- **Single-pass parsing.** The parser tokenizes each statement once and
+  parses it by recursive descent; no regexes are involved.
 - **Primary-key lookups** for `WHERE pk = <integer>`.
 - **Buffered writes.** Pages modified in a write group stay in memory
   (`Pager::pending`) and hit the WAL once, at commit, in a single write.

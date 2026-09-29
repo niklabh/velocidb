@@ -220,8 +220,9 @@ Concurrency
   `BEGIN` … `COMMIT` — see [docs/performance.md](docs/performance.md).
 - **Only primary-key equality uses the index.** `WHERE pk = <integer>` is a
   B-tree lookup; every other `WHERE` scans the table (no secondary indexes).
-- **No `JOIN`, `GROUP BY`, sub-queries**, no indexes other than the primary
-  key.
+- **No `JOIN`, `GROUP BY`, sub-queries, `OR` in `WHERE`**, no indexes other
+  than the primary key. Unsupported syntax is a parse error, never silently
+  reinterpreted.
 - **Single primary key column.** Composite primary keys are not supported.
 - **Vector search is exact.** Every query scans all candidate rows
   (in parallel). Approximate indexing (HNSW/DiskANN-style) is future work,

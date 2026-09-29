@@ -55,7 +55,7 @@ the slow parts). All suites must pass before a change is complete.
 
 ## What to test for each kind of change
 
-- Parser change → unit test in `src/parser.rs` + one end-to-end query test.
+- Parser change → golden case in `tests/parser_golden.rs` (+ lexer unit test if tokens change) + one end-to-end query test.
 - Write-path / executor change → integration test + `recovery_tests` must
   still pass.
 - On-disk format change → reopen test + all of `recovery_tests`.

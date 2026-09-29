@@ -34,8 +34,9 @@ Ship before expanding the SQL surface or advertising full ACID.
 
 Unblock almost every later SQL and concurrency feature.
 
-- [ ] **Replace the regex parser** with a lexer + recursive-descent (or
+- [x] **Replace the regex parser** with a lexer + recursive-descent (or
       pest/lalrpop) AST; keep current SQL as golden tests
+      (`tests/parser_golden.rs`)
 - [ ] **Typed expression AST** — stop carrying distance calls / predicates as
       opaque strings
 - [ ] **Secondary indexes** — `CREATE INDEX` / `DROP INDEX` on one column;
@@ -67,7 +68,7 @@ Assumes a real parser (or at least a typed expression layer) is underway.
       `COUNT(*)`)
 - [ ] Prepared statements / bind parameters
 - [ ] Composite `PRIMARY KEY` and multi-column `UNIQUE`
-- [ ] Quoted identifiers
+- [x] Quoted identifiers (`"x"`, `` `x` ``, `[x]` wherever a name is expected)
 - [ ] Subqueries / `IN (SELECT …)` (non-correlated first)
 - [ ] `ORDER BY` / `SELECT` expressions beyond vector distance helpers
 
@@ -146,7 +147,7 @@ CHANGELOG.
 1. ~~CI + enforce `UNIQUE`~~ (done)
 2. ~~Multi-statement WAL groups + real `ROLLBACK`~~ (done)
 3. ~~Primary-key point lookups + fewer fsyncs per commit~~ (done)
-4. Lexer / parser + golden tests
+4. ~~Lexer / parser + golden tests~~ (done)
 5. Secondary indexes + equality probe
 6. `OR` → `INNER JOIN` → `GROUP BY` aggregates
 7. Durable CDC + approximate vector index

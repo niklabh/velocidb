@@ -141,8 +141,9 @@ is checked by a scan.
 
 ## SQL
 
-`src/parser.rs` is a regex- and string-splitting parser (a real lexer/parser
-is roadmap item P1). It produces a `Statement` enum:
+`src/parser.rs` is a recursive-descent parser over the tokens produced by
+`src/parser/lexer.rs` (tokens carry byte spans into the source). It produces
+a `Statement` enum:
 
 - DDL: `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE` (rename table, rename /
   add / drop column)
@@ -151,6 +152,13 @@ is roadmap item P1). It produces a `Statement` enum:
   `WHERE` with comparison operators and `LIKE` joined by `AND`;
   `ORDER BY` a column or distance expression; `LIMIT`
 - `BEGIN` / `COMMIT` / `ROLLBACK`
+
+Identifiers may be quoted as `"name"`, `` `name` `` or `[name]`. String
+literals use `'...'` (`''` or `\'` for a quote). Anything the grammar does not
+cover — `OR`, parenthesized conditions, `AS`, multi-row `VALUES`, unknown
+column constraints such as `DEFAULT` — is a parse error rather than being
+misread. The grammar is documented on `Parser` in `src/parser.rs`, and
+`tests/parser_golden.rs` pins the AST for ~180 statements.
 
 Constraints: `PRIMARY KEY` (required, single integer column), `NOT NULL`,
 `UNIQUE` (NULLs never conflict), and vector dimension checks.
