@@ -19,11 +19,14 @@ transaction, is one atomic WAL group (`src/storage.rs`):
 3. Executor runs the statement; `save_schema` runs **inside the same group**
    if the statement was DDL or changed a B-tree root.
 4. On success: auto-commit → `pager.commit_group()`:
-   a. PAGE_WRITE record for every pending page + COMMIT record, **fsync WAL**
-      (durability point; if this fails the group is aborted),
-   b. apply pending pages to the data file,
-   c. **fsync data file**,
-   d. truncate WAL.
+   a. `wal.append_group`: PAGE_WRITE record for every pending page + COMMIT
+      record in one write at the WAL's committed length, **fsync WAL** — the
+      durability point and the only commit-path fsync. On failure the WAL is
+      cut back to its previous length and the group is aborted.
+   b. pending pages move to `Pager::committed` (served from memory),
+   c. if the WAL ≥ `CHECKPOINT_WAL_BYTES`, `checkpoint()`: write committed
+      pages to the data file, **fsync data file**, truncate + fsync WAL. A
+      checkpoint failure is logged, not returned — the commit is durable.
    In a transaction → `release_savepoint()`; `Database::commit` later runs
    `commit_group()` for the whole transaction.
 5. On error: `abort_group()` (auto-commit) or `rollback_to_savepoint()` (in a
@@ -35,8 +38,16 @@ transaction, is one atomic WAL group (`src/storage.rs`):
 
 Invariants:
 
-- The WAL fsync in 4a MUST happen before any data-file mutation.
+- The data file is written only by `checkpoint` (and recovery), only with
+  pages already durable in the WAL.
 - The WAL is truncated only after the data file is fsynced.
+- Recovery always resets a non-empty WAL, and appends start at the committed
+  length — never append after bytes recovery would stop at.
+- Read-path invariant: a cached page equals its newest version (pending,
+  else committed, else disk). Anything that discards buffered pages must
+  evict them from the cache.
+- `Pager::flush` (close / drop) checkpoints; a crash leaves committed pages
+  in the WAL for recovery. Tests simulate a crash with `std::mem::forget(db)`.
 - Only one write group can be active; the `writer` mutex guarantees it.
   `Pager::begin_group` errors if a group is already active — if you see this,
   a code path is writing without holding the writer mutex.

@@ -6,6 +6,12 @@ All notable changes to VelociDB are documented in this file.
 
 ### Fixed (P0 correctness)
 
+- **Recovery could strand later commits.** If the WAL contained only a torn
+  or uncommitted tail, recovery left it in place and new commits were
+  appended after it; a crash before those commits reached the data file
+  lost them, because the next recovery stopped at the garbage. Recovery now always resets the WAL, and a failed WAL append is
+  truncated back to the last committed group.
+
 - **`ROLLBACK` now undoes storage.** `BEGIN` opens a single WAL group that
   spans every statement until `COMMIT`; `ROLLBACK` (or closing the database
   without committing) discards all of it, including schema changes. Pages
@@ -36,6 +42,12 @@ All notable changes to VelociDB are documented in this file.
 
 ### Performance
 
+- **One fsync per commit (WAL checkpointing).** A commit appends its pages
+  and COMMIT record to the WAL in one write and fsyncs once. Committed pages
+  are served from memory until a checkpoint (at 4 MiB of WAL, and on close)
+  applies them to the data file. Previously every commit fsynced the WAL,
+  applied pages, fsynced the data file, then truncated and fsynced the WAL.
+  Auto-commit INSERT on macOS: ~74 → ~245 rows/s.
 - **Primary-key lookups.** `WHERE <pk> = <integer>` (alone or with other
   ANDed conditions) uses `BTree::search` instead of a full scan for SELECT,
   UPDATE and DELETE: ~850 → ~193,000 queries/s on a 2,000-row table.
@@ -65,6 +77,10 @@ All notable changes to VelociDB are documented in this file.
 - CI (`.github/workflows/ci.yml`): tests on Linux and macOS, doc tests,
   clippy with `-D warnings`, and a build + unit-test job for
   `--features experimental`.
+- Five crash tests in `tests/recovery_tests.rs` (simulated with
+  `mem::forget`): uncheckpointed commits survive, uncommitted transactions
+  are lost, the WAL stays bounded by checkpoints, commits after a torn-tail
+  recovery survive, repeated crashes. Plus `append_group` unit tests.
 - `tests/transaction_tests.rs` (12 tests): rollback of DML and DDL, commit
   and reopen, uncommitted-on-close, rollback across B-tree splits,
   savepoints, CDC publication, `UNIQUE` on insert/update/reopen.

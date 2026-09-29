@@ -45,10 +45,14 @@ Unblock almost every later SQL and concurrency feature.
 - [ ] **Concurrent-writer / deadlock stress tests** beyond the 30s lock timeout
 - [x] **Primary-key point lookups** — use `BTree::search` for `WHERE pk = …`
       instead of a full scan
-- [ ] **Fewer fsyncs per commit** — checkpoint the WAL periodically instead
-      of truncating (and fsyncing) after every commit; measured auto-commit
-      INSERT is ~79 rows/s on macOS vs ~49,800 rows/s batched in one
-      transaction (see `docs/performance.md`)
+- [x] **Fewer fsyncs per commit** — one fsync per commit; the WAL is
+      checkpointed at 4 MiB and on close (auto-commit INSERT ~79 → ~245 rows/s
+      on macOS, see `docs/performance.md`)
+- [ ] **Durability level option** — e.g. a `synchronous = NORMAL`-style mode
+      (plain `fsync` instead of `F_FULLFSYNC` on macOS, or fsync only at
+      checkpoint) for callers that accept losing the last commits on power loss
+- [ ] **Group commit** — let concurrent auto-commit writers share one WAL
+      fsync
 
 ---
 
@@ -141,7 +145,7 @@ CHANGELOG.
 
 1. ~~CI + enforce `UNIQUE`~~ (done)
 2. ~~Multi-statement WAL groups + real `ROLLBACK`~~ (done)
-3. ~~Primary-key point lookups~~ (done) + fewer fsyncs per commit
+3. ~~Primary-key point lookups + fewer fsyncs per commit~~ (done)
 4. Lexer / parser + golden tests
 5. Secondary indexes + equality probe
 6. `OR` → `INNER JOIN` → `GROUP BY` aggregates

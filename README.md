@@ -147,9 +147,9 @@ Storage and durability
 - 4 KB page-based storage on a single data file.
 - **Write-ahead log** (`<db>-wal`) with CRC32-checked records. Each write
   statement — or each explicit `BEGIN` … `COMMIT` transaction — runs as one
-  atomic group: modified pages are buffered in memory, written to the WAL and
-  fsynced on commit, then applied to the data file, fsynced, and the WAL
-  truncated.
+  atomic group: modified pages are buffered in memory, then appended to the
+  WAL with a single fsync on commit. Checkpoints copy committed pages into
+  the data file when the WAL reaches 4 MiB and on close.
 - Crash recovery on open: committed groups in the WAL are replayed; partial
   / torn / uncommitted records are discarded.
 - DashMap-backed read cache with bounded capacity.
@@ -215,9 +215,9 @@ Concurrency
   are held in memory until COMMIT.
 - **`UNIQUE` checks scan the table.** Without secondary indexes, inserting
   into or updating a `UNIQUE` column is O(rows).
-- **Auto-commit writes are fsync-bound.** Each commit does three fsyncs, so
-  single-statement writes are slow (tens per second on macOS). Batch writes
-  in `BEGIN` … `COMMIT` — see [docs/performance.md](docs/performance.md).
+- **Auto-commit writes are fsync-bound.** Each commit does one full fsync
+  (a few hundred commits per second on macOS). Batch writes in
+  `BEGIN` … `COMMIT` — see [docs/performance.md](docs/performance.md).
 - **Only primary-key equality uses the index.** `WHERE pk = <integer>` is a
   B-tree lookup; every other `WHERE` scans the table (no secondary indexes).
 - **No `JOIN`, `GROUP BY`, sub-queries**, no indexes other than the primary

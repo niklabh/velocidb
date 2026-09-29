@@ -50,7 +50,9 @@ below depends on them.
   [`.claude/skills/storage-format`](../.claude/skills/storage-format/SKILL.md).
 - `Pager::read_page` looks in the active write group's `pending` buffer
   first, then the read cache (a bounded `DashMap`, evicting an arbitrary
-  entry when full), then the file.
+  entry when full), then `committed` (pages committed to the WAL but not yet
+  checkpointed), then the file. A cached page always equals its newest
+  version, because aborts and savepoint rollbacks evict what they discard.
 - `Pager::write_page` never touches the file: it buffers the page in
   `pending` and refreshes the cache.
 
@@ -65,16 +67,25 @@ Every change is part of a **write group**:
 
 Commit (`Pager::commit_group`) is the only place the WAL is written:
 
-1. Append one PAGE_WRITE record per pending page and a COMMIT record.
-2. **fsync the WAL** — the durability point. If this fails, the group is
-   aborted.
-3. Write the pages to the data file and fsync it.
-4. Truncate the WAL.
+1. Append one PAGE_WRITE record per pending page plus a COMMIT record, in a
+   single write at the end of the last committed group.
+2. **fsync the WAL** — the durability point, and the only fsync on the
+   commit path. If the write or fsync fails, the WAL is cut back to its
+   previous length and the group is aborted.
+3. Move the pages from `pending` to `committed`. Reads are served from there
+   (and the cache) until a checkpoint.
+
+A **checkpoint** (`Pager::checkpoint`) writes every committed page into the
+data file, fsyncs it, and truncates the WAL (also fsynced). It runs when the
+WAL reaches `CHECKPOINT_WAL_BYTES` (4 MiB) and when the database is closed.
+A failed checkpoint keeps the pages in `committed` and retries later; the
+commit itself already succeeded.
 
 On open, `Pager::recover` replays every group in the WAL that has a COMMIT
-record and discards a torn tail or uncommitted records. Because the data file
-is only written after the WAL fsync, a crash at any point leaves either the
-old state or a replayable committed group.
+record, discards a torn tail or uncommitted records, and always resets the
+WAL, so leftover garbage can never sit in front of later commits. The data
+file is only written from pages already durable in the WAL, so a crash at
+any point leaves either the old state or a replayable committed group.
 
 **Abort** (`abort_group`) drops `pending`, evicts those pages from the cache,
 and restores the page count. Since nothing was logged, there is nothing to

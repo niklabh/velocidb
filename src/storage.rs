@@ -23,6 +23,8 @@ use std::sync::Arc;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const CACHE_SIZE: usize = 1024; // Number of pages to cache
+/// WAL size at which a commit triggers a checkpoint (~1,000 page records).
+pub const CHECKPOINT_WAL_BYTES: u64 = 4 * 1024 * 1024;
 
 #[repr(C, align(4096))]
 #[derive(Clone, Debug)]
@@ -56,8 +58,9 @@ impl Default for Page {
 ///
 /// All page mutations flow through `write_page`. If a "write group" is active
 /// (started by `begin_group`), the page is buffered in `pending` until
-/// `commit_group` appends every buffered page to the WAL, fsyncs it, and
-/// applies the pages to the data file. With no active group, `write_page`
+/// `commit_group` appends every buffered page to the WAL and fsyncs it. The
+/// committed pages then live in `committed` (and the WAL) until `checkpoint`
+/// copies them into the data file. With no active group, `write_page`
 /// opens an implicit single-write group, giving every standalone write its own
 /// atomic WAL transaction.
 ///
@@ -68,7 +71,8 @@ impl Default for Page {
 /// undone with `rollback_to_savepoint` without aborting the whole group.
 ///
 /// Reads consult `pending` first (so writes within the active group are
-/// visible to subsequent reads), then the page cache, then the data file.
+/// visible to subsequent reads), then `committed`, then the page cache, then
+/// the data file.
 pub struct Pager {
     file: File,
     num_pages: u64,
@@ -78,6 +82,9 @@ pub struct Pager {
     wal: WalManager,
     active_group: Option<u64>,
     pending: HashMap<PageId, Page>,
+    /// Pages committed to the WAL but not yet checkpointed into the data file.
+    /// Authoritative over the data file (and never evicted) until checkpoint.
+    committed: HashMap<PageId, Page>,
     /// `num_pages` when the active group began; restored on abort.
     group_start_pages: u64,
     /// Active savepoint: prior `pending` entry of every page written since
@@ -118,6 +125,7 @@ impl Pager {
             wal,
             active_group: None,
             pending: HashMap::new(),
+            committed: HashMap::new(),
             group_start_pages: num_pages,
             savepoint: None,
         };
@@ -127,20 +135,47 @@ impl Pager {
     }
 
     /// Replays any committed WAL groups onto the data file, then truncates the
-    /// WAL. Safe to call multiple times (truncated WAL yields zero groups).
+    /// WAL. The WAL is reset even when nothing was committed, so a torn or
+    /// uncommitted tail can never sit in front of later appends. Safe to call
+    /// multiple times (an empty WAL yields zero groups).
     fn recover(&mut self) -> Result<()> {
-        let groups = self.wal.read_committed_groups()?;
-        if groups.is_empty() {
+        if self.wal.size() == 0 {
             return Ok(());
         }
+        let groups = self.wal.read_committed_groups()?;
         for group in &groups {
             for (page_id, data) in &group.writes {
                 self.write_page_raw(*page_id, data)?;
             }
         }
-        self.file.sync_data()?;
+        if !groups.is_empty() {
+            self.file.sync_data()?;
+        }
         self.wal.truncate()?;
         Ok(())
+    }
+
+    /// Copies every committed-but-unapplied page into the data file, fsyncs
+    /// it, then truncates the WAL. On failure the pages stay in `committed`
+    /// (they are still durable in the WAL) and the next checkpoint retries.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        if self.committed.is_empty() {
+            return Ok(());
+        }
+        let committed = std::mem::take(&mut self.committed);
+        let applied = (|| -> Result<()> {
+            let mut page_ids: Vec<&PageId> = committed.keys().collect();
+            page_ids.sort_unstable();
+            for page_id in page_ids {
+                self.write_page_raw(*page_id, committed[page_id].data())?;
+            }
+            self.file.sync_data()?;
+            self.wal.truncate()
+        })();
+        if applied.is_err() {
+            self.committed = committed;
+        }
+        applied
     }
 
     /// Writes a page directly to the data file (no WAL, no cache, no pending).
@@ -183,9 +218,11 @@ impl Pager {
     }
 
     /// Commits the active write group: appends every buffered page and a
-    /// COMMIT record to the WAL, fsyncs it (the durability point), applies
-    /// the pages to the data file, fsyncs the data file, then truncates the
-    /// WAL. If writing the WAL fails the group is aborted.
+    /// COMMIT record to the WAL in one write and fsyncs it (the durability
+    /// point, and the only fsync on the commit path). The pages move to
+    /// `committed`; once the WAL passes `CHECKPOINT_WAL_BYTES` they are
+    /// checkpointed into the data file. If writing the WAL fails the group is
+    /// aborted.
     pub fn commit_group(&mut self) -> Result<()> {
         let group_id = self.active_group.ok_or_else(|| {
             VelociError::TransactionError("No active write group to commit".to_string())
@@ -198,28 +235,28 @@ impl Pager {
             return Ok(());
         }
 
-        let logged = (|| -> Result<()> {
-            let mut page_ids: Vec<PageId> = self.pending.keys().copied().collect();
-            page_ids.sort_unstable();
-            for page_id in page_ids {
-                self.wal
-                    .log_page_write(group_id, page_id, self.pending[&page_id].data())?;
-            }
-            self.wal.log_commit(group_id)
-        })();
+        let mut page_ids: Vec<PageId> = self.pending.keys().copied().collect();
+        page_ids.sort_unstable();
+        let pending = &self.pending;
+        let logged = self.wal.append_group(
+            group_id,
+            page_ids.iter().map(|id| (*id, pending[id].data())),
+        );
         if let Err(e) = logged {
-            // No COMMIT record is durable, so recovery ignores what was logged.
+            // No COMMIT record is durable, so recovery ignores the group.
             let _ = self.abort_group();
             return Err(e);
         }
         self.active_group = None;
+        self.committed.extend(std::mem::take(&mut self.pending));
 
-        let pending = std::mem::take(&mut self.pending);
-        for (page_id, page) in &pending {
-            self.write_page_raw(*page_id, page.data())?;
+        if self.wal.size() >= CHECKPOINT_WAL_BYTES {
+            // The commit is already durable; a failed checkpoint only delays
+            // moving pages into the data file and is retried next time.
+            if let Err(e) = self.checkpoint() {
+                tracing::warn!("checkpoint failed, will retry: {}", e);
+            }
         }
-        self.file.sync_data()?;
-        self.wal.truncate()?;
         Ok(())
     }
 
@@ -302,21 +339,28 @@ impl Pager {
             return Ok(Arc::new(RwLock::new(page.clone())));
         }
 
+        // Invariant: a cached page always equals its newest version (pending,
+        // else committed, else on disk). `write_page` caches what it buffers,
+        // and abort / savepoint rollback evict what they discard.
         if let Some(page) = self.cache.get(&page_id) {
             return Ok(page.clone());
         }
 
-        if page_id >= self.num_pages {
-            return Err(VelociError::NotFound(format!(
-                "Page {} out of bounds",
-                page_id
-            )));
-        }
-
-        let mut page = Page::new();
-        let offset = page_id * PAGE_SIZE as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut page.data)?;
+        let page = if let Some(page) = self.committed.get(&page_id) {
+            page.clone()
+        } else {
+            if page_id >= self.num_pages {
+                return Err(VelociError::NotFound(format!(
+                    "Page {} out of bounds",
+                    page_id
+                )));
+            }
+            let mut page = Page::new();
+            let offset = page_id * PAGE_SIZE as u64;
+            self.file.seek(SeekFrom::Start(offset))?;
+            self.file.read_exact(&mut page.data)?;
+            page
+        };
 
         let page_arc = Arc::new(RwLock::new(page));
 
@@ -405,6 +449,7 @@ impl Pager {
         if self.active_group.is_some() {
             let _ = self.abort_group();
         }
+        self.checkpoint()?;
         self.file.sync_all()?;
         Ok(())
     }

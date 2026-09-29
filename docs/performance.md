@@ -11,32 +11,39 @@ Measured on an Apple M4 Max (APFS, internal SSD) with a release build and
 
 | Workload | Result |
 |----------|--------|
-| INSERT, auto-commit (one statement per write group) | ~79 rows/s |
-| INSERT, all 2,000 inside one `BEGIN` … `COMMIT` | ~49,800 rows/s |
-| `SELECT * FROM t WHERE id = ?` (primary-key lookup) | ~193,000 queries/s |
+| INSERT, auto-commit (one statement per write group) | ~245 rows/s |
+| INSERT, all 2,000 inside one `BEGIN` … `COMMIT` | ~60,000–68,000 rows/s |
+| `SELECT * FROM t WHERE id = ?` (primary-key lookup) | ~160,000–190,000 queries/s |
 | `SELECT * FROM t WHERE v = ?` (non-key column, scans 2,000 rows) | ~1,800 queries/s |
 
-Before the fixes in the Unreleased changelog (regexes compiled on every parse,
-no primary-key lookups), the same machine measured ~4,600 rows/s batched and
-~850 queries/s for a primary-key lookup.
+Before the changes in the Unreleased changelog, the same machine measured
+~74 rows/s auto-commit, ~4,600 rows/s batched and ~850 queries/s for a
+primary-key lookup. The causes were three fsyncs per commit, regexes
+compiled on every parse, and no primary-key lookups.
 
 Treat these as a baseline, not a target. They are hardware- and
 filesystem-dependent. macOS `fsync` (`F_FULLFSYNC`) is much slower than
 Linux `fsync` on most SSDs.
 
-### Why auto-commit writes are slow
+### Commit cost: one fsync
 
-Each commit issues **three fsyncs**: the WAL after the COMMIT record, the data
-file after the pages are applied, and the WAL again after it is truncated
-(truncation must be durable, or stale committed groups could be replayed
-over newer data). Fsync latency dominates small writes.
+A commit appends the group's page images and a COMMIT record to the WAL in a
+single write and issues **one fsync**. Committed pages are served from
+memory until a **checkpoint** copies them into the data file, fsyncs it, and
+truncates the WAL. Checkpoints run when the WAL reaches 4 MiB
+(`CHECKPOINT_WAL_BYTES`) and on close, so their fsyncs are amortized over
+many commits. (Before checkpointing, every commit paid three fsyncs.)
+
+That one fsync still dominates small writes. On macOS, Rust's
+`File::sync_data` issues `F_FULLFSYNC`, which flushes the drive's write
+cache: the only fsync macOS guarantees survives power loss, and it takes a
+few milliseconds. VelociDB keeps this full durability. For comparison,
+SQLite on macOS uses a plain `fsync` unless `PRAGMA fullfsync` is set.
+Linux `fdatasync` is typically much cheaper.
 
 **Batch writes in an explicit transaction.** All statements then share one
-write group: one set of fsyncs, and each page is written to the WAL once
-however many times the transaction touched it. That is the ~600× gap above.
-
-Reducing per-commit fsyncs (checkpointing the WAL instead of truncating on
-every commit, as SQLite's WAL mode does) is on the roadmap.
+write group and one fsync, and each page goes to the WAL once however many
+times the transaction touched it. That is the ~250× gap above.
 
 ### Lookups and scans
 
@@ -51,7 +58,9 @@ secondary indexes yet (roadmap P1).
   process (`regex!` in `src/parser.rs`), not per statement.
 - **Primary-key lookups** for `WHERE pk = <integer>`.
 - **Buffered writes.** Pages modified in a write group stay in memory
-  (`Pager::pending`) and hit the WAL once, at commit.
+  (`Pager::pending`) and hit the WAL once, at commit, in a single write.
+- **Checkpointing.** Committed pages are served from memory
+  (`Pager::committed`) until a checkpoint moves them into the data file.
 - **Read cache.** A bounded `DashMap` of up to 1,024 pages (`CACHE_SIZE`).
   Eviction picks an arbitrary entry, not LRU.
 - **Parallel execution.** For inputs of 1,024 rows or more
