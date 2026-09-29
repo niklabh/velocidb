@@ -41,8 +41,9 @@ Unblock almost every later SQL and concurrency feature.
       opaque strings
 - [ ] **Secondary indexes** — `CREATE INDEX` / `DROP INDEX` on one column;
       maintain on write; equality probe in the executor (range scans later)
-- [ ] **Parser fuzzing** (and/or property tests) for statement splitting and
-      value parsing
+- [x] **Parser fuzzing** (and/or property tests) for statement splitting and
+      value parsing (`tests/parser_proptest.rs`: AST → SQL → AST round-trip,
+      split round-trip, no panics on arbitrary input)
 - [ ] **Concurrent-writer / deadlock stress tests** beyond the 30s lock timeout
 - [x] **Primary-key point lookups** — use `BTree::search` for `WHERE pk = …`
       instead of a full scan

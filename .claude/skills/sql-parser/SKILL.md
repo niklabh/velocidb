@@ -24,7 +24,10 @@ description: Extending VelociDB's SQL parser in src/parser.rs - the lexer (src/p
    (`eat_keyword` / `expect_keyword`). Words that delimit clauses are in
    `RESERVED` and cannot be bare names (quote them instead).
 4. `Parser::parse` accepts one optional trailing `;` and errors on anything
-   after it.
+   after it. Multi-statement text (the REPL) goes through
+   `split_statements`, which splits on `;` tokens — never on raw `;` chars.
+5. `X'..'` lexes as a blob only where a value can start (after punctuation,
+   an operator, or `LIKE`); after a name, `x` is an identifier.
 
 ## Adding syntax checklist
 
@@ -55,6 +58,10 @@ description: Extending VelociDB's SQL parser in src/parser.rs - the lexer (src/p
   syntax form (and a malformed variant) to `CASES`, run
   `UPDATE_GOLDEN=1 cargo test --test parser_golden`, and review the diff of
   the `.golden` file — unintended lines changing means a regression.
+- `tests/parser_proptest.rs` renders random `Statement`s to SQL and parses
+  them back. When adding syntax, extend its generator (`statement()`) and
+  renderer (`render_tokens`) so the new form is round-tripped too; keep its
+  `RESERVED` copy in sync with `src/parser.rs`.
 - Lexer unit tests live in `src/parser/lexer.rs`.
 - Add an end-to-end test in `tests/` too; the executor is where mis-parses
   surface.

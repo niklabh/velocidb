@@ -25,6 +25,17 @@ All notable changes to VelociDB are documented in this file.
   references. Unknown column constraints (`DEFAULT`, `AUTOINCREMENT`, ...)
   and anything after the end of a statement are errors instead of being
   ignored. Parse errors report the position of the offending token.
+- **REPL statement splitting uses the lexer** (`parser::split_statements`,
+  `parser::has_complete_statement`). A `;` inside `'it\'s; ok'`, a backtick
+  identifier or a `--` comment no longer splits a statement, and a string
+  left open across lines keeps the REPL reading.
+- `LIKE` wildcards (`%`, `_`) now match newlines.
+- `WHERE x='a'` (a column named `x` right before a string) is no longer
+  lexed as a blob literal; `X'..'` is a blob only where a value can start.
+- Property tests (`tests/parser_proptest.rs`) render random ASTs to SQL
+  with random whitespace, comments, case and quoting and check they parse
+  back identically, check statement splitting the same way, and feed
+  arbitrary input to the lexer and parser.
 - New: `''` escapes a quote in strings (`'it''s'`; `\'` still works),
   `--` comments, `==`, lowercase `like`, `END [TRANSACTION]`, type
   arguments such as `VARCHAR(255)` / `DECIMAL(10, 2)`, and quoted

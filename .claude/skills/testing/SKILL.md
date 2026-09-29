@@ -10,6 +10,8 @@ description: How to run and write VelociDB tests - test suite layout, commands, 
 | Suite | Location | Covers |
 |-------|----------|--------|
 | Unit tests | `#[cfg(test)] mod tests` in each `src/*.rs` | parser, btree (incl. proptest), wal, vector, cdc, async_api, storage |
+| `tests/parser_golden.rs` | parser | AST of ~180 statements vs `tests/golden/parser.golden` (`UPDATE_GOLDEN=1` to regenerate) |
+| `tests/parser_proptest.rs` | parser | AST → SQL → AST round-trip, `split_statements`, no panics |
 | `tests/integration_tests.rs` | full SQL path | CRUD, WHERE, ORDER BY, LIMIT, constraints |
 | `tests/recovery_tests.rs` | crash safety | WAL replay, torn tails, uncommitted groups, reopen persistence |
 | `tests/transaction_tests.rs` | transactions + constraints | ROLLBACK of DML/DDL, uncommitted-on-close, savepoints, CDC publication, `UNIQUE` |

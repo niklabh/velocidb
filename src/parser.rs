@@ -164,7 +164,8 @@ impl Operator {
             (Operator::LessThanOrEqual, Value::Text(a), Value::Text(b)) => Ok(a <= b),
             (Operator::Like, Value::Text(a), Value::Text(pattern)) => {
                 // Convert SQL LIKE pattern to regex character by character
-                let mut regex_pattern = String::from("^");
+                // (?s): `%` and `_` match newlines too.
+                let mut regex_pattern = String::from("(?s)^");
                 for ch in pattern.chars() {
                     match ch {
                         '%' => regex_pattern.push_str(".*"),
@@ -189,6 +190,42 @@ impl Operator {
                 actual: format!("{:?}", left),
             }),
         }
+    }
+}
+
+/// Splits `sql` into statements at top-level `;` tokens; a `;` inside a
+/// string, quoted identifier or `--` comment does not split. Returns the
+/// source text of each non-empty statement without its `;` or surrounding
+/// whitespace and comments.
+pub fn split_statements(sql: &str) -> Result<Vec<&str>> {
+    let tokens = lexer::tokenize(sql)?;
+    let mut out = Vec::new();
+    let mut current: Option<(usize, usize)> = None;
+    for tok in &tokens {
+        if tok.kind == TokenKind::Semicolon {
+            if let Some((start, end)) = current.take() {
+                out.push(&sql[start..end]);
+            }
+        } else {
+            let start = current.map_or(tok.start, |(start, _)| start);
+            current = Some((start, tok.end));
+        }
+    }
+    if let Some((start, end)) = current {
+        out.push(&sql[start..end]);
+    }
+    Ok(out)
+}
+
+/// Whether `sql` holds at least one `;`-terminated statement, for the REPL
+/// to decide when to stop reading lines. Input that ends inside a string or
+/// quoted identifier is incomplete. Other tokenizer errors count as complete
+/// once the text ends in `;`, so the caller runs it and reports the error.
+pub fn has_complete_statement(sql: &str) -> bool {
+    match lexer::tokenize(sql) {
+        Ok(tokens) => tokens.iter().any(|t| t.kind == TokenKind::Semicolon),
+        Err(e) if e.unterminated => false,
+        Err(_) => sql.trim_end().ends_with(';'),
     }
 }
 
@@ -1020,6 +1057,39 @@ mod tests {
         assert!(err("CREATE TABLE t (a VARCHAR(").ends_with("at end of input"));
         assert!(err("SELECT * FROM t WHERE a = 1 OR b = 2").contains("near 'OR'"));
         assert!(err("SELECT * FROM t LIMIT x").contains("position 22 near 'x'"));
+    }
+
+    #[test]
+    fn test_like_wildcards_match_newlines() {
+        let text = Value::Text("multi\nline;".to_string());
+        let like = |p: &str| Operator::Like.evaluate(&text, &Value::Text(p.to_string()));
+        assert!(like("%;%").unwrap());
+        assert!(like("multi_line;").unwrap());
+        assert!(!like("multi%x").unwrap());
+    }
+
+    #[test]
+    fn test_split_statements() {
+        assert_eq!(
+            split_statements("SELECT 1;; INSERT INTO t VALUES ('a;b', 'it\\'s;') ;\n-- c;\n x")
+                .unwrap(),
+            vec!["SELECT 1", "INSERT INTO t VALUES ('a;b', 'it\\'s;')", "x"]
+        );
+        assert_eq!(
+            split_statements(" ; -- only a comment").unwrap(),
+            Vec::<&str>::new()
+        );
+        assert!(split_statements("SELECT 'open;").is_err());
+    }
+
+    #[test]
+    fn test_has_complete_statement() {
+        assert!(has_complete_statement("SELECT * FROM t;"));
+        assert!(!has_complete_statement("SELECT * FROM t"));
+        assert!(!has_complete_statement("INSERT INTO t VALUES ('a;"));
+        assert!(!has_complete_statement("SELECT 1 -- done;"));
+        assert!(has_complete_statement("SELECT @;"));
+        assert!(!has_complete_statement("SELECT @"));
     }
 
     #[test]

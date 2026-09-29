@@ -5,7 +5,7 @@
 //! expressions it still passes to the executor as strings (select-list items,
 //! `ORDER BY` expressions, vector constructors).
 
-use crate::types::{Result, VelociError};
+use crate::types::VelociError;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
@@ -59,7 +59,24 @@ fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-pub fn tokenize(sql: &str) -> Result<Vec<Token>> {
+/// A tokenizer failure. `unterminated` is set when the input ended inside a
+/// quoted string, identifier or blob, i.e. more input could complete it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LexError {
+    pub offset: usize,
+    pub message: String,
+    pub unterminated: bool,
+}
+
+impl From<LexError> for VelociError {
+    fn from(e: LexError) -> Self {
+        VelociError::ParseError(format!("{} at position {}", e.message, e.offset))
+    }
+}
+
+type LexResult<T> = std::result::Result<T, LexError>;
+
+pub fn tokenize(sql: &str) -> LexResult<Vec<Token>> {
     let mut lexer = Lexer {
         sql,
         chars: sql.char_indices().peekable(),
@@ -96,7 +113,25 @@ impl<'a> Lexer<'a> {
         self.tokens.push(Token { kind, start, end });
     }
 
-    fn run(&mut self) -> Result<()> {
+    /// `X'...'` is a blob literal only where a value can start; after a
+    /// name (`WHERE x='a'`) the `x` is an identifier. `LIKE` is the only
+    /// keyword directly followed by a value.
+    fn blob_allowed(&self) -> bool {
+        match self.tokens.last().map(|t| &t.kind) {
+            Some(TokenKind::Word(w)) => w.eq_ignore_ascii_case("LIKE"),
+            Some(
+                TokenKind::QuotedIdent(_)
+                | TokenKind::String { .. }
+                | TokenKind::Number(_)
+                | TokenKind::Blob(_)
+                | TokenKind::RParen
+                | TokenKind::RBracket,
+            ) => false,
+            _ => true,
+        }
+    }
+
+    fn run(&mut self) -> LexResult<()> {
         while let Some(c) = self.peek() {
             let start = self.pos();
 
@@ -117,7 +152,7 @@ impl<'a> Lexer<'a> {
             }
 
             // X'...' blob literal (must be checked before identifiers).
-            if (c == 'x' || c == 'X') && self.peek2() == Some('\'') {
+            if (c == 'x' || c == 'X') && self.peek2() == Some('\'') && self.blob_allowed() {
                 self.chars.next();
                 self.chars.next();
                 let mut hex = String::new();
@@ -125,7 +160,7 @@ impl<'a> Lexer<'a> {
                     match self.chars.next() {
                         Some((_, '\'')) => break,
                         Some((_, c)) => hex.push(c),
-                        None => return Err(error_at(start, "Unterminated BLOB literal")),
+                        None => return Err(unterminated(start, "Unterminated BLOB literal")),
                     }
                 }
                 self.push(TokenKind::Blob(hex), start);
@@ -191,7 +226,13 @@ impl<'a> Lexer<'a> {
                         '=' => TokenKind::Eq,
                         '<' => TokenKind::Lt,
                         '>' => TokenKind::Gt,
-                        _ => return Err(error_at(start, &format!("Unexpected character '{}'", c))),
+                        _ => {
+                            return Err(LexError {
+                                offset: start,
+                                message: format!("Unexpected character '{}'", c),
+                                unterminated: false,
+                            })
+                        }
                     };
                     self.push(kind, start);
                 }
@@ -246,14 +287,17 @@ impl<'a> Lexer<'a> {
     /// is a literal quote (standard SQL); `\<quote>` and `\\` are accepted
     /// too for compatibility with the earlier parser. Any other backslash is
     /// kept as-is.
-    fn quoted(&mut self, quote: char, start: usize) -> Result<String> {
+    fn quoted(&mut self, quote: char, start: usize) -> LexResult<String> {
         self.chars.next(); // opening quote
         let mut out = String::new();
         loop {
             match self.chars.next() {
                 None => {
                     let what = if quote == '`' { "identifier" } else { "string" };
-                    return Err(error_at(start, &format!("Unterminated quoted {}", what)));
+                    return Err(unterminated(
+                        start,
+                        &format!("Unterminated quoted {}", what),
+                    ));
                 }
                 Some((_, '\\')) if matches!(self.peek(), Some(c) if c == quote || c == '\\') => {
                     out.push(self.chars.next().unwrap().1);
@@ -272,8 +316,12 @@ impl<'a> Lexer<'a> {
     }
 }
 
-fn error_at(offset: usize, msg: &str) -> VelociError {
-    VelociError::ParseError(format!("{} at position {}", msg, offset))
+fn unterminated(offset: usize, message: &str) -> LexError {
+    LexError {
+        offset,
+        message: message.to_string(),
+        unterminated: true,
+    }
 }
 
 #[cfg(test)]
@@ -336,14 +384,15 @@ mod tests {
                 },
             ]
         );
-        assert!(tokenize("'open").is_err());
+        assert!(tokenize("'open").unwrap_err().unterminated);
+        assert!(!tokenize("a @ b").unwrap_err().unterminated);
     }
 
     #[test]
     fn test_tokenize_numbers_blobs_comments() {
         use TokenKind::*;
         assert_eq!(
-            kinds("1 2.5 .5 1e3 2E-2 3e x'0a' -- trailing\n7"),
+            kinds("1 2.5 .5 1e3 2E-2 3e, x'0a' -- trailing\n7"),
             vec![
                 Number("1".into()),
                 Number("2.5".into()),
@@ -352,9 +401,39 @@ mod tests {
                 Number("2E-2".into()),
                 Number("3".into()),
                 Word("e".into()),
+                Comma,
                 Blob("0a".into()),
                 Number("7".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn test_blob_only_where_a_value_can_start() {
+        use TokenKind::*;
+        let string = |v: &str| String {
+            value: v.into(),
+            quote: '\'',
+        };
+        assert_eq!(
+            kinds("x='ab' = x'ab', X'00'"),
+            vec![
+                Word("x".into()),
+                Eq,
+                string("ab"),
+                Eq,
+                Blob("ab".into()),
+                Comma,
+                Blob("00".into()),
+            ]
+        );
+        assert_eq!(
+            kinds("WHERE x='a'"),
+            vec![Word("WHERE".into()), Word("x".into()), Eq, string("a")]
+        );
+        assert_eq!(
+            kinds("b LIKE x'00'"),
+            vec![Word("b".into()), Word("LIKE".into()), Blob("00".into())]
         );
     }
 
