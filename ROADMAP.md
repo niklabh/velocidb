@@ -46,7 +46,7 @@ Unblock almost every later SQL and concurrency feature.
 - [x] **Primary-key point lookups** — use `BTree::search` for `WHERE pk = …`
       instead of a full scan
 - [x] **Fewer fsyncs per commit** — one fsync per commit; the WAL is
-      checkpointed at 4 MiB and on close (auto-commit INSERT ~79 → ~245 rows/s
+      checkpointed at 4 MiB and on close (auto-commit INSERT ~74 → ~245 rows/s
       on macOS, see `docs/performance.md`)
 - [ ] **Durability level option** — e.g. a `synchronous = NORMAL`-style mode
       (plain `fsync` instead of `F_FULLFSYNC` on macOS, or fsync only at

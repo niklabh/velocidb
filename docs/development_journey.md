@@ -31,11 +31,12 @@ isn't justified for an embedded engine.
 
 ### No-steal WAL with buffered write groups
 
-Modified pages stay in memory until commit, then go to the WAL (fsync)
-before the data file. This makes abort trivial: nothing on disk needs
-undoing. Explicit transactions and statement-level savepoints come almost
-for free. The cost is that a transaction's dirty pages must fit in memory,
-and each commit pays several fsyncs (see [performance.md](performance.md)).
+Modified pages stay in memory until commit, then go to the WAL with a
+single fsync. Checkpoints later copy them into the data file. This makes
+abort trivial: nothing on disk needs undoing. Explicit transactions and
+statement-level savepoints come almost for free. The cost is that a
+transaction's dirty pages must fit in memory, and every commit still pays
+one full fsync (see [performance.md](performance.md)).
 
 ### Correctness before concurrency
 
@@ -72,5 +73,5 @@ a checked-in benchmark.
 ## Future Directions
 
 See [ROADMAP.md](../ROADMAP.md): a real SQL parser, secondary indexes,
-JOIN / GROUP BY, fewer fsyncs per commit, durable CDC, and an approximate
-vector index.
+JOIN / GROUP BY, a configurable durability level and group commit, durable
+CDC, and an approximate vector index.
