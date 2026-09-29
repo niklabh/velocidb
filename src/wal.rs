@@ -2,13 +2,22 @@
 //!
 //! # Semantics
 //!
-//! VelociDB uses a "no-steal, force" WAL: page writes performed while a write
-//! group is active are buffered in memory (the pager's `pending` map) and the
-//! same writes are appended to the WAL. On commit, the WAL is fsynced *before*
-//! any data file mutation, so a crash before the commit fsync leaves no trace
-//! in the WAL and the data file in its previous state. After a successful
-//! commit fsync the pager applies the pending pages to the data file, fsyncs
-//! the data file, and then truncates the WAL.
+//! VelociDB uses a "no-steal" WAL with checkpointing: page writes performed
+//! while a write group is active are buffered in memory (the pager's
+//! `pending` map). On commit the final image of every buffered page plus a
+//! COMMIT record is appended to the WAL in a single write and the WAL is
+//! fsynced — the only fsync on the commit path. A crash before that fsync
+//! leaves no committed group in the WAL.
+//!
+//! Committed pages are not written to the data file at commit. The pager
+//! serves them from memory until a *checkpoint* copies them into the data
+//! file, fsyncs it, and truncates the WAL. Checkpoints run when the WAL
+//! exceeds a size threshold and when the database is closed; recovery on
+//! open replays every committed group and then resets the WAL.
+//!
+//! The WAL tracks the end of its last committed group (`len`). Appends always
+//! start there, and a failed append truncates back to it, so a partially
+//! written record can never sit in front of later committed groups.
 //!
 //! # File format
 //!
@@ -52,28 +61,84 @@ pub struct WalManager {
     path: PathBuf,
     file: File,
     next_group_id: u64,
+    /// Byte length of the WAL up to the end of the last committed group.
+    len: u64,
 }
 
 impl WalManager {
     /// Opens (creating if needed) the WAL companion file for the given DB path.
-    /// The WAL path is `<db>.wal`.
+    /// The WAL path is `<db>-wal`.
     pub fn open(db_path: &Path) -> Result<Self> {
         let wal_path = wal_path_for(db_path);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false) // committed groups must survive for recovery
             .open(&wal_path)?;
+        let len = file.metadata()?.len();
         Ok(Self {
             path: wal_path,
             file,
             next_group_id: 1,
+            len,
         })
     }
 
     /// Path to the WAL file on disk.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Current WAL size in bytes (end of the last committed group).
+    pub fn size(&self) -> u64 {
+        self.len
+    }
+
+    /// Appends a whole committed group — one PAGE_WRITE record per page, then
+    /// a COMMIT record — in a single write, and fsyncs. After this returns
+    /// successfully the group is durable. On failure the WAL is truncated
+    /// back to its previous committed length.
+    pub fn append_group<'a>(
+        &mut self,
+        group_id: u64,
+        pages: impl IntoIterator<Item = (PageId, &'a [u8])>,
+    ) -> Result<()> {
+        let mut buf = Vec::new();
+        for (page_id, data) in pages {
+            if data.len() != PAGE_SIZE {
+                return Err(VelociError::StorageError(format!(
+                    "WAL page write expected {} bytes, got {}",
+                    PAGE_SIZE,
+                    data.len()
+                )));
+            }
+            let mut payload = Vec::with_capacity(8 + PAGE_SIZE);
+            payload.extend_from_slice(&page_id.to_le_bytes());
+            payload.extend_from_slice(data);
+            encode_record(&mut buf, REC_PAGE_WRITE, group_id, &payload);
+        }
+        encode_record(&mut buf, REC_COMMIT, group_id, &[]);
+
+        let written = (|| -> Result<()> {
+            self.file.seek(SeekFrom::Start(self.len))?;
+            self.file.write_all(&buf)?;
+            self.file.sync_data()?;
+            Ok(())
+        })();
+        match written {
+            Ok(()) => {
+                self.len += buf.len() as u64;
+                Ok(())
+            }
+            Err(e) => {
+                // Best effort: drop the partial group so later appends are not
+                // stranded behind a torn record. If this also fails, recovery
+                // still ignores the group (no durable COMMIT).
+                let _ = self.file.set_len(self.len);
+                Err(e)
+            }
+        }
     }
 
     /// Returns the next group id, advancing the counter.
@@ -103,7 +168,7 @@ impl WalManager {
             )));
         }
         let mut payload = Vec::with_capacity(8 + PAGE_SIZE);
-        payload.extend_from_slice(&(page_id as u64).to_le_bytes());
+        payload.extend_from_slice(&page_id.to_le_bytes());
         payload.extend_from_slice(data);
         self.append_record(REC_PAGE_WRITE, group_id, &payload)
     }
@@ -112,7 +177,7 @@ impl WalManager {
     /// successfully, the committed group is durable.
     pub fn log_commit(&mut self, group_id: u64) -> Result<()> {
         self.append_record(REC_COMMIT, group_id, &[])?;
-        self.file.sync_all()?;
+        self.file.sync_data()?;
         Ok(())
     }
 
@@ -123,6 +188,7 @@ impl WalManager {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         self.file.sync_all()?;
+        self.len = 0;
         Ok(())
     }
 
@@ -150,8 +216,7 @@ impl WalManager {
             }
             let rec_type = buf[cursor];
             let group_id = u64::from_le_bytes(buf[cursor + 1..cursor + 9].try_into().unwrap());
-            let len =
-                u32::from_le_bytes(buf[cursor + 9..cursor + 13].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(buf[cursor + 9..cursor + 13].try_into().unwrap()) as usize;
 
             let payload_start = cursor + 13;
             let payload_end = payload_start + len;
@@ -225,21 +290,27 @@ impl WalManager {
     }
 
     fn append_record(&mut self, rec_type: u8, group_id: u64, payload: &[u8]) -> Result<()> {
-        let mut header_and_payload = Vec::with_capacity(13 + payload.len());
-        header_and_payload.push(rec_type);
-        header_and_payload.extend_from_slice(&group_id.to_le_bytes());
-        header_and_payload.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        header_and_payload.extend_from_slice(payload);
-
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&header_and_payload);
-        let crc = hasher.finalize();
-
-        self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&header_and_payload)?;
-        self.file.write_all(&crc.to_le_bytes())?;
+        let mut buf = Vec::with_capacity(17 + payload.len());
+        encode_record(&mut buf, rec_type, group_id, payload);
+        self.file.seek(SeekFrom::Start(self.len))?;
+        self.file.write_all(&buf)?;
+        self.len += buf.len() as u64;
         Ok(())
     }
+}
+
+/// Appends one encoded record (`type | group_id | len | payload | crc32`) to
+/// `buf`.
+fn encode_record(buf: &mut Vec<u8>, rec_type: u8, group_id: u64, payload: &[u8]) {
+    let start = buf.len();
+    buf.push(rec_type);
+    buf.extend_from_slice(&group_id.to_le_bytes());
+    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    buf.extend_from_slice(payload);
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&buf[start..]);
+    let crc = hasher.finalize();
+    buf.extend_from_slice(&crc.to_le_bytes());
 }
 
 /// Returns the WAL path corresponding to a database file path. The suffix is
@@ -336,7 +407,11 @@ mod tests {
 
         // Simulate a crash mid-record by truncating the file by 5 bytes.
         let path = wal_path_for(&db);
-        let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         let len = f.metadata().unwrap().len();
         f.set_len(len - 5).unwrap();
         drop(f);
@@ -346,5 +421,44 @@ mod tests {
         // Only the first group is fully present.
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].group_id, g1);
+    }
+
+    #[test]
+    fn test_append_group_roundtrip_and_size() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("test.db");
+
+        let mut wal = WalManager::open(&db).unwrap();
+        assert_eq!(wal.size(), 0);
+        let (a, b) = (make_page(1), make_page(2));
+        let g1 = wal.allocate_group_id();
+        wal.append_group(g1, [(3, a.as_slice()), (4, b.as_slice())])
+            .unwrap();
+        let after_first = wal.size();
+        // Two PAGE_WRITE records + COMMIT, each with a 17-byte envelope.
+        assert_eq!(after_first, 2 * (17 + 8 + PAGE_SIZE as u64) + 17);
+        let g2 = wal.allocate_group_id();
+        wal.append_group(g2, [(3, b.as_slice())]).unwrap();
+        assert!(wal.size() > after_first);
+        drop(wal);
+
+        let mut wal = WalManager::open(&db).unwrap();
+        let groups = wal.read_committed_groups().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].writes, vec![(3, a.clone()), (4, b.clone())]);
+        assert_eq!(groups[1].writes, vec![(3, b)]);
+
+        wal.truncate().unwrap();
+        assert_eq!(wal.size(), 0);
+        assert!(wal.read_committed_groups().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_append_group_rejects_wrong_page_size() {
+        let dir = tempdir().unwrap();
+        let mut wal = WalManager::open(&dir.path().join("test.db")).unwrap();
+        let g = wal.allocate_group_id();
+        assert!(wal.append_group(g, [(0, &[0u8; 10][..])]).is_err());
+        assert_eq!(wal.size(), 0);
     }
 }

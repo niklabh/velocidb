@@ -4,6 +4,91 @@ All notable changes to VelociDB are documented in this file.
 
 ## [Unreleased]
 
+### Fixed (P0 correctness)
+
+- **Recovery could strand later commits.** If the WAL contained only a torn
+  or uncommitted tail, recovery left it in place and new commits were
+  appended after it; a crash before those commits reached the data file
+  lost them, because the next recovery stopped at the garbage. Recovery now always resets the WAL, and a failed WAL append is
+  truncated back to the last committed group.
+
+- **`ROLLBACK` now undoes storage.** `BEGIN` opens a single WAL group that
+  spans every statement until `COMMIT`; `ROLLBACK` (or closing the database
+  without committing) discards all of it, including schema changes. Pages
+  are written to the WAL only at commit, so an uncommitted transaction never
+  reaches disk.
+- **Statement-level atomicity inside transactions.** Each statement runs
+  under a pager savepoint; a failing statement undoes only its own writes
+  and the transaction continues (previously the failure aborted the
+  transaction object and released its locks mid-transaction).
+- **Schema writes are atomic with the statement.** DDL and B-tree root
+  changes are saved inside the statement's WAL group instead of a separate
+  group afterwards. After any rollback the in-memory schema and B-tree roots
+  are rebuilt from storage.
+- **`UNIQUE` is enforced** on non-primary-key columns for INSERT and
+  UPDATE (including several rows updated to the same value). NULLs never
+  conflict.
+- **CDC only publishes committed changes.** Events are staged per write
+  group and published on commit; rolled-back or failed statements emit
+  nothing, and sequence numbers have no gaps.
+- **Table locks no longer leak on errors.** A failing auto-commit statement
+  (e.g. `ORDER BY` an unknown column, missing primary key value) used to
+  keep its table lock, stalling the next conflicting statement for the 30 s
+  lock timeout. Lock/transaction lifecycle now lives in one wrapper.
+- `SELECT` after a write inside an explicit transaction no longer fails
+  with "Cannot downgrade exclusive lock to shared".
+- An aborted write group now restores the pager's page count, so pages
+  allocated by the aborted group are not left referenced past end-of-file.
+
+### Performance
+
+- **One fsync per commit (WAL checkpointing).** A commit appends its pages
+  and COMMIT record to the WAL in one write and fsyncs once. Committed pages
+  are served from memory until a checkpoint (at 4 MiB of WAL, and on close)
+  applies them to the data file. Previously every commit fsynced the WAL,
+  applied pages, fsynced the data file, then truncated and fsynced the WAL.
+  Auto-commit INSERT on macOS: ~74 → ~245 rows/s.
+- **Primary-key lookups.** `WHERE <pk> = <integer>` (alone or with other
+  ANDed conditions) uses `BTree::search` instead of a full scan for SELECT,
+  UPDATE and DELETE: ~850 → ~193,000 queries/s on a 2,000-row table.
+- **Parser regexes are compiled once** instead of on every statement.
+  Batched inserts went from ~4,600 to ~49,800 rows/s and non-key filtered
+  SELECTs roughly doubled. Numbers and method are in `docs/performance.md`.
+
+### Changed
+
+- **Experimental modules are behind the `experimental` feature** (off by
+  default): `mvcc`, `async_io`, `lockfree`, `simd`, `btree_optimized`,
+  `crdt`, `cloud_vfs`, `hybrid_storage`, `pmem`. They are no longer compiled
+  or re-exported from the crate root by default. **Breaking** for anyone
+  importing e.g. `velocidb::MvccManager` — enable `experimental` and use the
+  module path (`velocidb::mvcc::MvccManager`).
+- Docs describe the engine that exists: `docs/architecture.md`,
+  `docs/quickstart.md` and `docs/performance.md` are rewritten (the old
+  versions presented experimental modules as integrated and quoted
+  unmeasured speedups); `docs/implementation.md` is replaced by
+  `docs/experimental.md`. `performance.md` now has a measured baseline.
+- REPL / `--version` print the crate version instead of a hard-coded
+  `v0.1.0`.
+- Active-path code is clippy-clean (`cargo clippy --all-targets -- -D warnings`).
+- The whole tree is rustfmt-formatted (one formatting-only commit, listed in
+  `.git-blame-ignore-revs`); CI checks `cargo fmt --check`.
+
+### Added
+
+- CI (`.github/workflows/ci.yml`): tests on Linux and macOS, doc tests,
+  clippy with `-D warnings`, `cargo fmt --check`, and a build + unit-test job for
+  `--features experimental`.
+- Five crash tests in `tests/recovery_tests.rs` (simulated with
+  `mem::forget`): uncheckpointed commits survive, uncommitted transactions
+  are lost, the WAL stays bounded by checkpoints, commits after a torn-tail
+  recovery survive, repeated crashes. Plus `append_group` unit tests.
+- `tests/transaction_tests.rs` (12 tests): rollback of DML and DDL, commit
+  and reopen, uncommitted-on-close, rollback across B-tree splits,
+  savepoints, CDC publication, `UNIQUE` on insert/update/reopen.
+
+## [0.3.0] — 2026-07-24
+
 ### Added (Turso-inspired features)
 
 - **Vector search** (`src/vector.rs`). Vector columns via `F32_BLOB(n)` /
@@ -101,14 +186,25 @@ All notable changes to VelociDB are documented in this file.
 ### Known limitations
 
 - All writers serialize on a `Database`-level mutex.
-- Explicit-transaction `ROLLBACK` only releases locks; storage mutations
-  made by previous statements in the transaction are not undone (each
-  statement is its own WAL group).
 - No `JOIN`, `GROUP BY`, sub-queries, or composite primary keys.
 - Vector search is exact (brute-force, parallel); approximate indexing
   (HNSW/DiskANN-style) is future work, mirroring Turso's roadmap.
 
-## [0.1.0] — 2025-05-19
+## [0.2.0] — 2026-05-19
+
+### Fixed
+
+- B-tree delete underflow: leaves redistribute from or merge with a
+  sibling (left or right); internal-node underflow promotes / demotes the
+  root. `split_leaf_node` no longer rewrites the left page mid-split.
+- `find_sibling_info` corruption is reported as `VelociError::Corruption`
+  instead of silently leaving the tree underflowed.
+- Page-cache size accounting races (double decrements, missing increments
+  on `write_page`).
+- Executor propagates transaction commit / abort errors instead of
+  discarding them.
+
+## [0.1.0] — 2025-11-19
 
 ### Added
 

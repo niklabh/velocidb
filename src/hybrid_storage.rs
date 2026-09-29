@@ -3,8 +3,8 @@
 //! [`HybridTable`] stores data row-major by default and projects columns on
 //! demand. Supports adaptive layout switching based on access patterns.
 
+use crate::simd::{VectorBatch, VectorColumn};
 use crate::types::{Column, Result, Row, Value, VelociError};
-use crate::simd::{VectorColumn, VectorBatch};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -135,10 +135,12 @@ impl ColumnStorage {
                     self.null_bitmap[index] = false;
                 }
             }
-            _ => return Err(VelociError::TypeMismatch {
-                expected: "Integer, Real, or Text".to_string(),
-                actual: format!("{:?}", value),
-            }),
+            _ => {
+                return Err(VelociError::TypeMismatch {
+                    expected: "Integer, Real, or Text".to_string(),
+                    actual: format!("{:?}", value),
+                })
+            }
         }
 
         Ok(())
@@ -187,7 +189,7 @@ impl HybridTable {
     pub fn insert_row(&self, key: i64, values: Vec<Value>) -> Result<()> {
         let record = RowRecord::new(key, values);
         self.row_store.write().insert(key, record);
-        
+
         // Update stats
         self.stats.write().record_insert();
 
@@ -224,7 +226,9 @@ impl HybridTable {
         }
 
         // Materialize from row store
-        let column_idx = self.columns.iter()
+        let column_idx = self
+            .columns
+            .iter()
             .position(|c| c.name == column_name)
             .ok_or_else(|| VelociError::NotFound(format!("Column {} not found", column_name)))?;
 
@@ -233,7 +237,8 @@ impl HybridTable {
         rows.sort_by_key(|r| r.key);
 
         // Determine column type from first non-null value
-        let first_value = rows.iter()
+        let first_value = rows
+            .iter()
             .find_map(|r| r.values.get(column_idx))
             .ok_or_else(|| VelociError::NotFound("No values in column".to_string()))?;
 
@@ -241,7 +246,7 @@ impl HybridTable {
             Value::Integer(_) => {
                 let mut values = Vec::new();
                 let mut nulls = Vec::new();
-                
+
                 for row in rows.iter() {
                     match row.values.get(column_idx) {
                         Some(Value::Integer(v)) => {
@@ -258,13 +263,13 @@ impl HybridTable {
                         }
                     }
                 }
-                
+
                 ColumnStorage::from_integers(column_name.to_string(), values, nulls)
             }
             Value::Real(_) => {
                 let mut values = Vec::new();
                 let mut nulls = Vec::new();
-                
+
                 for row in rows.iter() {
                     match row.values.get(column_idx) {
                         Some(Value::Real(v)) => {
@@ -281,13 +286,13 @@ impl HybridTable {
                         }
                     }
                 }
-                
+
                 ColumnStorage::from_reals(column_name.to_string(), values, nulls)
             }
             Value::Text(_) => {
                 let mut values = Vec::new();
                 let mut nulls = Vec::new();
-                
+
                 for row in rows.iter() {
                     match row.values.get(column_idx) {
                         Some(Value::Text(v)) => {
@@ -304,17 +309,21 @@ impl HybridTable {
                         }
                     }
                 }
-                
+
                 ColumnStorage::from_text(column_name.to_string(), values, nulls)
             }
-            _ => return Err(VelociError::TypeMismatch {
-                expected: "Integer, Real, or Text".to_string(),
-                actual: format!("{:?}", first_value),
-            }),
+            _ => {
+                return Err(VelociError::TypeMismatch {
+                    expected: "Integer, Real, or Text".to_string(),
+                    actual: format!("{:?}", first_value),
+                })
+            }
         };
 
         // Cache the projection
-        self.column_store.write().insert(column_name.to_string(), column_storage.clone());
+        self.column_store
+            .write()
+            .insert(column_name.to_string(), column_storage.clone());
 
         Ok(column_storage)
     }
@@ -421,8 +430,12 @@ mod tests {
         let table = HybridTable::new("users".to_string(), columns, StorageLayout::RowMajor);
 
         // Insert rows
-        table.insert_row(1, vec![Value::Integer(1), Value::Text("Alice".to_string())]).unwrap();
-        table.insert_row(2, vec![Value::Integer(2), Value::Text("Bob".to_string())]).unwrap();
+        table
+            .insert_row(1, vec![Value::Integer(1), Value::Text("Alice".to_string())])
+            .unwrap();
+        table
+            .insert_row(2, vec![Value::Integer(2), Value::Text("Bob".to_string())])
+            .unwrap();
 
         // Get row
         let row = table.get_row(1).unwrap();
@@ -452,9 +465,15 @@ mod tests {
         let table = HybridTable::new("users".to_string(), columns, StorageLayout::Hybrid);
 
         // Insert rows
-        table.insert_row(1, vec![Value::Integer(1), Value::Integer(30)]).unwrap();
-        table.insert_row(2, vec![Value::Integer(2), Value::Integer(25)]).unwrap();
-        table.insert_row(3, vec![Value::Integer(3), Value::Integer(35)]).unwrap();
+        table
+            .insert_row(1, vec![Value::Integer(1), Value::Integer(30)])
+            .unwrap();
+        table
+            .insert_row(2, vec![Value::Integer(2), Value::Integer(25)])
+            .unwrap();
+        table
+            .insert_row(3, vec![Value::Integer(3), Value::Integer(35)])
+            .unwrap();
 
         // Get columnar projection
         let col = table.get_column_projection("age").unwrap();
@@ -487,7 +506,9 @@ mod tests {
 
         // Insert rows
         for i in 1..=10 {
-            table.insert_row(i, vec![Value::Integer(i), Value::Integer(i * 10)]).unwrap();
+            table
+                .insert_row(i, vec![Value::Integer(i), Value::Integer(i * 10)])
+                .unwrap();
         }
 
         // Get vector batch
@@ -497,15 +518,13 @@ mod tests {
 
     #[test]
     fn test_adaptive_layout() {
-        let columns = vec![
-            Column {
-                name: "id".to_string(),
-                data_type: DataType::Integer,
-                primary_key: true,
-                not_null: true,
-                unique: true,
-            },
-        ];
+        let columns = vec![Column {
+            name: "id".to_string(),
+            data_type: DataType::Integer,
+            primary_key: true,
+            not_null: true,
+            unique: true,
+        }];
 
         let table = HybridTable::new("test".to_string(), columns, StorageLayout::Hybrid);
 
@@ -526,4 +545,3 @@ mod tests {
         assert_eq!(layout, StorageLayout::ColumnMajor);
     }
 }
-

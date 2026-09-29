@@ -50,7 +50,8 @@ impl CachedPage {
 
     pub fn access(&self) {
         self.access_count.fetch_add(1, Ordering::Relaxed);
-        self.last_access.store(current_timestamp(), Ordering::Relaxed);
+        self.last_access
+            .store(current_timestamp(), Ordering::Relaxed);
     }
 
     pub fn get_access_count(&self) -> u64 {
@@ -76,13 +77,13 @@ impl LockFreePageCache {
     pub fn get(&self, page_id: PageId) -> Option<Arc<CachedPage>> {
         let entries = self.entries.read();
         let cached = entries.get(&page_id).cloned();
-        
+
         if let Some(ref page) = cached {
             page.access();
             // Push to LRU queue for tracking
             self.lru_queue.push(page_id);
         }
-        
+
         cached
     }
 
@@ -114,7 +115,7 @@ impl LockFreePageCache {
         let mut oldest_timestamp = u64::MAX;
 
         let entries = self.entries.read();
-        
+
         // Scan recent pages to find LRU
         for _ in 0..std::cmp::min(100, self.capacity) {
             if let Some(page_id) = self.lru_queue.pop() {
@@ -129,7 +130,7 @@ impl LockFreePageCache {
                 self.lru_queue.push(page_id);
             }
         }
-        
+
         drop(entries);
 
         // Remove the oldest page
@@ -137,7 +138,7 @@ impl LockFreePageCache {
             let mut entries = self.entries.write();
             entries.remove(&page_id);
             drop(entries);
-            
+
             self.size.fetch_sub(1, Ordering::Relaxed);
         }
 
@@ -148,11 +149,11 @@ impl LockFreePageCache {
     pub fn remove(&self, page_id: PageId) -> Option<Arc<CachedPage>> {
         let mut entries = self.entries.write();
         let removed = entries.remove(&page_id);
-        
+
         if removed.is_some() {
             self.size.fetch_sub(1, Ordering::Relaxed);
         }
-        
+
         removed
     }
 
@@ -169,7 +170,7 @@ impl LockFreePageCache {
         let mut entries = self.entries.write();
         entries.clear();
         self.size.store(0, Ordering::Relaxed);
-        
+
         // Drain the LRU queue
         while self.lru_queue.pop().is_some() {}
     }
@@ -530,4 +531,3 @@ mod tests {
         assert_eq!(stats.reads, 0);
     }
 }
-

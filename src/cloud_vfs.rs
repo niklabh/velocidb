@@ -4,7 +4,7 @@
 //! `object_store` crate with lazy page loading and prefetching.
 
 #[cfg(feature = "cloud-vfs")]
-use object_store::{ObjectStore, path::Path as ObjectPath};
+use object_store::{path::Path as ObjectPath, ObjectStore};
 
 use crate::async_io::AsyncVfs;
 use crate::storage::{Page, PAGE_SIZE};
@@ -72,7 +72,10 @@ impl CloudVfs {
         let range = offset..(offset + PAGE_SIZE as u64);
 
         // Perform range read
-        let result = self.store.get_range(&self.db_path, range).await
+        let result = self
+            .store
+            .get_range(&self.db_path, range)
+            .await
             .map_err(|e| VelociError::IoError(format!("Cloud fetch error: {}", e)))?;
 
         let mut page = Page::new();
@@ -90,7 +93,10 @@ impl CloudVfs {
         // This is simplified; production would use multipart uploads
 
         // Read entire file
-        let file_data = self.store.get(&self.db_path).await
+        let file_data = self
+            .store
+            .get(&self.db_path)
+            .await
             .map(|r| r.bytes().to_vec())
             .unwrap_or_else(|_| Vec::new());
 
@@ -105,12 +111,13 @@ impl CloudVfs {
         };
 
         // Update the page
-        new_data[offset as usize..(offset as usize + PAGE_SIZE)]
-            .copy_from_slice(page.data());
+        new_data[offset as usize..(offset as usize + PAGE_SIZE)].copy_from_slice(page.data());
 
         // Write back
         let bytes = Bytes::from(new_data);
-        self.store.put(&self.db_path, bytes).await
+        self.store
+            .put(&self.db_path, bytes)
+            .await
             .map_err(|e| VelociError::IoError(format!("Cloud write error: {}", e)))?;
 
         Ok(())
@@ -119,7 +126,7 @@ impl CloudVfs {
     /// Evict LRU page from cache
     fn evict_lru(&self) -> Result<()> {
         let mut cache = self.cache.write();
-        
+
         if cache.len() >= self.cache_capacity {
             // Simple eviction: remove first entry
             if let Some(&page_id) = cache.keys().next() {
@@ -185,7 +192,7 @@ impl AsyncVfs for CloudVfs {
         // Initialize the page in pending writes
         let page = Page::new();
         drop(num_pages);
-        
+
         self.write_page(page_id, &page).await?;
 
         Ok(page_id)
@@ -197,7 +204,7 @@ impl AsyncVfs for CloudVfs {
         drop(pending);
 
         let mut pending_write = self.pending_writes.write();
-        
+
         for (page_id, page) in pending_write.drain() {
             self.flush_page_to_remote(page_id, &page).await?;
         }
@@ -234,9 +241,7 @@ impl CloudPrefetcher {
             let page_id = start_page + i as u64;
             let vfs = Arc::clone(&self.vfs);
 
-            let handle = tokio::spawn(async move {
-                vfs.read_page(page_id).await
-            });
+            let handle = tokio::spawn(async move { vfs.read_page(page_id).await });
 
             handles.push(handle);
         }
@@ -328,4 +333,3 @@ mod tests {
         assert!(true);
     }
 }
-

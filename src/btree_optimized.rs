@@ -105,16 +105,17 @@ impl CacheAlignedNodeHeader {
 pub struct CacheOptimizedNode {
     /// Header (64 bytes, cache-aligned)
     header: CacheAlignedNodeHeader,
-    
+
     /// Keys array (contiguous, cache-friendly)
     /// Using fixed-size array for better cache prediction
     keys: [i64; OPTIMIZED_BTREE_ORDER],
-    
+
     /// Child pointers for internal nodes (or value offsets for leaf nodes)
     children: [u32; OPTIMIZED_BTREE_ORDER + 1],
-    
+
     /// Remaining space for values in leaf nodes
-    data_area: [u8; PAGE_SIZE - 64 - (OPTIMIZED_BTREE_ORDER * 8) - ((OPTIMIZED_BTREE_ORDER + 1) * 4)],
+    data_area:
+        [u8; PAGE_SIZE - 64 - (OPTIMIZED_BTREE_ORDER * 8) - ((OPTIMIZED_BTREE_ORDER + 1) * 4)],
 }
 
 impl CacheOptimizedNode {
@@ -123,7 +124,10 @@ impl CacheOptimizedNode {
             header: CacheAlignedNodeHeader::new_leaf(),
             keys: [0; OPTIMIZED_BTREE_ORDER],
             children: [0; OPTIMIZED_BTREE_ORDER + 1],
-            data_area: [0; PAGE_SIZE - 64 - (OPTIMIZED_BTREE_ORDER * 8) - ((OPTIMIZED_BTREE_ORDER + 1) * 4)],
+            data_area: [0; PAGE_SIZE
+                - 64
+                - (OPTIMIZED_BTREE_ORDER * 8)
+                - ((OPTIMIZED_BTREE_ORDER + 1) * 4)],
         }
     }
 
@@ -132,7 +136,10 @@ impl CacheOptimizedNode {
             header: CacheAlignedNodeHeader::new_internal(level),
             keys: [0; OPTIMIZED_BTREE_ORDER],
             children: [0; OPTIMIZED_BTREE_ORDER + 1],
-            data_area: [0; PAGE_SIZE - 64 - (OPTIMIZED_BTREE_ORDER * 8) - ((OPTIMIZED_BTREE_ORDER + 1) * 4)],
+            data_area: [0; PAGE_SIZE
+                - 64
+                - (OPTIMIZED_BTREE_ORDER * 8)
+                - ((OPTIMIZED_BTREE_ORDER + 1) * 4)],
         }
     }
 
@@ -140,7 +147,7 @@ impl CacheOptimizedNode {
     /// Optimized for cache-line sequential access
     pub fn search_key(&self, key: i64) -> std::result::Result<usize, usize> {
         let num_keys = self.header.num_keys() as usize;
-        
+
         // Use SIMD-accelerated search for larger ranges
         #[cfg(target_arch = "x86_64")]
         {
@@ -166,7 +173,8 @@ impl CacheOptimizedNode {
         for i in (0..num_keys).step_by(4) {
             if i + 4 > num_keys {
                 // Fallback to binary search for remainder
-                return self.keys[i..num_keys].binary_search(&key)
+                return self.keys[i..num_keys]
+                    .binary_search(&key)
                     .map(|idx| i + idx)
                     .map_err(|idx| i + idx);
             }
@@ -220,9 +228,15 @@ impl CacheOptimizedNode {
     }
 
     /// Insert a key-child pair (for internal nodes)
-    pub fn insert_internal(&mut self, key: i64, left_child: PageId, right_child: PageId, index: usize) -> Result<()> {
+    pub fn insert_internal(
+        &mut self,
+        key: i64,
+        left_child: PageId,
+        right_child: PageId,
+        index: usize,
+    ) -> Result<()> {
         let num_keys = self.header.num_keys() as usize;
-        
+
         if num_keys >= OPTIMIZED_BTREE_ORDER {
             return Err(VelociError::StorageError("Node full".to_string()));
         }
@@ -244,17 +258,17 @@ impl CacheOptimizedNode {
     /// Serialize to page
     pub fn serialize(&self, page: &mut Page) {
         let buffer = page.data_mut();
-        
+
         // Write header
         self.header.serialize(&mut buffer[0..64]);
-        
+
         // Write keys
         let num_keys = self.header.num_keys() as usize;
         for i in 0..num_keys {
             let offset = 64 + i * 8;
             buffer[offset..offset + 8].copy_from_slice(&self.keys[i].to_le_bytes());
         }
-        
+
         // Write children
         for i in 0..=num_keys {
             let offset = 64 + (OPTIMIZED_BTREE_ORDER * 8) + i * 4;
@@ -265,30 +279,27 @@ impl CacheOptimizedNode {
     /// Deserialize from page
     pub fn deserialize(page: &Page) -> Result<Self> {
         let buffer = page.data();
-        
+
         let header = CacheAlignedNodeHeader::deserialize(&buffer[0..64])?;
         let mut keys = [0i64; OPTIMIZED_BTREE_ORDER];
         let mut children = [0u32; OPTIMIZED_BTREE_ORDER + 1];
-        let mut data_area = [0u8; PAGE_SIZE - 64 - (OPTIMIZED_BTREE_ORDER * 8) - ((OPTIMIZED_BTREE_ORDER + 1) * 4)];
-        
+        let mut data_area =
+            [0u8; PAGE_SIZE - 64 - (OPTIMIZED_BTREE_ORDER * 8) - ((OPTIMIZED_BTREE_ORDER + 1) * 4)];
+
         let num_keys = header.num_keys() as usize;
-        
+
         // Read keys
         for i in 0..num_keys {
             let offset = 64 + i * 8;
-            keys[i] = i64::from_le_bytes(
-                buffer[offset..offset + 8].try_into().unwrap()
-            );
+            keys[i] = i64::from_le_bytes(buffer[offset..offset + 8].try_into().unwrap());
         }
-        
+
         // Read children
         for i in 0..=num_keys {
             let offset = 64 + (OPTIMIZED_BTREE_ORDER * 8) + i * 4;
-            children[i] = u32::from_le_bytes(
-                buffer[offset..offset + 4].try_into().unwrap()
-            );
+            children[i] = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap());
         }
-        
+
         Ok(Self {
             header,
             keys,
@@ -307,9 +318,9 @@ impl CachePrefetcher {
     pub fn prefetch_page(page: &Page) {
         unsafe {
             use std::arch::x86_64::*;
-            
+
             let ptr = page.data().as_ptr();
-            
+
             // Prefetch the entire page into L1 cache
             for i in (0..PAGE_SIZE).step_by(CACHE_LINE_SIZE) {
                 _mm_prefetch::<_MM_HINT_T0>(ptr.add(i) as *const i8);
@@ -322,7 +333,7 @@ impl CachePrefetcher {
     pub fn prefetch_streaming(ptr: *const u8, size: usize) {
         unsafe {
             use std::arch::x86_64::*;
-            
+
             for i in (0..size).step_by(CACHE_LINE_SIZE) {
                 _mm_prefetch::<_MM_HINT_NTA>(ptr.add(i) as *const i8);
             }
@@ -357,14 +368,17 @@ mod tests {
     #[test]
     fn test_cache_aligned_header() {
         let header = CacheAlignedNodeHeader::new_leaf();
-        assert_eq!(std::mem::size_of::<CacheAlignedNodeHeader>(), CACHE_LINE_SIZE);
+        assert_eq!(
+            std::mem::size_of::<CacheAlignedNodeHeader>(),
+            CACHE_LINE_SIZE
+        );
         assert!(header.is_leaf());
     }
 
     #[test]
     fn test_optimized_node_search() {
         let mut node = CacheOptimizedNode::new_leaf();
-        
+
         // Insert some keys
         for i in 0..10 {
             node.keys[i] = (i * 10) as i64;
@@ -383,7 +397,7 @@ mod tests {
     #[test]
     fn test_node_serialization() {
         let mut node = CacheOptimizedNode::new_leaf();
-        
+
         // Set some data
         for i in 0..5 {
             node.keys[i] = i as i64 * 100;
@@ -409,9 +423,8 @@ mod tests {
     fn test_cache_alignment() {
         let node = CacheOptimizedNode::new_leaf();
         let addr = &node as *const _ as usize;
-        
+
         // Verify page alignment
         assert_eq!(addr % PAGE_SIZE, 0, "Node should be page-aligned");
     }
 }
-

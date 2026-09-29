@@ -32,6 +32,9 @@ reader, and add a reopen test in `tests/` (see `test_vector_schema_survives_reop
 - CRC32 covers everything before it. Recovery stops at the first CRC mismatch
   or truncation (torn tail = never written). Only groups with a COMMIT record
   are replayed.
+- Records are appended only by `Pager::commit_group` (one PAGE_WRITE per
+  buffered page, sorted by page id, then COMMIT). Nothing is logged while a
+  group — including a multi-statement transaction — is still open.
 
 ## B-tree node layout (`src/btree.rs`)
 

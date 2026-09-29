@@ -167,7 +167,7 @@ impl CrdtStore {
     /// Insert a new record
     pub fn insert(&mut self, table: &str, key: i64, values: Vec<Value>) -> Result<()> {
         let timestamp = self.next_timestamp();
-        
+
         let operation = CrdtOperation::Insert {
             table: table.to_string(),
             key,
@@ -186,7 +186,7 @@ impl CrdtStore {
     /// Update an existing record
     pub fn update(&mut self, table: &str, key: i64, values: Vec<Value>) -> Result<()> {
         let timestamp = self.next_timestamp();
-        
+
         let operation = CrdtOperation::Update {
             table: table.to_string(),
             key,
@@ -205,7 +205,7 @@ impl CrdtStore {
     /// Delete a record
     pub fn delete(&mut self, table: &str, key: i64) -> Result<()> {
         let timestamp = self.next_timestamp();
-        
+
         let operation = CrdtOperation::Delete {
             table: table.to_string(),
             key,
@@ -223,17 +223,36 @@ impl CrdtStore {
     /// Apply a CRDT operation to local state
     fn apply_operation(&mut self, op: &CrdtOperation) -> Result<()> {
         match op {
-            CrdtOperation::Insert { table, key, values, timestamp, node_id } => {
-                let table_state = self.state.entry(table.clone()).or_insert_with(BTreeMap::new);
-                
+            CrdtOperation::Insert {
+                table,
+                key,
+                values,
+                timestamp,
+                node_id,
+            } => {
+                let table_state = self
+                    .state
+                    .entry(table.clone())
+                    .or_insert_with(BTreeMap::new);
+
                 let record = CrdtRecord::new(*key, values.clone(), *timestamp, node_id.clone());
                 table_state.insert(*key, record);
             }
-            CrdtOperation::Update { table, key, values, timestamp, node_id } => {
-                let table_state = self.state.entry(table.clone()).or_insert_with(BTreeMap::new);
-                
+            CrdtOperation::Update {
+                table,
+                key,
+                values,
+                timestamp,
+                node_id,
+            } => {
+                let table_state = self
+                    .state
+                    .entry(table.clone())
+                    .or_insert_with(BTreeMap::new);
+
                 if let Some(existing) = table_state.get_mut(key) {
-                    let new_record = CrdtRecord::new(*key, values.clone(), *timestamp, node_id.clone());
+                    let new_record =
+                        CrdtRecord::new(*key, values.clone(), *timestamp, node_id.clone());
                     existing.merge(&new_record);
                 } else {
                     // Create if doesn't exist
@@ -241,9 +260,17 @@ impl CrdtStore {
                     table_state.insert(*key, record);
                 }
             }
-            CrdtOperation::Delete { table, key, timestamp, node_id } => {
-                let table_state = self.state.entry(table.clone()).or_insert_with(BTreeMap::new);
-                
+            CrdtOperation::Delete {
+                table,
+                key,
+                timestamp,
+                node_id,
+            } => {
+                let table_state = self
+                    .state
+                    .entry(table.clone())
+                    .or_insert_with(BTreeMap::new);
+
                 if let Some(existing) = table_state.get_mut(key) {
                     existing.delete(*timestamp, node_id.clone());
                 }
@@ -258,17 +285,19 @@ impl CrdtStore {
         for op in operations {
             // Update our clock
             self.update_timestamp(op.timestamp());
-            
+
             // Apply operation
             self.apply_operation(&op)?;
-            
+
             // Add to our log if not already present
-            if !self.operation_log.iter().any(|o| {
-                o.timestamp() == op.timestamp() && o.node_id() == op.node_id()
-            }) {
+            if !self
+                .operation_log
+                .iter()
+                .any(|o| o.timestamp() == op.timestamp() && o.node_id() == op.node_id())
+            {
                 self.operation_log.push(op.clone());
             }
-            
+
             // Update vector clock
             self.update_vector_clock(op.timestamp());
         }
@@ -320,13 +349,16 @@ impl CrdtStore {
         let min_timestamp = self.vector_clock.values().min().copied().unwrap_or(0);
 
         // Keep only operations newer than min_timestamp
-        self.operation_log.retain(|op| op.timestamp() > min_timestamp);
+        self.operation_log
+            .retain(|op| op.timestamp() > min_timestamp);
     }
 
     /// Get statistics
     pub fn stats(&self) -> CrdtStats {
         let total_records: usize = self.state.values().map(|t| t.len()).sum();
-        let deleted_records: usize = self.state.values()
+        let deleted_records: usize = self
+            .state
+            .values()
             .map(|t| t.values().filter(|r| r.is_deleted).count())
             .sum();
 
@@ -365,7 +397,10 @@ impl SyncProtocol {
     }
 
     /// Generate sync message for another replica
-    pub fn generate_sync_message(&self, peer_vector_clock: &HashMap<NodeId, LamportTimestamp>) -> Vec<CrdtOperation> {
+    pub fn generate_sync_message(
+        &self,
+        peer_vector_clock: &HashMap<NodeId, LamportTimestamp>,
+    ) -> Vec<CrdtOperation> {
         // Find minimum timestamp the peer has seen
         let peer_min_timestamp = peer_vector_clock.values().min().copied().unwrap_or(0);
 
@@ -396,9 +431,11 @@ mod tests {
     #[test]
     fn test_crdt_insert() {
         let mut store = CrdtStore::new("node1".to_string());
-        
-        store.insert("users", 1, vec![Value::Text("Alice".to_string())]).unwrap();
-        
+
+        store
+            .insert("users", 1, vec![Value::Text("Alice".to_string())])
+            .unwrap();
+
         let record = store.get_record("users", 1).unwrap();
         assert_eq!(record.key, 1);
         assert!(!record.is_deleted);
@@ -410,11 +447,15 @@ mod tests {
         let mut store2 = CrdtStore::new("node2".to_string());
 
         // Node 1 inserts
-        store1.insert("users", 1, vec![Value::Text("Alice".to_string())]).unwrap();
+        store1
+            .insert("users", 1, vec![Value::Text("Alice".to_string())])
+            .unwrap();
 
         // Node 2 updates (later timestamp)
         std::thread::sleep(std::time::Duration::from_millis(10));
-        store2.insert("users", 1, vec![Value::Text("Bob".to_string())]).unwrap();
+        store2
+            .insert("users", 1, vec![Value::Text("Bob".to_string())])
+            .unwrap();
 
         // Merge store2's operations into store1
         let ops = store2.get_operations_since(0);
@@ -428,10 +469,12 @@ mod tests {
     #[test]
     fn test_crdt_delete() {
         let mut store = CrdtStore::new("node1".to_string());
-        
-        store.insert("users", 1, vec![Value::Text("Alice".to_string())]).unwrap();
+
+        store
+            .insert("users", 1, vec![Value::Text("Alice".to_string())])
+            .unwrap();
         store.delete("users", 1).unwrap();
-        
+
         let record = store.get_record("users", 1).unwrap();
         assert!(record.is_deleted);
     }
@@ -442,8 +485,14 @@ mod tests {
         let mut protocol2 = SyncProtocol::new("node2".to_string());
 
         // Node 1 makes changes
-        protocol1.store_mut().insert("users", 1, vec![Value::Text("Alice".to_string())]).unwrap();
-        protocol1.store_mut().insert("users", 2, vec![Value::Text("Bob".to_string())]).unwrap();
+        protocol1
+            .store_mut()
+            .insert("users", 1, vec![Value::Text("Alice".to_string())])
+            .unwrap();
+        protocol1
+            .store_mut()
+            .insert("users", 2, vec![Value::Text("Bob".to_string())])
+            .unwrap();
 
         // Generate sync message
         let sync_msg = protocol1.generate_sync_message(&HashMap::new());
@@ -459,7 +508,7 @@ mod tests {
     #[test]
     fn test_operation_pruning() {
         let mut store = CrdtStore::new("node1".to_string());
-        
+
         // Add many operations
         for i in 0..100 {
             store.insert("test", i, vec![Value::Integer(i)]).unwrap();
@@ -474,4 +523,3 @@ mod tests {
         assert_eq!(store.operation_log.len(), 100);
     }
 }
-

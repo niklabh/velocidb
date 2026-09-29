@@ -14,8 +14,8 @@ use memmap2::{MmapMut, MmapOptions};
 use parking_lot::RwLock;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Direct Access (DAX) mode for persistent memory
 /// Bypasses kernel page cache for direct memory access
@@ -90,48 +90,54 @@ impl DaxVfs {
     /// Get a pointer to a page (zero-copy access)
     pub fn get_page_ptr(&self, page_id: PageId) -> Result<*const u8> {
         let num_pages = self.num_pages.load(Ordering::Acquire);
-        
+
         if page_id >= num_pages {
-            return Err(VelociError::NotFound(format!("Page {} out of bounds", page_id)));
+            return Err(VelociError::NotFound(format!(
+                "Page {} out of bounds",
+                page_id
+            )));
         }
 
         let mmap_guard = self.mmap.read();
-        let mmap = mmap_guard.as_ref().ok_or_else(|| VelociError::StorageError("Memory map not initialized".to_string()))?;
+        let mmap = mmap_guard
+            .as_ref()
+            .ok_or_else(|| VelociError::StorageError("Memory map not initialized".to_string()))?;
         let offset = page_id as usize * PAGE_SIZE;
-        
+
         Ok(unsafe { mmap.as_ptr().add(offset) })
     }
 
     /// Get a mutable pointer to a page (zero-copy writes)
     pub fn get_page_ptr_mut(&self, page_id: PageId) -> Result<*mut u8> {
         let num_pages = self.num_pages.load(Ordering::Acquire);
-        
+
         if page_id >= num_pages {
-            return Err(VelociError::NotFound(format!("Page {} out of bounds", page_id)));
+            return Err(VelociError::NotFound(format!(
+                "Page {} out of bounds",
+                page_id
+            )));
         }
 
         let mut mmap_guard = self.mmap.write();
-        let mmap = mmap_guard.as_mut().ok_or_else(|| VelociError::StorageError("Memory map not initialized".to_string()))?;
+        let mmap = mmap_guard
+            .as_mut()
+            .ok_or_else(|| VelociError::StorageError("Memory map not initialized".to_string()))?;
         let offset = page_id as usize * PAGE_SIZE;
-        
+
         Ok(unsafe { mmap.as_mut_ptr().add(offset) })
     }
 
-    /// Persist data using cache line flushes (clflush/clflushopt/clwb)
+    /// Persist data using cache line flushes (`clflush`).
+    ///
+    /// `clwb` / `clflushopt` would avoid invalidating the flushed lines, but
+    /// their intrinsics are unstable in Rust, so only `clflush` is used.
     pub fn persist_page(&self, page_id: PageId) -> Result<()> {
         let ptr = self.get_page_ptr(page_id)?;
 
         #[cfg(all(target_arch = "x86_64", not(doc)))]
-        {
-            // Use CLWB (Cache Line Write Back) if available, otherwise CLFLUSHOPT
-            if is_x86_feature_detected!("clwb") {
-                unsafe { Self::persist_with_clwb(ptr, PAGE_SIZE) };
-            } else if is_x86_feature_detected!("clflushopt") {
-                unsafe { Self::persist_with_clflushopt(ptr, PAGE_SIZE) };
-            } else {
-                unsafe { Self::persist_with_clflush(ptr, PAGE_SIZE) };
-            }
-        }
+        unsafe {
+            Self::persist_with_clflush(ptr, PAGE_SIZE)
+        };
 
         #[cfg(any(not(target_arch = "x86_64"), doc))]
         {
@@ -146,35 +152,11 @@ impl DaxVfs {
         Ok(())
     }
 
-    /// Persist using CLWB (most efficient - doesn't invalidate cache line)
-    #[cfg(all(target_arch = "x86_64", not(doc)))]
-    #[target_feature(enable = "clwb")]
-    unsafe fn persist_with_clwb(ptr: *const u8, size: usize) {
-        use std::arch::x86_64::*;
-        
-        const CACHE_LINE_SIZE: usize = 64;
-        for i in (0..size).step_by(CACHE_LINE_SIZE) {
-            _mm_clwb(ptr.add(i) as *const u8);
-        }
-    }
-
-    /// Persist using CLFLUSHOPT (optimized flush)
-    #[cfg(all(target_arch = "x86_64", not(doc)))]
-    #[target_feature(enable = "clflushopt")]
-    unsafe fn persist_with_clflushopt(ptr: *const u8, size: usize) {
-        use std::arch::x86_64::*;
-        
-        const CACHE_LINE_SIZE: usize = 64;
-        for i in (0..size).step_by(CACHE_LINE_SIZE) {
-            _mm_clflushopt(ptr.add(i) as *const u8);
-        }
-    }
-
     /// Persist using CLFLUSH (standard flush)
     #[cfg(all(target_arch = "x86_64", not(doc)))]
     unsafe fn persist_with_clflush(ptr: *const u8, size: usize) {
         use std::arch::x86_64::*;
-        
+
         const CACHE_LINE_SIZE: usize = 64;
         for i in (0..size).step_by(CACHE_LINE_SIZE) {
             _mm_clflush(ptr.add(i) as *const u8);
@@ -213,7 +195,7 @@ impl DaxVfs {
             let offset = i * 16;
             let src_ptr = src.add(offset) as *const __m128i;
             let dst_ptr = dst.add(offset) as *mut __m128i;
-            
+
             let data = _mm_loadu_si128(src_ptr);
             _mm_stream_si128(dst_ptr, data);
         }
@@ -229,22 +211,16 @@ impl DaxVfs {
 
     /// Expand the file to accommodate more pages
     fn expand(&self, new_size: u64) -> Result<()> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.path)?;
+        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
 
         file.set_len(new_size)?;
 
         // Remap
-        let new_mmap = unsafe {
-            MmapOptions::new()
-                .len(new_size as usize)
-                .map_mut(&file)?
-        };
+        let new_mmap = unsafe { MmapOptions::new().len(new_size as usize).map_mut(&file)? };
 
         *self.mmap.write() = Some(new_mmap);
-        self.num_pages.store(new_size / PAGE_SIZE as u64, Ordering::Release);
+        self.num_pages
+            .store(new_size / PAGE_SIZE as u64, Ordering::Release);
 
         Ok(())
     }
@@ -254,7 +230,7 @@ impl DaxVfs {
 impl AsyncVfs for DaxVfs {
     async fn read_page(&self, page_id: PageId) -> Result<Page> {
         let ptr = self.get_page_ptr(page_id)?;
-        
+
         let mut page = Page::new();
         unsafe {
             std::ptr::copy_nonoverlapping(ptr, page.data_mut().as_mut_ptr(), PAGE_SIZE);
@@ -265,7 +241,7 @@ impl AsyncVfs for DaxVfs {
 
     async fn write_page(&self, page_id: PageId, page: &Page) -> Result<()> {
         let ptr = self.get_page_ptr_mut(page_id)?;
-        
+
         unsafe {
             std::ptr::copy_nonoverlapping(page.data().as_ptr(), ptr, PAGE_SIZE);
         }
@@ -332,14 +308,16 @@ impl PmemTransactionLog {
 
     /// Append a log entry (returns immediately after cache line flush)
     pub fn append(&self, data: &[u8]) -> Result<u64> {
-        let offset = self.write_offset.fetch_add(data.len() as u64, Ordering::AcqRel);
-        
+        let offset = self
+            .write_offset
+            .fetch_add(data.len() as u64, Ordering::AcqRel);
+
         if offset + data.len() as u64 > PAGE_SIZE as u64 {
             return Err(VelociError::StorageError("Log page full".to_string()));
         }
 
         let page_ptr = self.dax_vfs.get_page_ptr_mut(self.log_page)?;
-        
+
         unsafe {
             let write_ptr = page_ptr.add(offset as usize);
             std::ptr::copy_nonoverlapping(data.as_ptr(), write_ptr, data.len());
@@ -354,13 +332,13 @@ impl PmemTransactionLog {
     /// Read log entries
     pub fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
         let page_ptr = self.dax_vfs.get_page_ptr(self.log_page)?;
-        
+
         if offset + length as u64 > PAGE_SIZE as u64 {
             return Err(VelociError::StorageError("Read out of bounds".to_string()));
         }
 
         let mut buffer = vec![0u8; length];
-        
+
         unsafe {
             let read_ptr = page_ptr.add(offset as usize);
             std::ptr::copy_nonoverlapping(read_ptr, buffer.as_mut_ptr(), length);
@@ -418,4 +396,3 @@ mod tests {
         assert_eq!(read_data, data);
     }
 }
-

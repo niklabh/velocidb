@@ -23,10 +23,7 @@ fn test_vector_column_roundtrip() {
 
     let result = db.query("SELECT * FROM docs ORDER BY id").unwrap();
     assert_eq!(result.rows.len(), 2);
-    assert_eq!(
-        result.rows[0].values[1],
-        Value::Vector(vec![1.0, 0.0, 0.0])
-    );
+    assert_eq!(result.rows[0].values[1], Value::Vector(vec![1.0, 0.0, 0.0]));
 }
 
 #[test]
@@ -121,7 +118,13 @@ fn test_vector_search_api() {
     }
 
     let neighbors = db
-        .vector_search("docs", "embedding", &[7.0, 1.0], 2, DistanceMetric::Euclidean)
+        .vector_search(
+            "docs",
+            "embedding",
+            &[7.0, 1.0],
+            2,
+            DistanceMetric::Euclidean,
+        )
         .unwrap();
     assert_eq!(neighbors.len(), 2);
     assert_eq!(neighbors[0].1.values[0], Value::Integer(7));
@@ -182,9 +185,7 @@ fn test_parallel_filter_and_sort_large_set() {
     assert_eq!(result.rows[0].values[1], Value::Integer(1000));
     assert_eq!(result.rows[999].values[1], Value::Integer(1999));
 
-    let count = db
-        .query("SELECT COUNT(*) FROM nums WHERE v < 500")
-        .unwrap();
+    let count = db.query("SELECT COUNT(*) FROM nums WHERE v < 500").unwrap();
     assert_eq!(count.rows[0].values[0], Value::Integer(500));
 }
 
@@ -230,7 +231,8 @@ fn test_cdc_capture_and_poll() {
 
     db.enable_cdc();
     db.execute("INSERT INTO t VALUES (2, 'alice')").unwrap();
-    db.execute("UPDATE t SET name = 'bob' WHERE id = 2").unwrap();
+    db.execute("UPDATE t SET name = 'bob' WHERE id = 2")
+        .unwrap();
     db.execute("DELETE FROM t WHERE id = 1").unwrap();
 
     let changes = db.changes_since(0);
@@ -305,8 +307,10 @@ fn test_alter_table_renames_survive_reopen() {
         db.execute("CREATE TABLE old_name (id INTEGER PRIMARY KEY, a TEXT)")
             .unwrap();
         db.execute("INSERT INTO old_name VALUES (1, 'x')").unwrap();
-        db.execute("ALTER TABLE old_name RENAME TO new_name").unwrap();
-        db.execute("ALTER TABLE new_name RENAME COLUMN a TO b").unwrap();
+        db.execute("ALTER TABLE old_name RENAME TO new_name")
+            .unwrap();
+        db.execute("ALTER TABLE new_name RENAME COLUMN a TO b")
+            .unwrap();
         db.close().unwrap();
     }
 
@@ -353,7 +357,13 @@ async fn test_async_end_to_end() {
 
     // Async KNN API.
     let neighbors = conn
-        .vector_search("docs", "embedding", &[6.0, 0.0], 2, DistanceMetric::Euclidean)
+        .vector_search(
+            "docs",
+            "embedding",
+            &[6.0, 0.0],
+            2,
+            DistanceMetric::Euclidean,
+        )
         .await
         .unwrap();
     assert_eq!(neighbors[0].1.values[0], Value::Integer(6));

@@ -13,6 +13,7 @@ use crate::vector::{self, DistanceMetric};
 use crate::wal::WalManager;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -22,6 +23,8 @@ use std::sync::Arc;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const CACHE_SIZE: usize = 1024; // Number of pages to cache
+/// WAL size at which a commit triggers a checkpoint (~1,000 page records).
+pub const CHECKPOINT_WAL_BYTES: u64 = 4 * 1024 * 1024;
 
 #[repr(C, align(4096))]
 #[derive(Clone, Debug)]
@@ -54,14 +57,22 @@ impl Default for Page {
 /// The pager owns the on-disk data file and the WAL.
 ///
 /// All page mutations flow through `write_page`. If a "write group" is active
-/// (started by `begin_group`), the page is appended to the WAL and buffered in
-/// `pending` until `commit_group` fsyncs the WAL and applies the buffered
-/// pages to the data file. With no active group, `write_page` opens an
-/// implicit single-write group, giving every standalone write its own atomic
-/// WAL transaction.
+/// (started by `begin_group`), the page is buffered in `pending` until
+/// `commit_group` appends every buffered page to the WAL and fsyncs it. The
+/// committed pages then live in `committed` (and the WAL) until `checkpoint`
+/// copies them into the data file. With no active group, `write_page`
+/// opens an implicit single-write group, giving every standalone write its own
+/// atomic WAL transaction.
+///
+/// Because nothing reaches the WAL before commit, a group can span several
+/// statements (an explicit `BEGIN` … `COMMIT`) and be discarded wholesale by
+/// `abort_group`. Within a group, a savepoint (`begin_savepoint`) records the
+/// pre-image of every page a statement touches so a failed statement can be
+/// undone with `rollback_to_savepoint` without aborting the whole group.
 ///
 /// Reads consult `pending` first (so writes within the active group are
-/// visible to subsequent reads), then the page cache, then the data file.
+/// visible to subsequent reads), then `committed`, then the page cache, then
+/// the data file.
 pub struct Pager {
     file: File,
     num_pages: u64,
@@ -71,6 +82,19 @@ pub struct Pager {
     wal: WalManager,
     active_group: Option<u64>,
     pending: HashMap<PageId, Page>,
+    /// Pages committed to the WAL but not yet checkpointed into the data file.
+    /// Authoritative over the data file (and never evicted) until checkpoint.
+    committed: HashMap<PageId, Page>,
+    /// `num_pages` when the active group began; restored on abort.
+    group_start_pages: u64,
+    /// Active savepoint: prior `pending` entry of every page written since
+    /// the savepoint began (`None` = page was not pending), plus `num_pages`.
+    savepoint: Option<Savepoint>,
+}
+
+struct Savepoint {
+    undo: HashMap<PageId, Option<Page>>,
+    num_pages: u64,
 }
 
 impl Pager {
@@ -79,6 +103,7 @@ impl Pager {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
 
         let metadata = file.metadata()?;
@@ -100,6 +125,9 @@ impl Pager {
             wal,
             active_group: None,
             pending: HashMap::new(),
+            committed: HashMap::new(),
+            group_start_pages: num_pages,
+            savepoint: None,
         };
 
         pager.recover()?;
@@ -107,20 +135,47 @@ impl Pager {
     }
 
     /// Replays any committed WAL groups onto the data file, then truncates the
-    /// WAL. Safe to call multiple times (truncated WAL yields zero groups).
+    /// WAL. The WAL is reset even when nothing was committed, so a torn or
+    /// uncommitted tail can never sit in front of later appends. Safe to call
+    /// multiple times (an empty WAL yields zero groups).
     fn recover(&mut self) -> Result<()> {
-        let groups = self.wal.read_committed_groups()?;
-        if groups.is_empty() {
+        if self.wal.size() == 0 {
             return Ok(());
         }
+        let groups = self.wal.read_committed_groups()?;
         for group in &groups {
             for (page_id, data) in &group.writes {
                 self.write_page_raw(*page_id, data)?;
             }
         }
-        self.file.sync_data()?;
+        if !groups.is_empty() {
+            self.file.sync_data()?;
+        }
         self.wal.truncate()?;
         Ok(())
+    }
+
+    /// Copies every committed-but-unapplied page into the data file, fsyncs
+    /// it, then truncates the WAL. On failure the pages stay in `committed`
+    /// (they are still durable in the WAL) and the next checkpoint retries.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        if self.committed.is_empty() {
+            return Ok(());
+        }
+        let committed = std::mem::take(&mut self.committed);
+        let applied = (|| -> Result<()> {
+            let mut page_ids: Vec<&PageId> = committed.keys().collect();
+            page_ids.sort_unstable();
+            for page_id in page_ids {
+                self.write_page_raw(*page_id, committed[page_id].data())?;
+            }
+            self.file.sync_data()?;
+            self.wal.truncate()
+        })();
+        if applied.is_err() {
+            self.committed = committed;
+        }
+        applied
     }
 
     /// Writes a page directly to the data file (no WAL, no cache, no pending).
@@ -153,30 +208,55 @@ impl Pager {
         }
         let id = self.wal.allocate_group_id();
         self.active_group = Some(id);
+        self.group_start_pages = self.num_pages;
         Ok(id)
     }
 
-    /// Commits the active write group: fsyncs the WAL (durability of the
-    /// COMMIT marker), applies buffered pages to the data file, fsyncs the
-    /// data file, then truncates the WAL.
+    /// Whether a write group is currently active.
+    pub fn in_group(&self) -> bool {
+        self.active_group.is_some()
+    }
+
+    /// Commits the active write group: appends every buffered page and a
+    /// COMMIT record to the WAL in one write and fsyncs it (the durability
+    /// point, and the only fsync on the commit path). The pages move to
+    /// `committed`; once the WAL passes `CHECKPOINT_WAL_BYTES` they are
+    /// checkpointed into the data file. If writing the WAL fails the group is
+    /// aborted.
     pub fn commit_group(&mut self) -> Result<()> {
-        let group_id = self.active_group.take().ok_or_else(|| {
+        let group_id = self.active_group.ok_or_else(|| {
             VelociError::TransactionError("No active write group to commit".to_string())
         })?;
+        self.savepoint = None;
 
-        // Empty group: nothing to commit, no WAL records were written.
+        // Empty group: nothing to commit.
         if self.pending.is_empty() {
+            self.active_group = None;
             return Ok(());
         }
 
-        self.wal.log_commit(group_id)?;
-
-        let pending = std::mem::take(&mut self.pending);
-        for (page_id, page) in &pending {
-            self.write_page_raw(*page_id, page.data())?;
+        let mut page_ids: Vec<PageId> = self.pending.keys().copied().collect();
+        page_ids.sort_unstable();
+        let pending = &self.pending;
+        let logged = self.wal.append_group(
+            group_id,
+            page_ids.iter().map(|id| (*id, pending[id].data())),
+        );
+        if let Err(e) = logged {
+            // No COMMIT record is durable, so recovery ignores the group.
+            let _ = self.abort_group();
+            return Err(e);
         }
-        self.file.sync_data()?;
-        self.wal.truncate()?;
+        self.active_group = None;
+        self.committed.extend(std::mem::take(&mut self.pending));
+
+        if self.wal.size() >= CHECKPOINT_WAL_BYTES {
+            // The commit is already durable; a failed checkpoint only delays
+            // moving pages into the data file and is retried next time.
+            if let Err(e) = self.checkpoint() {
+                tracing::warn!("checkpoint failed, will retry: {}", e);
+            }
+        }
         Ok(())
     }
 
@@ -190,13 +270,67 @@ impl Pager {
                 "No active write group to abort".to_string(),
             ));
         }
-        for page_id in self.pending.keys() {
-            if self.cache.remove(page_id).is_some() {
-                self.cache_size.fetch_sub(1, Ordering::Relaxed);
-            }
+        self.savepoint = None;
+        let pending = std::mem::take(&mut self.pending);
+        for page_id in pending.keys() {
+            self.evict(*page_id);
         }
-        self.pending.clear();
+        self.num_pages = self.group_start_pages;
         Ok(())
+    }
+
+    /// Starts a statement-level savepoint inside the active group. Every page
+    /// written until `release_savepoint` / `rollback_to_savepoint` has its
+    /// prior buffered state recorded.
+    pub fn begin_savepoint(&mut self) -> Result<()> {
+        if self.active_group.is_none() {
+            return Err(VelociError::TransactionError(
+                "Savepoint requires an active write group".to_string(),
+            ));
+        }
+        if self.savepoint.is_some() {
+            return Err(VelociError::TransactionError(
+                "Savepoint already active".to_string(),
+            ));
+        }
+        self.savepoint = Some(Savepoint {
+            undo: HashMap::new(),
+            num_pages: self.num_pages,
+        });
+        Ok(())
+    }
+
+    /// Keeps every write made since the savepoint began.
+    pub fn release_savepoint(&mut self) {
+        self.savepoint = None;
+    }
+
+    /// Restores `pending` (and `num_pages`) to their state when the savepoint
+    /// began, undoing the writes of the failed statement only.
+    pub fn rollback_to_savepoint(&mut self) -> Result<()> {
+        let sp = self
+            .savepoint
+            .take()
+            .ok_or_else(|| VelociError::TransactionError("No active savepoint".to_string()))?;
+        for (page_id, prior) in sp.undo {
+            match prior {
+                Some(page) => {
+                    self.pending.insert(page_id, page);
+                }
+                None => {
+                    self.pending.remove(&page_id);
+                }
+            }
+            self.evict(page_id);
+        }
+        self.num_pages = sp.num_pages;
+        Ok(())
+    }
+
+    fn evict(&self, page_id: PageId) {
+        if self.cache.remove(&page_id).is_some() {
+            self.cache_size.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     pub fn read_page(&mut self, page_id: PageId) -> Result<Arc<RwLock<Page>>> {
@@ -206,21 +340,28 @@ impl Pager {
             return Ok(Arc::new(RwLock::new(page.clone())));
         }
 
+        // Invariant: a cached page always equals its newest version (pending,
+        // else committed, else on disk). `write_page` caches what it buffers,
+        // and abort / savepoint rollback evict what they discard.
         if let Some(page) = self.cache.get(&page_id) {
             return Ok(page.clone());
         }
 
-        if page_id >= self.num_pages {
-            return Err(VelociError::NotFound(format!(
-                "Page {} out of bounds",
-                page_id
-            )));
-        }
-
-        let mut page = Page::new();
-        let offset = page_id * PAGE_SIZE as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut page.data)?;
+        let page = if let Some(page) = self.committed.get(&page_id) {
+            page.clone()
+        } else {
+            if page_id >= self.num_pages {
+                return Err(VelociError::NotFound(format!(
+                    "Page {} out of bounds",
+                    page_id
+                )));
+            }
+            let mut page = Page::new();
+            let offset = page_id * PAGE_SIZE as u64;
+            self.file.seek(SeekFrom::Start(offset))?;
+            self.file.read_exact(&mut page.data)?;
+            page
+        };
 
         let page_arc = Arc::new(RwLock::new(page));
 
@@ -248,11 +389,13 @@ impl Pager {
         if auto_group {
             self.begin_group()?;
         }
-        let group_id = self.active_group.expect("group active after begin_group");
+        if let Some(sp) = self.savepoint.as_mut() {
+            if let Entry::Vacant(e) = sp.undo.entry(page_id) {
+                e.insert(self.pending.get(&page_id).cloned());
+            }
+        }
 
-        self.wal.log_page_write(group_id, page_id, page.data())?;
-
-        // Update pending buffer.
+        // Update pending buffer; the WAL is written at commit.
         self.pending.insert(page_id, page.clone());
 
         // Update cache (overwrites any older version).
@@ -307,6 +450,7 @@ impl Pager {
         if self.active_group.is_some() {
             let _ = self.abort_group();
         }
+        self.checkpoint()?;
         self.file.sync_all()?;
         Ok(())
     }
@@ -438,10 +582,10 @@ impl Database {
                 break;
             }
 
-            let chunk_len = u32::from_le_bytes(
-                page_data[0..4].try_into()
-                    .map_err(|_| VelociError::Corruption("Failed to read chunk length".to_string()))?
-            ) as usize;
+            let chunk_len =
+                u32::from_le_bytes(page_data[0..4].try_into().map_err(|_| {
+                    VelociError::Corruption("Failed to read chunk length".to_string())
+                })?) as usize;
 
             let chunk_end = std::cmp::min(4 + chunk_len, page_data.len());
             data_copy.extend_from_slice(&page_data[4..chunk_end]);
@@ -459,42 +603,52 @@ impl Database {
         let data = &data_copy[..];
 
         let num_tables = u32::from_le_bytes(
-            data[0..4].try_into()
-                .map_err(|_| VelociError::Corruption("Failed to read table count".to_string()))?
+            data[0..4]
+                .try_into()
+                .map_err(|_| VelociError::Corruption("Failed to read table count".to_string()))?,
         );
         let mut offset: usize = 4;
 
         for _ in 0..num_tables {
             if offset + 4 > data.len() {
-                return Err(VelociError::Corruption("Schema truncated at table name length".to_string()));
+                return Err(VelociError::Corruption(
+                    "Schema truncated at table name length".to_string(),
+                ));
             }
 
-            let name_len = u32::from_le_bytes(
-                data[offset..offset + 4].try_into()
-                    .map_err(|_| VelociError::Corruption("Failed to read table name length".to_string()))?
-            ) as usize;
+            let name_len =
+                u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
+                    VelociError::Corruption("Failed to read table name length".to_string())
+                })?) as usize;
             offset += 4;
 
             if offset + name_len > data.len() {
                 return Err(VelociError::Corruption(format!(
-                    "Schema truncated at table name (expected {} bytes)", name_len
+                    "Schema truncated at table name (expected {} bytes)",
+                    name_len
                 )));
             }
 
-            let table_name = String::from_utf8(data[offset..offset + name_len].to_vec())
-                .map_err(|_| VelociError::Corruption(format!("Invalid UTF-8 in table name at offset {}", offset)))?;
+            let table_name =
+                String::from_utf8(data[offset..offset + name_len].to_vec()).map_err(|_| {
+                    VelociError::Corruption(format!(
+                        "Invalid UTF-8 in table name at offset {}",
+                        offset
+                    ))
+                })?;
             offset += name_len;
 
             if offset + 4 > data.len() {
                 return Err(VelociError::Corruption(format!(
-                    "Schema truncated at column count for table '{}'", table_name
+                    "Schema truncated at column count for table '{}'",
+                    table_name
                 )));
             }
 
-            let num_cols = u32::from_le_bytes(
-                data[offset..offset + 4].try_into()
-                    .map_err(|_| VelociError::Corruption("Failed to read column count".to_string()))?
-            ) as usize;
+            let num_cols =
+                u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
+                    VelociError::Corruption("Failed to read column count".to_string())
+                })?) as usize;
             offset += 4;
 
             let mut columns = Vec::new();
@@ -502,24 +656,31 @@ impl Database {
             for _ in 0..num_cols {
                 if offset + 4 > data.len() {
                     return Err(VelociError::Corruption(format!(
-                        "Schema truncated at column name length in table '{}'", table_name
+                        "Schema truncated at column name length in table '{}'",
+                        table_name
                     )));
                 }
 
-                let col_name_len = u32::from_le_bytes(
-                    data[offset..offset + 4].try_into()
-                        .map_err(|_| VelociError::Corruption("Failed to read column name length".to_string()))?
-                ) as usize;
+                let col_name_len =
+                    u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
+                        VelociError::Corruption("Failed to read column name length".to_string())
+                    })?) as usize;
                 offset += 4;
 
                 if offset + col_name_len + 10 > data.len() {
                     return Err(VelociError::Corruption(format!(
-                        "Schema truncated at column data for table '{}'", table_name
+                        "Schema truncated at column data for table '{}'",
+                        table_name
                     )));
                 }
 
                 let col_name = String::from_utf8(data[offset..offset + col_name_len].to_vec())
-                    .map_err(|_| VelociError::Corruption(format!("Invalid UTF-8 in column name at offset {}", offset)))?;
+                    .map_err(|_| {
+                        VelociError::Corruption(format!(
+                            "Invalid UTF-8 in column name at offset {}",
+                            offset
+                        ))
+                    })?;
                 offset += col_name_len;
 
                 let data_type_byte = data[offset];
@@ -537,23 +698,28 @@ impl Database {
                                 col_name
                             )));
                         }
-                        let dim = u32::from_le_bytes(
-                            data[offset..offset + 4].try_into().map_err(|_| {
-                                VelociError::Corruption("Failed to read vector dimension".to_string())
-                            })?,
-                        );
+                        let dim = u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(
+                            |_| {
+                                VelociError::Corruption(
+                                    "Failed to read vector dimension".to_string(),
+                                )
+                            },
+                        )?);
                         offset += 4;
                         DataType::Vector(dim)
                     }
-                    _ => return Err(VelociError::Corruption(format!(
-                        "Unknown data type byte {} for column '{}' in table '{}'",
-                        data_type_byte, col_name, table_name
-                    ))),
+                    _ => {
+                        return Err(VelociError::Corruption(format!(
+                            "Unknown data type byte {} for column '{}' in table '{}'",
+                            data_type_byte, col_name, table_name
+                        )))
+                    }
                 };
 
                 if offset + 9 > data.len() {
                     return Err(VelociError::Corruption(format!(
-                        "Schema truncated at column flags for table '{}'", table_name
+                        "Schema truncated at column flags for table '{}'",
+                        table_name
                     )));
                 }
                 let flags = data[offset];
@@ -562,10 +728,10 @@ impl Database {
                 let unique = (flags & 4) != 0;
                 offset += 1;
 
-                let root_page = u64::from_le_bytes(
-                    data[offset..offset + 8].try_into()
-                        .map_err(|_| VelociError::Corruption("Failed to read root page".to_string()))?
-                );
+                let root_page =
+                    u64::from_le_bytes(data[offset..offset + 8].try_into().map_err(|_| {
+                        VelociError::Corruption("Failed to read root page".to_string())
+                    })?);
                 offset += 8;
 
                 if table_root_page == 0 && root_page != 0 {
@@ -585,7 +751,12 @@ impl Database {
                 // A schema entry without a valid root page indicates a bug or
                 // partial recovery. Allocate a fresh leaf root for it.
                 let mut pager = self.pager.write();
-                pager.begin_group()?;
+                // Inside an active group (reload after a rollback) the repair
+                // joins that group; otherwise it gets one of its own.
+                let own_group = !pager.in_group();
+                if own_group {
+                    pager.begin_group()?;
+                }
                 let res = (|| -> Result<u64> {
                     let new_root_page = pager.allocate_page()?;
                     let mut page = crate::storage::Page::new();
@@ -596,11 +767,15 @@ impl Database {
                 })();
                 match res {
                     Ok(p) => {
-                        pager.commit_group()?;
+                        if own_group {
+                            pager.commit_group()?;
+                        }
                         p
                     }
                     Err(e) => {
-                        let _ = pager.abort_group();
+                        if own_group {
+                            let _ = pager.abort_group();
+                        }
                         return Err(e);
                     }
                 }
@@ -609,7 +784,9 @@ impl Database {
             };
 
             let btree = crate::btree::BTree::from_root(btree_root, Arc::clone(&self.pager));
-            self.btrees.write().insert(table_name.clone(), Arc::new(RwLock::new(btree)));
+            self.btrees
+                .write()
+                .insert(table_name.clone(), Arc::new(RwLock::new(btree)));
 
             let table_schema = TableSchema {
                 name: table_name,
@@ -622,6 +799,18 @@ impl Database {
         Ok(())
     }
 
+    /// Discards the in-memory schema and B-tree handles and rebuilds them from
+    /// the pager's current view (the data file plus any pending pages). Called
+    /// after a rollback so in-memory roots and columns match storage again.
+    fn reload_schema(&self) -> Result<()> {
+        *self.schema.write() = Schema::new();
+        self.btrees.write().clear();
+        self.load_schema()
+    }
+
+    /// Serializes the schema into the schema page chain. Runs inside the
+    /// caller's active write group so the schema commits (or rolls back)
+    /// atomically with the statement that changed it.
     fn save_schema(&self) -> Result<()> {
         let schema = self.schema.read();
         let mut buffer = Vec::new();
@@ -690,39 +879,36 @@ impl Database {
             }
         }
 
-        // The entire schema serialization is one atomic WAL group: either all
-        // chained pages land or none do.
+        drop(schema);
+
         let mut pager = self.pager.write();
+        debug_assert!(
+            pager.in_group(),
+            "save_schema must run inside a write group"
+        );
         let usable_size = PAGE_SIZE - 4; // Reserve 4 bytes for chunk length header
-        let num_pages_needed = if buffer.is_empty() { 1 } else { (buffer.len() + usable_size - 1) / usable_size };
+        let num_pages_needed = if buffer.is_empty() {
+            1
+        } else {
+            (buffer.len() + usable_size - 1) / usable_size
+        };
 
-        pager.begin_group()?;
-        let res = (|| -> Result<()> {
-            while pager.num_pages() < 1 + num_pages_needed as u64 {
-                pager.allocate_page()?;
-            }
+        while pager.num_pages() < 1 + num_pages_needed as u64 {
+            pager.allocate_page()?;
+        }
 
-            for page_idx in 0..num_pages_needed {
-                let start = page_idx * usable_size;
-                let end = std::cmp::min(start + usable_size, buffer.len());
-                let chunk = &buffer[start..end];
+        for page_idx in 0..num_pages_needed {
+            let start = page_idx * usable_size;
+            let end = std::cmp::min(start + usable_size, buffer.len());
+            let chunk = &buffer[start..end];
 
-                let mut page = crate::storage::Page::new();
-                let chunk_len = chunk.len() as u32;
-                page.data_mut()[0..4].copy_from_slice(&chunk_len.to_le_bytes());
-                page.data_mut()[4..4 + chunk.len()].copy_from_slice(chunk);
+            let mut page = crate::storage::Page::new();
+            let chunk_len = chunk.len() as u32;
+            page.data_mut()[0..4].copy_from_slice(&chunk_len.to_le_bytes());
+            page.data_mut()[4..4 + chunk.len()].copy_from_slice(chunk);
 
-                let schema_page_id = 1 + page_idx as u64;
-                pager.write_page(schema_page_id, &page)?;
-            }
-            Ok(())
-        })();
-        match res {
-            Ok(()) => pager.commit_group()?,
-            Err(e) => {
-                let _ = pager.abort_group();
-                return Err(e);
-            }
+            let schema_page_id = 1 + page_idx as u64;
+            pager.write_page(schema_page_id, &page)?;
         }
 
         Ok(())
@@ -764,6 +950,13 @@ impl Database {
         let parser = Parser::new();
         let statement = parser.parse(sql)?;
 
+        match statement {
+            Statement::BeginTransaction => return self.begin(),
+            Statement::CommitTransaction => return self.commit(),
+            Statement::RollbackTransaction => return self.rollback(),
+            _ => {}
+        }
+
         let executor = self.get_or_create_executor();
 
         // Serialize writers so the pager only ever has a single active WAL
@@ -773,6 +966,11 @@ impl Database {
         // Pager persists across lock releases, so `write_page` calls from the
         // executor still see the group and buffer correctly.
         let _writer = self.writer.lock();
+
+        // Inside an explicit transaction the WAL group opened by `begin` stays
+        // open; the statement runs under a savepoint so a failure undoes only
+        // this statement. Otherwise the statement is its own group.
+        let in_txn = executor.in_transaction();
 
         let needs_schema_save = matches!(
             statement,
@@ -786,23 +984,52 @@ impl Database {
         // underflow). If a root changed, the schema page must be re-saved
         // so a subsequent open finds the correct root.
         let roots_before = self.snapshot_roots();
+        let cdc_mark = self.cdc.staged_mark();
 
-        self.pager.write().begin_group()?;
-        let result = executor.execute_statement(statement);
-        match &result {
-            Ok(()) => self.pager.write().commit_group()?,
-            Err(_) => {
-                let _ = self.pager.write().abort_group();
+        if in_txn {
+            self.pager.write().begin_savepoint()?;
+        } else {
+            self.pager.write().begin_group()?;
+        }
+
+        // The schema is saved inside the same group so DDL and root changes
+        // commit atomically with the rows they describe.
+        let result = executor.execute_statement(statement).and_then(|()| {
+            if needs_schema_save || roots_before != self.snapshot_roots() {
+                self.save_schema()?;
+            }
+            Ok(())
+        });
+
+        match result {
+            Ok(()) => {
+                if in_txn {
+                    self.pager.write().release_savepoint();
+                } else {
+                    let committed = self.pager.write().commit_group();
+                    if let Err(e) = committed {
+                        // commit_group already aborted the group.
+                        self.cdc.discard_staged_from(cdc_mark);
+                        self.reload_schema()?;
+                        return Err(e);
+                    }
+                    self.cdc.publish_staged();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if in_txn {
+                    self.pager.write().rollback_to_savepoint()?;
+                } else {
+                    self.pager.write().abort_group()?;
+                }
+                self.cdc.discard_staged_from(cdc_mark);
+                // The statement may have changed in-memory roots or columns
+                // before failing; rebuild them from storage.
+                self.reload_schema()?;
+                Err(e)
             }
         }
-        result?;
-
-        let roots_after = self.snapshot_roots();
-        if needs_schema_save || roots_before != roots_after {
-            self.save_schema()?;
-        }
-
-        Ok(())
     }
 
     fn snapshot_roots(&self) -> HashMap<String, PageId> {
@@ -837,27 +1064,65 @@ impl Database {
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
         let parser = Parser::new();
         let statement = parser.parse(sql)?;
-        
+
         let executor = self.get_or_create_executor();
-        
+
         executor.query_statement(statement)
     }
 
     /// Begins an explicit transaction.
+    ///
+    /// Every statement until [`Database::commit`] or [`Database::rollback`]
+    /// joins a single WAL group: nothing is durable until COMMIT, and ROLLBACK
+    /// discards all of it. The transaction is database-wide (a `Database` is
+    /// one session): statements from any thread join it, and readers see its
+    /// uncommitted writes.
     pub fn begin(&self) -> Result<()> {
         let executor = self.get_or_create_executor();
-        executor.begin_transaction()
+        let _writer = self.writer.lock();
+        executor.begin_transaction()?;
+        if let Err(e) = self.pager.write().begin_group() {
+            let _ = executor.rollback_transaction();
+            return Err(e);
+        }
+        Ok(())
     }
 
-    /// Commits the current explicit transaction.
+    /// Commits the current explicit transaction, making all of its writes
+    /// durable atomically. If the commit fails, the transaction is rolled back.
     pub fn commit(&self) -> Result<()> {
         let executor = self.get_or_create_executor();
+        let _writer = self.writer.lock();
+        if !executor.in_transaction() {
+            return Err(VelociError::TransactionError(
+                "No active transaction to commit".to_string(),
+            ));
+        }
+        let committed = self.pager.write().commit_group();
+        if let Err(e) = committed {
+            // commit_group already aborted the group.
+            self.cdc.discard_staged_from(0);
+            let _ = executor.rollback_transaction();
+            self.reload_schema()?;
+            return Err(e);
+        }
+        self.cdc.publish_staged();
         executor.commit_transaction()
     }
 
-    /// Rolls back the current explicit transaction.
+    /// Rolls back the current explicit transaction, discarding every change
+    /// made since [`Database::begin`], including schema changes.
     pub fn rollback(&self) -> Result<()> {
         let executor = self.get_or_create_executor();
+        let _writer = self.writer.lock();
+        if !executor.in_transaction() {
+            return Err(VelociError::TransactionError(
+                "No active transaction to rollback".to_string(),
+            ));
+        }
+        self.pager.write().abort_group()?;
+        self.cdc.discard_staged_from(0);
+        self.reload_schema()?;
         executor.rollback_transaction()
     }
 
@@ -1024,6 +1289,12 @@ pub struct Schema {
     tables: HashMap<String, TableSchema>,
 }
 
+impl Default for Schema {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Schema {
     pub fn new() -> Self {
         Self {
@@ -1082,7 +1353,7 @@ mod tests {
     fn test_page_allocation() {
         let temp_file = NamedTempFile::new().unwrap();
         let mut pager = Pager::new(temp_file.path()).unwrap();
-        
+
         let page_id = pager.allocate_page().unwrap();
         assert_eq!(page_id, 0);
         assert_eq!(pager.num_pages(), 1);
@@ -1092,14 +1363,14 @@ mod tests {
     fn test_read_write_page() {
         let temp_file = NamedTempFile::new().unwrap();
         let mut pager = Pager::new(temp_file.path()).unwrap();
-        
+
         let page_id = pager.allocate_page().unwrap();
-        
+
         let mut page = Page::new();
         page.data_mut()[0..4].copy_from_slice(&[1, 2, 3, 4]);
-        
+
         pager.write_page(page_id, &page).unwrap();
-        
+
         let read_page = pager.read_page(page_id).unwrap();
         let read_page_locked = read_page.read();
         assert_eq!(read_page_locked.data()[0..4], [1, 2, 3, 4]);
@@ -1112,4 +1383,3 @@ mod tests {
         assert!(db.pager.read().num_pages() >= 1);
     }
 }
-

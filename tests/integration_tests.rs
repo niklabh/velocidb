@@ -1,9 +1,9 @@
 // Integration tests for VelociDB
 
+use std::sync::Arc;
 use tempfile::NamedTempFile;
 use velocidb::storage::Database;
 use velocidb::types::{QueryResult, Value};
-use std::sync::Arc;
 
 struct TestDb {
     _temp_file: NamedTempFile,
@@ -57,7 +57,7 @@ fn test_select_specific_columns() {
     // and we get rows back.
     let result = db.query("SELECT name FROM users");
     assert_eq!(result.rows.len(), 1);
-    // Ideally we would check that we only got the name column, but the Result struct 
+    // Ideally we would check that we only got the name column, but the Result struct
     // might not expose column metadata easily in this test context without further inspection.
 }
 
@@ -92,7 +92,7 @@ fn test_select_with_where_operators() {
     // Test !=
     let result = db.query("SELECT * FROM items WHERE val != 20");
     assert_eq!(result.rows.len(), 2); // 10, 30
-    
+
     // Test =
     let result = db.query("SELECT * FROM items WHERE val = 20");
     assert_eq!(result.rows.len(), 1); // 20
@@ -120,8 +120,8 @@ fn test_update() {
 
     let result = db.query("SELECT * FROM users WHERE id = 1");
     assert_eq!(result.rows.len(), 1);
-    // We would need to inspect the row content to verify the update, 
-    // but row structure access depends on public API. 
+    // We would need to inspect the row content to verify the update,
+    // but row structure access depends on public API.
     // Assuming the query works, we at least verify it doesn't crash.
 }
 
@@ -198,42 +198,22 @@ fn test_text_data() {
 
 #[test]
 fn test_persistence() {
-    // Note: Schema persistence not yet implemented
-    // This test verifies page-level persistence only
     let temp_file = NamedTempFile::new().unwrap();
     let path = temp_file.path().to_path_buf();
 
     {
         let db = Database::open(&path).unwrap();
-        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
     } // db is dropped here, should flush
 
     {
         let db = Database::open(&path).unwrap();
-        // Schema should be persisted, so creating table again should fail or we should just query
-        // Let's try to query directly.
-        let result = db.query("SELECT * FROM users");
-        if result.is_err() {
-             // If query fails (maybe schema not loaded?), try create
-             db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
-             db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
-        } else {
-             // If query succeeds, check data
-             let rows = result.unwrap();
-             if rows.rows.is_empty() {
-                 // If empty, maybe data wasn't persisted but schema was?
-                 // Or maybe we need to insert again?
-                 // But the previous block inserted.
-                 // If persistence works, we should have 1 row.
-                 // If we have 0 rows, then data persistence failed.
-                 // Let's assert we have 1 row if we expect full persistence.
-                 // But wait, the error was "Table 'users' already exists".
-                 // So schema IS persisted.
-                 // So we should just query.
-             }
-             assert_eq!(rows.rows.len(), 1);
-        }
+        // Schema and data both persist across reopen.
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0].values[1], Value::Text("Alice".to_string()));
     }
 }
 
@@ -289,7 +269,10 @@ fn test_insert_text_with_commas() {
 
     let result = db.query("SELECT * FROM notes WHERE id = 1");
     assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0].values[1], Value::Text("Hello, World".to_string()));
+    assert_eq!(
+        result.rows[0].values[1],
+        Value::Text("Hello, World".to_string())
+    );
 }
 
 #[test]
@@ -367,7 +350,11 @@ fn test_large_dataset_with_splits() {
     db.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, val INTEGER)");
 
     for i in 0..200 {
-        db.execute(&format!("INSERT INTO data (id, val) VALUES ({}, {})", i, i * 3));
+        db.execute(&format!(
+            "INSERT INTO data (id, val) VALUES ({}, {})",
+            i,
+            i * 3
+        ));
     }
 
     let result = db.query("SELECT * FROM data");
@@ -381,4 +368,88 @@ fn test_large_dataset_with_splits() {
     assert_eq!(result.rows[0].values[0], Value::Integer(99));
 }
 
+#[test]
+fn test_primary_key_point_lookups() {
+    // `WHERE <pk> = <int>` takes the B-tree lookup path; results must match
+    // the scan path exactly, including extra AND conditions.
+    let db = TestDb::new();
+    db.db
+        .execute("CREATE TABLE p (id INTEGER PRIMARY KEY, name TEXT, n INTEGER)")
+        .unwrap();
+    db.db.begin().unwrap();
+    for i in 0..300 {
+        db.db
+            .execute(&format!(
+                "INSERT INTO p VALUES ({}, 'r{}', {})",
+                i,
+                i,
+                i % 7
+            ))
+            .unwrap();
+    }
+    db.db.commit().unwrap();
 
+    let r = db.db.query("SELECT name FROM p WHERE id = 123").unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].values[0], Value::Text("r123".to_string()));
+
+    // Missing key.
+    assert!(db
+        .db
+        .query("SELECT * FROM p WHERE id = 1000")
+        .unwrap()
+        .rows
+        .is_empty());
+    // PK match plus a non-matching condition.
+    assert!(db
+        .db
+        .query("SELECT * FROM p WHERE id = 10 AND n = 0")
+        .unwrap()
+        .rows
+        .is_empty());
+    // PK match plus a matching condition, conditions in either order.
+    assert_eq!(
+        db.db
+            .query("SELECT * FROM p WHERE n = 3 AND id = 10")
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    // Contradictory PK conditions.
+    assert!(db
+        .db
+        .query("SELECT * FROM p WHERE id = 1 AND id = 2")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        db.db
+            .query("SELECT COUNT(*) FROM p WHERE id = 42")
+            .unwrap()
+            .rows[0]
+            .values[0],
+        Value::Integer(1)
+    );
+
+    // UPDATE and DELETE by primary key touch exactly one row.
+    db.db
+        .execute("UPDATE p SET name = 'changed' WHERE id = 5")
+        .unwrap();
+    let r = db
+        .db
+        .query("SELECT * FROM p WHERE name = 'changed'")
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].values[0], Value::Integer(5));
+
+    db.db.execute("DELETE FROM p WHERE id = 5").unwrap();
+    db.db.execute("DELETE FROM p WHERE id = 9999").unwrap();
+    assert_eq!(db.db.query("SELECT * FROM p").unwrap().rows.len(), 299);
+    assert!(db
+        .db
+        .query("SELECT * FROM p WHERE id = 5")
+        .unwrap()
+        .rows
+        .is_empty());
+}

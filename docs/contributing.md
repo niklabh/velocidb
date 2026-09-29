@@ -39,27 +39,25 @@ cargo bench
 ```
 velocidb/
 ├── src/
-│   ├── main.rs              # REPL entry point
+│   ├── main.rs              # REPL (built on the library crate)
 │   ├── lib.rs               # Library interface and re-exports
-│   ├── storage.rs           # Storage engine: pager, database, schema
-│   ├── btree.rs             # B-Tree index implementation
-│   ├── btree_optimized.rs   # Cache-optimized B-Tree with SIMD search
-│   ├── parser.rs            # SQL parser (DDL, DML, DQL support)
-│   ├── executor.rs          # Query executor backed by MVCC
-│   ├── transaction.rs       # ACID transaction manager + lock manager
-│   ├── types.rs             # Core types: Value, Row, Column, errors
-│   ├── mvcc.rs              # Multi-Version Concurrency Control
-│   ├── async_io.rs          # Async I/O with Tokio / io_uring
-│   ├── lockfree.rs          # Lock-free data structures
-│   ├── simd.rs              # SIMD vectorized execution
-│   ├── crdt.rs              # CRDT-based sync (feature-gated)
-│   ├── cloud_vfs.rs         # Cloud storage VFS (feature-gated)
-│   ├── hybrid_storage.rs    # Hybrid row/columnar storage
-│   └── pmem.rs              # Persistent memory PMEM/DAX (feature-gated)
-├── tests/                   # Integration tests
+│   ├── storage.rs           # Pager, write groups/savepoints, Database, schema
+│   ├── wal.rs               # Write-ahead log and crash recovery
+│   ├── btree.rs             # B-tree primary index
+│   ├── parser.rs            # SQL parser
+│   ├── executor.rs          # Statement execution, constraints, parallel filter/sort
+│   ├── transaction.rs       # Transaction manager and table lock manager
+│   ├── types.rs             # Value, Row, Column, DataType, errors
+│   ├── vector.rs            # Vector columns, distance metrics, KNN
+│   ├── cdc.rs               # Change Data Capture
+│   ├── async_api.rs         # Builder / AsyncDatabase / AsyncConnection
+│   └── mvcc.rs, simd.rs, lockfree.rs, async_io.rs, btree_optimized.rs,
+│       crdt.rs, cloud_vfs.rs, hybrid_storage.rs, pmem.rs
+│                            # experimental: `--features experimental` only
+├── tests/                   # integration, recovery, transaction, advanced features
 ├── benches/                 # Criterion benchmarks
 ├── docs/                    # Documentation
-└── Cargo.toml               # Crate manifest with feature flags
+└── .claude/skills/          # Codebase guides for AI coding agents
 ```
 
 ## Contributing Guidelines
@@ -95,10 +93,12 @@ For feature requests:
    - Update documentation as needed
 
 4. **Test your changes**
+   These are the checks CI runs on every pull request:
    ```bash
-   cargo test
-   cargo clippy
+   cargo test --all-targets && cargo test --doc
+   cargo clippy --all-targets -- -D warnings
    cargo fmt --check
+   cargo test --lib --features experimental   # if you touched experimental modules
    ```
 
 5. **Commit your changes**
@@ -121,8 +121,10 @@ For feature requests:
 ## Code Style
 
 ### Formatting
-- Use `rustfmt` for consistent formatting
-- Run `cargo fmt` before committing
+- Run `cargo fmt` before committing (CI checks it). The tree-wide
+  formatting commit is listed in `.git-blame-ignore-revs`; run
+  `git config blame.ignoreRevsFile .git-blame-ignore-revs` to skip it in
+  `git blame`
 
 ### Linting
 - Use `clippy` to catch common mistakes

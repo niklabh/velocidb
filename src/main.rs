@@ -12,7 +12,6 @@ use std::env;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use tracing::{error, info, Level};
-use tracing_subscriber;
 
 use velocidb::Database;
 
@@ -277,7 +276,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             "--version" | "-v" => {
-                println!("VelociDB v0.1.0");
+                println!("VelociDB v{}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             "--db" | "-d" => {
@@ -300,12 +299,13 @@ fn main() -> Result<()> {
         }
     }
 
-    tracing_subscriber::fmt()
-        .with_max_level(Level::WARN)
-        .init();
+    tracing_subscriber::fmt().with_max_level(Level::WARN).init();
 
-    info!("VelociDB v0.1.0 - Interactive SQL Shell");
-    println!("VelociDB v0.1.0");
+    info!(
+        "VelociDB v{} - Interactive SQL Shell",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!("VelociDB v{}", env!("CARGO_PKG_VERSION"));
     println!("Database: {}", db_filename);
     println!("Type '.help' for help, '.exit' to quit. Statements end with ';'.");
     println!();
@@ -369,7 +369,11 @@ fn main() -> Result<()> {
 
     let mut buffer = String::new();
     loop {
-        let prompt = if buffer.is_empty() { "velocidb> " } else { "      ...> " };
+        let prompt = if buffer.is_empty() {
+            "velocidb> "
+        } else {
+            "      ...> "
+        };
         match rl.readline(prompt) {
             Ok(line) => {
                 let line_trimmed = line.trim();
@@ -392,8 +396,15 @@ fn main() -> Result<()> {
                     let lower = line_trimmed.to_lowercase();
                     if matches!(
                         lower.as_str(),
-                        "exit" | "quit" | "help" | "begin" | "commit" | "rollback"
-                            | "begin transaction" | "commit transaction" | "rollback transaction"
+                        "exit"
+                            | "quit"
+                            | "help"
+                            | "begin"
+                            | "commit"
+                            | "rollback"
+                            | "begin transaction"
+                            | "commit transaction"
+                            | "rollback transaction"
                     ) {
                         match process_command(&db, line_trimmed) {
                             Ok(true) => continue,
@@ -450,7 +461,7 @@ fn main() -> Result<()> {
 }
 
 fn print_help() {
-    println!("VelociDB v0.1.0");
+    println!("VelociDB v{}", env!("CARGO_PKG_VERSION"));
     println!();
     println!("USAGE:");
     println!("    velocidb [OPTIONS] [DATABASE]");

@@ -1,42 +1,77 @@
 # Development Journey & Architecture Decisions
 
 ## The Vision
-VelociDB started with a simple goal: to build a database that bridges the gap between the simplicity of SQLite and the performance capabilities of modern hardware. We wanted a database that could run on an embedded device but still take advantage of NVMe storage, AVX-512 instructions, and persistent memory.
 
-## Key Architectural Decisions
+VelociDB set out to be an embedded SQL database in Rust that keeps SQLite's
+simplicity and can grow into features from Turso: vector search, change
+data capture, and a native async API.
 
-### 1. Rust as the Foundation
-Choosing Rust was the first and most important decision. Its memory safety guarantees allowed us to implement complex concurrent structures (like our lock-free page cache) without the fear of data races or segfaults that plague C/C++ database engines.
+The early releases explored a lot of advanced techniques at once: MVCC,
+io_uring, SIMD kernels, lock-free caches, CRDTs, cloud and persistent-memory
+VFSs. Most of that work was never wired into the SQL engine. From 0.3 the
+project draws a hard line: the **active path** (pager, WAL, B-tree, parser,
+executor) must be correct and tested before anything else joins it. The
+research code lives behind the `experimental` feature
+([experimental.md](experimental.md)).
 
-### 2. The Storage Engine: B-Tree vs. LSM
-We debated between a Log-Structured Merge-tree (LSM) and a B-Tree. While LSM trees are popular for write-heavy workloads, we chose a **B-Tree** (specifically a B+Tree variant) because:
-- It offers better read performance for range queries.
-- It behaves more predictably under mixed workloads.
-- It aligns well with our page-based architecture.
+## Key Decisions
 
-We optimized our B-Tree for modern CPU caches by aligning node headers and keys to cache lines, reducing L1/L2 cache misses by up to 40%.
+### Rust
 
-### 3. Concurrency Control: MVCC
-To support high concurrency, we implemented **Multi-Version Concurrency Control (MVCC)**. Instead of locking rows for readers, we create immutable versions of records. This allows:
-- **Non-blocking reads**: Readers never block writers, and writers never block readers.
-- **Snapshot Isolation**: Transactions see a consistent view of the database as it existed when they started.
+Memory safety without a garbage collector, `parking_lot` locks, and rayon /
+tokio for parallel and async execution. It lets a small codebase take on
+concurrency without the usual class of C/C++ memory bugs.
 
-### 4. Async I/O with Tokio
-Traditional databases often use thread pools for I/O. We embraced Rust's async ecosystem, using **Tokio** and `io_uring` (on Linux) to handle thousands of concurrent I/O operations with a small number of threads. This "thread-per-core" architecture minimizes context switching overhead.
+### B-tree, not LSM
 
-### 5. SIMD Acceleration
-We identified that query execution often becomes CPU-bound during aggregations and filters. We used Rust's portable SIMD features (and specific AVX-512 intrinsics where available) to vectorize these operations, achieving 4-20x speedups for operations like `SUM`, `AVG`, and complex `WHERE` clause filtering.
+A B-tree keyed by the integer primary key gives predictable reads and
+in-place updates, and maps directly onto 4 KB pages. An LSM tree would
+favour write-heavy workloads, at the cost of compaction complexity that
+isn't justified for an embedded engine.
+
+### No-steal WAL with buffered write groups
+
+Modified pages stay in memory until commit, then go to the WAL with a
+single fsync. Checkpoints later copy them into the data file. This makes
+abort trivial: nothing on disk needs undoing. Explicit transactions and
+statement-level savepoints come almost for free. The cost is that a
+transaction's dirty pages must fit in memory, and every commit still pays
+one full fsync (see [performance.md](performance.md)).
+
+### Correctness before concurrency
+
+Writers are serialized by one mutex, and a transaction is database-wide.
+MVCC is the obvious next step for reader isolation, and there is an
+experimental implementation. It will only graduate with integration and
+crash-recovery tests behind it.
 
 ## Challenges & Lessons Learned
 
-### The "Internal Node Splitting" Hurdle
-One of the biggest challenges was implementing the B-Tree split logic. Leaf node splitting was straightforward, but propagating splits up the tree (internal node splitting) introduced complex edge cases with locking and parent pointers. We initially launched with a simplified implementation that limited tree height, which we are now actively addressing.
+### B-tree splits and underflow
 
-### Persistent Memory (PMEM)
-Integrating PMEM support was tricky. We had to bypass the page cache entirely for PMEM-backed regions to avoid double caching, while still maintaining transactional consistency. This required a hybrid storage adapter that treats PMEM as byte-addressable storage rather than block storage.
+Leaf splits were straightforward. Propagating splits and underflow through
+internal nodes, while keeping parent pointers durable, took several rounds.
+Early versions mutated cached pages directly, and those changes were lost on
+eviction. Every page mutation now goes through `Pager::write_page`, and a
+proptest exercises random insert/delete sequences.
+
+### ROLLBACK that only released locks
+
+For several releases `ROLLBACK` released locks without undoing the earlier
+statements in the transaction, because each statement was its own WAL group.
+The fix buffers a whole transaction in one group and logs it only at commit.
+It also exposed leaked table locks and in-memory schema drift after failed
+statements.
+
+### Docs that ran ahead of the code
+
+Older docs described experimental modules as integrated and quoted speedups
+that were never measured. The rule now: a feature is documented as working
+only when it is on the active path with tests, and a performance claim needs
+a checked-in benchmark.
 
 ## Future Directions
-We are currently working on:
-- **Distributed Consensus**: Adding Raft support for high availability.
-- **WASM User-Defined Functions**: Allowing users to write safe, high-performance custom logic.
-- **Cloud-Native Storage**: Improving our S3/Object Store backend for serverless deployments.
+
+See [ROADMAP.md](../ROADMAP.md): a real SQL parser, secondary indexes,
+JOIN / GROUP BY, a configurable durability level and group commit, durable
+CDC, and an approximate vector index.

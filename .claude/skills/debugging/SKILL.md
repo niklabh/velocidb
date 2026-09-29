@@ -27,7 +27,7 @@ in the module under suspicion.
 ## Inspecting files
 
 ```bash
-ls -la mydb.db mydb.db-wal     # WAL should be 0 bytes after clean commits
+ls -la mydb.db mydb.db-wal     # WAL: 0 bytes after a clean close; up to ~4 MiB while open
 xxd -l 64 mydb.db              # page 0; schema starts at offset 4096 (page 1)
 xxd -s 4096 -l 128 mydb.db     # schema page: [chunk_len: u32][chunk...]
 ```
@@ -46,7 +46,7 @@ Formats are documented in the storage-format skill.
 | Data missing after reopen | schema not re-saved after a root change — check `needs_schema_save` / root diffing in `Database::execute` |
 | Wrong rows only on large tables (≥1024) | rayon parallel path diverged from the sequential path in `src/executor.rs` — the two branches must be behaviorally identical |
 | Vector query returns row in wrong order | distance convention violated (lower = more similar for ALL metrics, incl. dot which is negated) or the top-k path in `vector::knn` |
-| WAL grows / never truncates | commit path didn't reach `wal.truncate()` — data-file fsync failed midway? |
+| WAL grows past ~4 MiB / never truncates | checkpoint failing (look for the `checkpoint failed` tracing warning) — data-file write or fsync error? |
 
 ## Bisecting a layer
 

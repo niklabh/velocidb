@@ -349,11 +349,15 @@ mod tests {
     #[test]
     fn test_parse_vector_constructor() {
         assert_eq!(
-            parse_vector_constructor("vector32('[1, 2]')").unwrap().unwrap(),
+            parse_vector_constructor("vector32('[1, 2]')")
+                .unwrap()
+                .unwrap(),
             vec![1.0, 2.0]
         );
         assert_eq!(
-            parse_vector_constructor("VECTOR('[0.5]')").unwrap().unwrap(),
+            parse_vector_constructor("VECTOR('[0.5]')")
+                .unwrap()
+                .unwrap(),
             vec![0.5]
         );
         assert_eq!(
@@ -399,10 +403,7 @@ mod tests {
             .map(|i| {
                 (
                     i,
-                    Row::new(vec![
-                        Value::Integer(i),
-                        Value::Vector(vec![i as f32, 0.0]),
-                    ]),
+                    Row::new(vec![Value::Integer(i), Value::Vector(vec![i as f32, 0.0])]),
                 )
             })
             .collect();
@@ -410,6 +411,6 @@ mod tests {
         let result = knn(rows, 1, &[3.0, 0.0], DistanceMetric::Euclidean, 3);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].1, 3); // exact match first
-        assert!(result[0].0 < result[1].0 || result[0].0 == result[1].0);
+        assert!(result[0].0 <= result[1].0);
     }
 }

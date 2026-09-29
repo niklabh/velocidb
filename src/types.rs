@@ -3,8 +3,8 @@
 //! Includes [`Value`] (SQL data), [`Row`], [`Column`], [`QueryResult`], and
 //! the [`VelociError`] enum for structured error handling.
 
-use std::fmt;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
 
 pub type PageId = u64;
@@ -16,43 +16,43 @@ pub enum VelociError {
     /// IO error occurred.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    
+
     /// Custom IO error message.
     #[error("IO error: {0}")]
     IoError(String),
-    
+
     /// Database file corruption detected.
     #[error("Database corruption: {0}")]
     Corruption(String),
-    
+
     /// Database is busy (locked).
     #[error("Database is busy")]
     Busy,
-    
+
     /// Item not found (table, row, etc.).
     #[error("Not found: {0}")]
     NotFound(String),
-    
+
     /// Constraint violation (e.g., unique key).
     #[error("Constraint violation: {0}")]
     ConstraintViolation(String),
-    
+
     /// SQL parsing error.
     #[error("Parse error: {0}")]
     ParseError(String),
-    
+
     /// Transaction error.
     #[error("Transaction error: {0}")]
     TransactionError(String),
-    
+
     /// Type mismatch during value conversion.
     #[error("Type mismatch: expected {expected}, got {actual}")]
     TypeMismatch { expected: String, actual: String },
-    
+
     /// Storage engine error.
     #[error("Storage error: {0}")]
     StorageError(String),
-    
+
     /// Feature not implemented.
     #[error("Not implemented: {0}")]
     NotImplemented(String),
@@ -119,7 +119,7 @@ impl Value {
             }),
         }
     }
-    
+
     /// Converts the value to a vector of f32 if possible.
     pub fn as_vector(&self) -> Result<&[f32]> {
         match self {
@@ -135,9 +135,9 @@ impl Value {
     pub fn size_bytes(&self) -> usize {
         match self {
             Value::Null => 1,
-            Value::Integer(_) => 9, // 1 byte type + 8 bytes data
-            Value::Float(_) => 9,   // 1 byte type + 8 bytes data
-            Value::Real(_) => 9,    // 1 byte type + 8 bytes data
+            Value::Integer(_) => 9,            // 1 byte type + 8 bytes data
+            Value::Float(_) => 9,              // 1 byte type + 8 bytes data
+            Value::Real(_) => 9,               // 1 byte type + 8 bytes data
             Value::Text(s) => 1 + 4 + s.len(), // 1 byte type + 4 bytes length + data
             Value::Blob(b) => 1 + 4 + b.len(), // 1 byte type + 4 bytes length + data
             Value::Vector(v) => 1 + 4 + v.len() * 4, // 1 byte type + 4 bytes dim + f32 data
@@ -185,6 +185,7 @@ impl DataType {
     ///
     /// Vector columns use the Turso/libSQL syntax `F32_BLOB(n)` or the alias
     /// `VECTOR(n)` where `n` is the dimension.
+    #[allow(clippy::should_implement_trait)] // infallible: unknown type names default to TEXT
     pub fn from_str(s: &str) -> Self {
         let upper = s.trim().to_uppercase();
 
@@ -264,4 +265,3 @@ impl QueryResult {
         }
     }
 }
-

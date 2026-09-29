@@ -14,17 +14,18 @@ items land; update README Limitations and CHANGELOG in the same change.
 
 Ship before expanding the SQL surface or advertising full ACID.
 
-- [ ] **Real multi-statement `ROLLBACK`** — fold an explicit `BEGIN`…`COMMIT`
+- [x] **Real multi-statement `ROLLBACK`** — fold an explicit `BEGIN`…`COMMIT`
       into a single WAL group (or track undo) so `ROLLBACK` undoes storage
       mutations, not only locks
-- [ ] **Enforce `UNIQUE`** on non-primary-key columns (INSERT / UPDATE); add
+- [x] **Enforce `UNIQUE`** on non-primary-key columns (INSERT / UPDATE); add
       regression tests; keep `.schema` / README in sync
-- [ ] **CI on every PR** — `cargo test --all-targets`, `cargo clippy` on the
+- [x] **CI on every PR** — `cargo test --all-targets`, `cargo clippy` on the
       active path (docs workflow alone is not enough)
-- [ ] **Docs / API honesty** — align older docs
-      (`docs/architecture.md`, `docs/performance.md`, `docs/implementation.md`)
+- [x] **Docs / API honesty** — align older docs
+      (`docs/architecture.md`, `docs/performance.md`, `docs/implementation.md`
+      → `docs/experimental.md`)
       with README; stop implying experimental modules are integrated
-- [ ] **Stop crate-root re-exports of experimental types** (or gate them
+- [x] **Stop crate-root re-exports of experimental types** (or gate them
       behind an `experimental` feature) so the public API matches the engine
 
 ---
@@ -42,6 +43,16 @@ Unblock almost every later SQL and concurrency feature.
 - [ ] **Parser fuzzing** (and/or property tests) for statement splitting and
       value parsing
 - [ ] **Concurrent-writer / deadlock stress tests** beyond the 30s lock timeout
+- [x] **Primary-key point lookups** — use `BTree::search` for `WHERE pk = …`
+      instead of a full scan
+- [x] **Fewer fsyncs per commit** — one fsync per commit; the WAL is
+      checkpointed at 4 MiB and on close (auto-commit INSERT ~74 → ~245 rows/s
+      on macOS, see `docs/performance.md`)
+- [ ] **Durability level option** — e.g. a `synchronous = NORMAL`-style mode
+      (plain `fsync` instead of `F_FULLFSYNC` on macOS, or fsync only at
+      checkpoint) for callers that accept losing the last commits on power loss
+- [ ] **Group commit** — let concurrent auto-commit writers share one WAL
+      fsync
 
 ---
 
@@ -120,7 +131,7 @@ CHANGELOG.
 - [x] WAL with CRC32, group commit, torn-tail-tolerant recovery
 - [x] B-tree primary index (leaf + internal split / merge / redistribute)
 - [x] Core SQL: CREATE / DROP / ALTER TABLE, INSERT / SELECT / UPDATE / DELETE
-- [x] `BEGIN` / `COMMIT` (locks); `ROLLBACK` locks only — see P0
+- [x] `BEGIN` / `COMMIT` / `ROLLBACK` as one WAL group; statement savepoints
 - [x] Parallel WHERE / ORDER BY / vector distance (rayon, ≥ 1024 rows)
 - [x] Vector columns + exact KNN
 - [x] In-memory CDC + REPL `.cdc` / `.changes`
@@ -132,10 +143,11 @@ CHANGELOG.
 
 ## Suggested sequence
 
-1. CI + enforce `UNIQUE`
-2. Multi-statement WAL groups + real `ROLLBACK`
-3. Lexer / parser + golden tests
-4. Secondary indexes + equality probe
-5. `OR` → `INNER JOIN` → `GROUP BY` aggregates
-6. Durable CDC + approximate vector index
-7. Graduate or archive experimental modules
+1. ~~CI + enforce `UNIQUE`~~ (done)
+2. ~~Multi-statement WAL groups + real `ROLLBACK`~~ (done)
+3. ~~Primary-key point lookups + fewer fsyncs per commit~~ (done)
+4. Lexer / parser + golden tests
+5. Secondary indexes + equality probe
+6. `OR` → `INNER JOIN` → `GROUP BY` aggregates
+7. Durable CDC + approximate vector index
+8. Graduate or archive experimental modules

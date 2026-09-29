@@ -1,488 +1,188 @@
 # VelociDB Architecture
 
-## Overview
+This document describes the engine as it exists in the source tree today —
+the **active SQL path**. Research modules that are not wired into the engine
+(MVCC, SIMD kernels, lock-free cache, io_uring, CRDT, cloud VFS, PMEM, hybrid
+storage) are covered separately in [experimental.md](experimental.md); nothing
+below depends on them.
 
-VelociDB is a modern embedded database built from the ground up for high-performance, multi-core systems. This document describes the key architectural components and design decisions that enable exceptional performance on contemporary hardware.
+## Layers
 
-## Core Principles
-
-1. **Memory Safety**: Rust's ownership system eliminates entire classes of bugs
-2. **Concurrency**: MVCC enables non-blocking reads and concurrent writes
-3. **Async I/O**: Native asynchronous operations maximize CPU utilization
-4. **Vectorization**: SIMD instructions for data-parallel operations
-5. **Cache-Consciousness**: Optimized data layouts for modern CPU cache hierarchies
-
----
-
-## Architecture Layers
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Application Layer                       │
-│              (SQL queries via Database API)                 │
-└─────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────┐
-│                    Query Execution Layer                    │
-│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────┐    │
-│  │   Parser     │→ │   Executor   │→ │ SIMD Vectorized │    │
-│  │              │  │              │  │   Execution     │    │
-│  └──────────────┘  └──────────────┘  └─────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────┐
-│              Transaction & Concurrency Layer                │
-│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────┐    │
-│  │ MVCC Manager │  │ Lock-Free    │  │  Snapshot       │    │
-│  │              │  │ Structures   │  │  Isolation      │    │
-│  └──────────────┘  └──────────────┘  └─────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────┐
-│                    Storage Engine Layer                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────┐    │
-│  │ Cache-Opt    │  │ Lock-Free    │  │  Async Pager    │    │
-│  │ B-Tree       │  │ Page Cache   │  │                 │    │
-│  └──────────────┘  └──────────────┘  └─────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────┐
-│                      I/O Subsystem                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────┐    │
-│  │  Async VFS   │  │  io_uring    │  │   Cloud VFS     │    │
-│  │  (Tokio)     │  │  (Linux)     │  │   (S3/Azure)    │    │
-│  └──────────────┘  └──────────────┘  └─────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────┐
-│                    Storage Hardware                         │
-│       NVMe SSD    │    PMEM/Optane    │    Cloud Object     │
-└─────────────────────────────────────────────────────────────┘
+```text
+            REPL (src/main.rs)        Library users
+                    │                   │        │
+                    ▼                   ▼        ▼
+            ┌──────────────────────────────┐  ┌───────────────────────────┐
+            │ Database  (src/storage.rs)   │◄─┤ AsyncConnection           │
+            │  execute / query / begin /   │  │ (src/async_api.rs, tokio  │
+            │  commit / rollback, writer   │  │  spawn_blocking)          │
+            │  mutex, schema, CDC          │  └───────────────────────────┘
+            └──────────────┬───────────────┘
+                           │  Statement (AST)
+     Parser (src/parser.rs)│
+                           ▼
+            ┌──────────────────────────────┐   ┌──────────────────────────┐
+            │ Executor (src/executor.rs)   │──►│ LockManager /            │
+            │  DML, DDL, SELECT, UNIQUE,   │   │ TransactionManager       │
+            │  rayon filter/sort, KNN      │   │ (src/transaction.rs)     │
+            └──────────────┬───────────────┘   └──────────────────────────┘
+                           │ rows by primary key
+                           ▼
+            ┌──────────────────────────────┐
+            │ BTree  (src/btree.rs)        │  one per table
+            └──────────────┬───────────────┘
+                           │ pages
+                           ▼
+            ┌──────────────────────────────┐   ┌──────────────────────────┐
+            │ Pager  (src/storage.rs)      │──►│ WalManager (src/wal.rs)  │
+            │  pending buffer, savepoints, │   │  <db>-wal, CRC32 records │
+            │  DashMap read cache          │   └──────────────────────────┘
+            └──────────────┬───────────────┘
+                           ▼
+                     <db> data file (4 KB pages)
 ```
 
----
-
-## 1. Multi-Version Concurrency Control (MVCC)
-
-### Overview
-MVCC is the cornerstone of modern concurrency, replacing the pessimistic file-level locking of traditional SQLite.
-
-### Key Features
-
-**Snapshot Isolation**
-- Each transaction gets a consistent snapshot of the database
-- Readers never block writers
-- Writers never block readers
-- True multi-core scalability
-
-**Version Chains**
-```rust
-pub struct VersionedRecord {
-    key: i64,
-    versions: Vec<RecordVersion>, // Ordered by timestamp
-}
-
-pub struct RecordVersion {
-    version_info: VersionInfo,  // xmin, xmax, timestamps
-    data: Vec<Value>,           // Actual data
-}
-```
-
-**Visibility Rules**
-- A version is visible if:
-  1. Created before the snapshot timestamp
-  2. Not deleted before the snapshot timestamp
-  3. Created by a committed transaction
-
-### Performance Benefits
-- **Concurrent Reads**: Unlimited reader scalability
-- **Concurrent Writes**: Multiple transactions can modify different rows simultaneously
-- **No Read Locks**: Zero contention on read-heavy workloads
-
-### Garbage Collection
-Background vacuum process removes old versions:
-```rust
-mvcc.vacuum(); // Reclaims space from dead versions
-```
-
----
-
-## 2. Asynchronous I/O Architecture
-
-### Design Philosophy
-Traditional blocking I/O underutilizes modern multi-core CPUs. Async I/O allows threads to process other work while waiting for storage.
-
-### Implementation
-
-**Async VFS Trait**
-```rust
-#[async_trait]
-pub trait AsyncVfs: Send + Sync {
-    async fn read_page(&self, page_id: PageId) -> Result<Page>;
-    async fn write_page(&self, page_id: PageId, page: &Page) -> Result<()>;
-    async fn allocate_page(&self) -> Result<PageId>;
-    async fn flush(&self) -> Result<()>;
-}
-```
-
-**Tokio Runtime**
-- Multi-threaded work-stealing scheduler
-- Efficient task switching without kernel overhead
-- Native support for `async/await`
-
-**io_uring Support** (Linux)
-- Kernel bypass for minimal latency
-- Batch I/O submissions
-- Zero-copy operations
-
-### Batch I/O
-Process multiple I/O requests in parallel:
-```rust
-let executor = BatchIoExecutor::new(pager);
-let results = executor.read_batch(page_ids).await?;
-```
-
-### Performance Impact
-- **Throughput**: 10-50x improvement on high-IOPS storage
-- **Latency**: Microsecond-level response times on NVMe
-- **CPU Utilization**: Near 100% on multi-core systems
-
----
-
-## 3. Lock-Free Data Structures
-
-### Motivation
-Traditional locks cause:
-- Context switches (10,000+ CPU cycles)
-- Kernel system calls
-- Thread contention and serialization
-
-### Lock-Free Cache
-```rust
-pub struct LockFreePageCache {
-    entries: Arc<RwLock<HashMap<PageId, Arc<CachedPage>>>>,
-    lru_queue: Arc<SegQueue<PageId>>, // Lock-free queue
-    size: AtomicUsize,                // Atomic counter
-}
-```
-
-**Benefits**:
-- No kernel involvement for cache operations
-- Wait-free reads (no blocking)
-- Minimal CAS operations for writes
-
-### Lock-Free Queues
-```rust
-pub struct LockFreeIoQueue<T> {
-    queue: Arc<SegQueue<T>>,  // Crossbeam lock-free queue
-    size: Arc<AtomicUsize>,
-}
-```
-
-**Use Cases**:
-- I/O request queues
-- Transaction commit logs
-- Background task scheduling
-
-### Atomic Counters
-```rust
-pub struct LockFreeCounter {
-    value: AtomicU64,  // Compare-and-swap operations
-}
-```
-
-### Performance Characteristics
-- **Latency**: Sub-microsecond operations
-- **Throughput**: Scales linearly with CPU cores
-- **Overhead**: Zero kernel involvement
-
----
-
-## 4. Vectorized Execution (SIMD)
-
-### Concept
-Process multiple data elements in a single CPU instruction using vector registers (AVX2, AVX-512).
-
-### Implementation
-
-**Vectorized Filtering**
-```rust
-// Filter 256 integers in parallel
-let values = vec![...]; // 1000 integers
-let mask = VectorizedFilter::filter_integers_greater_than(&values, 100);
-```
-
-**Hardware Utilization**:
-- AVX2: Process 4 × i64 per instruction
-- AVX-512: Process 8 × i64 per instruction
-
-**Vectorized Aggregation**
-```rust
-let sum = VectorizedAggregation::sum_integers(&values);    // SIMD sum
-let avg = VectorizedAggregation::average_integers(&values); // SIMD average
-let min = VectorizedAggregation::min_integers(&values);     // SIMD min
-```
-
-### Vector Batches
-Columnar data layout for efficient SIMD processing:
-```rust
-pub struct VectorBatch {
-    columns: Vec<VectorColumn>,
-    row_count: usize,
-}
-
-pub enum VectorColumn {
-    Integer(Vec<i64>),  // Contiguous for SIMD
-    Real(Vec<f64>),
-    Text(Vec<String>),
-}
-```
-
-### Performance Gains
-- **WHERE Clause**: 4-8x faster filtering
-- **Aggregations**: 10-20x faster SUM/AVG/MIN/MAX
-- **Scans**: 5-10x faster full table scans
-
----
-
-## 5. Cache-Conscious B-Tree
-
-### CPU Cache Hierarchy
-```
-L1 Cache:  32 KB,  ~4 cycles
-L2 Cache: 256 KB, ~12 cycles
-L3 Cache:   8 MB, ~40 cycles
-RAM:      64 GB+, ~200 cycles
-```
-
-### Optimizations
-
-**Cache-Line Alignment**
-```rust
-#[repr(C, align(64))]  // 64-byte cache line
-pub struct CacheAlignedNodeHeader {
-    node_type: u8,
-    num_keys: u16,
-    parent: u32,
-    level: u8,
-    flags: u16,
-    _padding: [u8; 52],  // Fill entire cache line
-}
-```
-
-**Contiguous Key Storage**
-```rust
-pub struct CacheOptimizedNode {
-    header: CacheAlignedNodeHeader,     // 64 bytes
-    keys: [i64; 32],                    // Contiguous array
-    children: [u32; 33],                // Contiguous pointers
-    data_area: [u8; ...],               // Data follows
-}
-```
-
-**SIMD Key Search**
-```rust
-#[target_feature(enable = "avx2")]
-unsafe fn search_key_simd(&self, key: i64) -> Result<usize, usize> {
-    let key_vec = _mm256_set1_epi64x(key);
-    // Compare 4 keys simultaneously
-    let cmp_result = _mm256_cmpeq_epi64(keys_vec, key_vec);
-    // ...
-}
-```
-
-**Cache Prefetching**
-```rust
-pub fn prefetch_page(page: &Page) {
-    for i in (0..PAGE_SIZE).step_by(64) {
-        _mm_prefetch::<_MM_HINT_T0>(ptr.add(i));
-    }
-}
-```
-
-### Impact
-- **Search**: 2-3x faster key lookups
-- **Scan**: 4-6x faster sequential scans
-- **Cache Misses**: 50-70% reduction
-
----
-
-## 6. PMEM/DAX Support (Coming Soon)
-
-### Persistent Memory
-Intel Optane DC: byte-addressable, non-volatile, DRAM-like latency
-
-**DAX Mode**
-```rust
-pub struct PmemVfs {
-    mmap: MmapMut,  // Direct memory mapping
-    base_addr: usize,
-}
-```
-
-**Benefits**:
-- Bypass kernel page cache
-- Direct load/store operations
-- No serialization overhead
-- Microsecond persistence
-
----
-
-## 7. Hybrid Storage Layout (Coming Soon)
-
-### Row Storage (OLTP)
-```
-| ID | Name    | Age | Email          |
-|----|---------|-----|----------------|
-| 1  | Alice   | 30  | alice@...      |
-| 2  | Bob     | 25  | bob@...        |
-```
-
-### Column Storage (OLAP)
-```
-ID:    [1, 2, 3, 4, ...]
-Name:  [Alice, Bob, Charlie, ...]
-Age:   [30, 25, 35, ...]
-Email: [alice@..., bob@..., ...]
-```
-
-**Adaptive Strategy**:
-- Row-major for transactional writes
-- Columnar projections for analytical queries
-- Automatic materialization during scans
-
----
-
-## 8. CRDT Synchronization (Coming Soon)
-
-### Problem
-Traditional sync requires conflict resolution and complex merge logic.
-
-### Solution: CRDTs
-Conflict-Free Replicated Data Types guarantee eventual consistency without coordination.
-
-**Operation-Based Sync**
-```rust
-pub enum CrdtOperation {
-    Insert { key: i64, value: Value, timestamp: u64 },
-    Update { key: i64, value: Value, timestamp: u64 },
-    Delete { key: i64, timestamp: u64 },
-}
-```
-
-**Merge Rules**:
-- Last-write-wins with Lamport timestamps
-- Commutative operations (order-independent)
-- Deterministic convergence
-
----
-
-## 9. Cloud VFS (Coming Soon)
-
-### Remote Storage Abstraction
-```rust
-pub struct CloudVfs {
-    client: ObjectStoreClient,
-    cache: Arc<AsyncPageCache>,
-}
-
-impl AsyncVfs for CloudVfs {
-    async fn read_page(&self, page_id: PageId) -> Result<Page> {
-        // Range read from S3/Azure Blob
-        self.client.get_range(offset, PAGE_SIZE).await
-    }
-}
-```
-
-**Features**:
-- Lazy loading (fetch pages on demand)
-- Aggressive caching
-- Batch prefetching
-- Cost-optimized I/O
-
----
-
-## Performance Comparison
-
-### Throughput (ops/sec)
-
-| Operation      | SQLite (Classic) | VelociDB v0.1 | VelociDB (target) |
-|----------------|------------------|---------------|-------------------|
-| Insert         | 5,000            | 10,000        | **50,000**        |
-| Select (cache) | 20,000           | 50,000        | **200,000**       |
-| Select (scan)  | 1,000            | 2,000         | **15,000**        |
-| Update         | 4,000            | 8,000         | **30,000**        |
-| Aggregate      | 500              | 1,000         | **10,000**        |
-
-### Latency (microseconds)
-
-| Operation      | SQLite | VelociDB v0.1 | VelociDB (target) |
-|----------------|--------|---------------|-------------------|
-| Single Read    | 200    | 100           | **20**            |
-| Single Write   | 500    | 250           | **50**            |
-| Transaction    | 1000   | 500           | **100**           |
-
----
-
-## Design Tradeoffs
-
-### MVCC
-- **Pro**: Non-blocking reads, high concurrency
-- **Con**: Version bloat requires garbage collection
-
-### Async I/O
-- **Pro**: Maximum CPU utilization, low latency
-- **Con**: More complex programming model
-
-### SIMD
-- **Pro**: Massive throughput improvements
-- **Con**: Architecture-specific code, fallback required
-
-### Lock-Free Structures
-- **Pro**: Zero kernel overhead, scalable
-- **Con**: Complex correctness reasoning
-
----
-
-## Future Roadmap
-
-### Phase 1 (Completed)
-- ✅ MVCC implementation
-- ✅ Async I/O layer
-- ✅ Lock-free cache
-- ✅ SIMD vectorization
-- ✅ Cache-conscious B-tree
-
-### Phase 2 (In Progress)
-- 🚧 PMEM/DAX support
-- 🚧 Hybrid storage layout
-- 🚧 CRDT synchronization
-- 🚧 Cloud VFS
-
-### Phase 3 (Planned)
-- Query optimizer with cost model
-- Parallel query execution
-- Replication protocol
-- Distributed transactions
-
----
-
-## References
-
-1. **MVCC**: PostgreSQL Architecture Documentation
-2. **io_uring**: "Efficient IO with io_uring" (Jens Axboe)
-3. **Lock-Free**: "The Art of Multiprocessor Programming" (Herlihy & Shavit)
-4. **SIMD**: "Data-Parallel Primitives for Database Systems" (MonetDB)
-5. **Cache-Consciousness**: "Cache-Oblivious B-Trees" (Bender et al.)
-6. **CRDTs**: "Conflict-Free Replicated Data Types" (Shapiro et al.)
-
----
-
-## Contributing
-
-See [Contributing Guide](contributing.md) for guidelines on contributing to VelociDB.
-
-## License
-
-MIT License - See [LICENSE](../LICENSE) file for details.
+## Storage: pages and the pager
+
+- The data file is an array of 4 KB pages (`PAGE_SIZE`). Page 0 is reserved,
+  pages 1..N hold the schema (a chained byte stream), and every other page is
+  one B-tree node. Exact byte layouts are in
+  [`.claude/skills/storage-format`](../.claude/skills/storage-format/SKILL.md).
+- `Pager::read_page` looks in the active write group's `pending` buffer
+  first, then the read cache (a bounded `DashMap`, evicting an arbitrary
+  entry when full), then `committed` (pages committed to the WAL but not yet
+  checkpointed), then the file. A cached page always equals its newest
+  version, because aborts and savepoint rollbacks evict what they discard.
+- `Pager::write_page` never touches the file: it buffers the page in
+  `pending` and refreshes the cache.
+
+## Durability: write groups and the WAL
+
+Every change is part of a **write group**:
+
+| Caller | Group spans |
+|--------|-------------|
+| Auto-commit statement (`db.execute(...)` outside a transaction) | that one statement |
+| Explicit transaction (`BEGIN` … `COMMIT`) | every statement until COMMIT / ROLLBACK |
+
+Commit (`Pager::commit_group`) is the only place the WAL is written:
+
+1. Append one PAGE_WRITE record per pending page plus a COMMIT record, in a
+   single write at the end of the last committed group.
+2. **fsync the WAL** — the durability point, and the only fsync on the
+   commit path. If the write or fsync fails, the WAL is cut back to its
+   previous length and the group is aborted.
+3. Move the pages from `pending` to `committed`. Reads are served from there
+   (and the cache) until a checkpoint.
+
+A **checkpoint** (`Pager::checkpoint`) writes every committed page into the
+data file, fsyncs it, and truncates the WAL (also fsynced). It runs when the
+WAL reaches `CHECKPOINT_WAL_BYTES` (4 MiB) and when the database is closed.
+A failed checkpoint keeps the pages in `committed` and retries later; the
+commit itself already succeeded.
+
+On open, `Pager::recover` replays every group in the WAL that has a COMMIT
+record, discards a torn tail or uncommitted records, and always resets the
+WAL, so leftover garbage can never sit in front of later commits. The data
+file is only written from pages already durable in the WAL, so a crash at
+any point leaves either the old state or a replayable committed group.
+
+**Abort** (`abort_group`) drops `pending`, evicts those pages from the cache,
+and restores the page count. Since nothing was logged, there is nothing to
+undo on disk.
+
+### Savepoints and statement atomicity
+
+Inside an explicit transaction each statement runs under a pager savepoint
+that records the prior `pending` image of every page the statement touches.
+If the statement fails, `rollback_to_savepoint` restores those images: the
+statement is undone and the transaction continues.
+
+After any rollback `Database::reload_schema` rebuilds the in-memory schema
+and B-tree root handles from the pager, since a failed statement may have
+split a root or altered columns before erroring.
+
+The schema is re-saved **inside the statement's group** whenever the
+statement is DDL or changes a B-tree root, so table definitions and data
+always commit together.
+
+## Concurrency
+
+- **One writer at a time.** `Database::execute`, `begin`, `commit` and
+  `rollback` take a database-wide `writer` mutex.
+- **Readers** (`Database::query`) do not take the writer mutex and can run
+  concurrently with each other.
+- **Table locks.** `Executor::with_table_lock` takes a shared (SELECT) or
+  exclusive (INSERT/UPDATE/DELETE) lock per table. Auto-commit statements
+  release it on every path; explicit transactions hold it until COMMIT /
+  ROLLBACK. Acquisition times out after 30 s as crude deadlock protection.
+- **One transaction per `Database`.** An explicit transaction is database-wide:
+  statements from other threads join it, and readers see its uncommitted
+  pages. There is no snapshot isolation yet — MVCC is a candidate
+  (see [ROADMAP.md](../ROADMAP.md), P4).
+
+Lock ordering and the full commit protocol are documented in
+[`.claude/skills/transaction-correctness`](../.claude/skills/transaction-correctness/SKILL.md).
+
+## B-tree
+
+Each table is a B-tree keyed by its single `INTEGER PRIMARY KEY`
+(`BTREE_ORDER = 64` keys per node). Leaves hold serialized rows; internal
+nodes hold separator keys and child page ids. Inserts split leaves and
+internal nodes; deletes merge or redistribute on underflow and collapse the
+root when it empties. A proptest checks the invariants over random
+insert/delete sequences.
+
+A `WHERE` containing `<pk> = <integer>` is answered by `BTree::search`
+(`candidate_rows` in `src/executor.rs`) for SELECT, UPDATE and DELETE; the
+full clause is still evaluated on the result. There are no secondary
+indexes: any other `WHERE` scans the table, and `UNIQUE` on a non-key column
+is checked by a scan.
+
+## SQL
+
+`src/parser.rs` is a regex- and string-splitting parser (a real lexer/parser
+is roadmap item P1). It produces a `Statement` enum:
 
+- DDL: `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE` (rename table, rename /
+  add / drop column)
+- DML: `INSERT` (optional column list), `UPDATE`, `DELETE`
+- `SELECT` with `*`, columns, `COUNT(*)`, or `vector_distance_*` projections;
+  `WHERE` with comparison operators and `LIKE` joined by `AND`;
+  `ORDER BY` a column or distance expression; `LIMIT`
+- `BEGIN` / `COMMIT` / `ROLLBACK`
+
+Constraints: `PRIMARY KEY` (required, single integer column), `NOT NULL`,
+`UNIQUE` (NULLs never conflict), and vector dimension checks.
+
+## Parallel execution
+
+Once a query touches at least 1024 rows (`PARALLEL_THRESHOLD`), WHERE
+filtering, ORDER BY sorting, and vector distance computation use rayon.
+Smaller inputs run sequentially to avoid thread-pool overhead.
+
+## Vector search
+
+`F32_BLOB(n)` / `VECTOR(n)` columns store `f32` vectors with a fixed dimension.
+`vector_distance_cos`, `_l2` and `_dot` work in projections and in
+`ORDER BY … LIMIT k`, which uses top-k selection. `Database::vector_search`
+exposes the same exact KNN. There is no approximate index yet.
+
+## Change Data Capture
+
+`src/cdc.rs` keeps a bounded in-memory log (default 65,536 events). The
+executor *stages* events; `Database` publishes them, assigning sequence
+numbers, only after the write group commits. Rolled-back statements and
+transactions publish nothing. The log is not persisted across restarts.
+
+## Async API
+
+`Builder` → `AsyncDatabase` → `AsyncConnection` (feature `async-io`, on by
+default) wraps the synchronous `Database`. Each call runs on tokio's blocking
+pool via `spawn_blocking`, so the reactor never blocks on disk I/O.
+
+## Known limitations
+
+See the README's *Limitations* section and [ROADMAP.md](../ROADMAP.md) for
+the prioritized list (single writer, no JOIN / GROUP BY / secondary indexes,
+exact-only vector search, in-memory CDC).

@@ -32,7 +32,8 @@ fn test_data_survives_clean_reopen() {
 
     {
         let db = open_db(&path);
-        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO u VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO u VALUES (2, 'Bob')").unwrap();
         db.execute("INSERT INTO u VALUES (3, 'Charlie')").unwrap();
@@ -58,9 +59,11 @@ fn test_wal_is_truncated_after_clean_commits() {
 
     {
         let db = open_db(&path);
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         for i in 0..50 {
-            db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap();
+            db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+                .unwrap();
         }
         db.close().unwrap();
     }
@@ -81,9 +84,11 @@ fn test_torn_wal_tail_is_discarded() {
     // contains the schema.
     {
         let db = open_db(&path);
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         for i in 0..3 {
-            db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10)).unwrap();
+            db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10))
+                .unwrap();
         }
         db.close().unwrap(); // truncates WAL after each commit
     }
@@ -142,7 +147,8 @@ fn test_uncommitted_group_in_wal_is_skipped() {
     // Phase A: clean DB with some data.
     {
         let db = open_db(&path);
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
         db.close().unwrap();
     }
@@ -218,9 +224,11 @@ fn test_persistence_strong_assertions() {
 
     {
         let db = open_db(&path);
-        db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         for i in 0..500 {
-            db.execute(&format!("INSERT INTO big VALUES ({}, {})", i, i * 7)).unwrap();
+            db.execute(&format!("INSERT INTO big VALUES ({}, {})", i, i * 7))
+                .unwrap();
         }
         db.close().unwrap();
     }
@@ -237,4 +245,170 @@ fn test_persistence_strong_assertions() {
         let count = db.query("SELECT COUNT(*) FROM big").unwrap();
         assert_eq!(count.rows[0].values[0], Value::Integer(500));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Checkpointing: commits are durable in the WAL before they reach the data
+// file. `std::mem::forget` simulates a crash — the database is never flushed
+// or checkpointed, exactly as if the process died after its last commit.
+// ---------------------------------------------------------------------------
+
+fn crash(db: std::sync::Arc<Database>) {
+    std::mem::forget(db);
+}
+
+fn wal_len(path: &std::path::Path) -> u64 {
+    std::fs::metadata(wal_path_for(path))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+fn ids(db: &Database) -> Vec<i64> {
+    db.query("SELECT id FROM u ORDER BY id")
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match r.values[0] {
+            Value::Integer(i) => i,
+            ref v => panic!("unexpected {:?}", v),
+        })
+        .collect()
+}
+
+#[test]
+fn test_committed_but_not_checkpointed_survives_crash() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ckpt_crash.db");
+    let data_len_before;
+    {
+        let db = open_db(&path);
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        for i in 0..50 {
+            db.execute(&format!("INSERT INTO u VALUES ({}, 'n{}')", i, i))
+                .unwrap();
+        }
+        db.execute("DELETE FROM u WHERE id = 7").unwrap();
+        db.execute("UPDATE u SET name = 'x' WHERE id = 8").unwrap();
+        // Everything is in the WAL, nothing has been checkpointed yet.
+        assert!(wal_len(&path) > 0, "commits should be sitting in the WAL");
+        data_len_before = std::fs::metadata(&path).unwrap().len();
+        crash(db);
+    }
+    assert!(wal_len(&path) > 0);
+
+    let db = open_db(&path);
+    let expected: Vec<i64> = (0..50).filter(|i| *i != 7).collect();
+    assert_eq!(ids(&db), expected);
+    let r = db.query("SELECT name FROM u WHERE id = 8").unwrap();
+    assert_eq!(r.rows[0].values[0], Value::Text("x".to_string()));
+    // Recovery applied the WAL to the data file and reset it.
+    assert_eq!(wal_len(&path), 0);
+    assert!(std::fs::metadata(&path).unwrap().len() >= data_len_before);
+}
+
+#[test]
+fn test_uncommitted_transaction_lost_on_crash() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("txn_crash.db");
+    {
+        let db = open_db(&path);
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO u VALUES (1, 'a')").unwrap();
+        db.begin().unwrap();
+        for i in 2..200 {
+            db.execute(&format!("INSERT INTO u VALUES ({}, 'n')", i))
+                .unwrap();
+        }
+        crash(db);
+    }
+    let db = open_db(&path);
+    assert_eq!(ids(&db), vec![1]);
+}
+
+#[test]
+fn test_wal_is_checkpointed_when_large() {
+    // Enough committed page images to cross CHECKPOINT_WAL_BYTES several
+    // times: the WAL must be checkpointed (bounded), and data must be exact.
+    use velocidb::storage::CHECKPOINT_WAL_BYTES;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ckpt_size.db");
+    let db = open_db(&path);
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    let per_commit = (PAGE_SIZE + 64) as u64; // at least one page image each
+    let commits = (3 * CHECKPOINT_WAL_BYTES / per_commit) as i64;
+    let mut max_wal = 0;
+    for i in 0..commits {
+        db.execute(&format!("INSERT INTO u VALUES ({}, 'row{}')", i, i))
+            .unwrap();
+        max_wal = max_wal.max(wal_len(&path));
+    }
+    assert!(
+        max_wal < CHECKPOINT_WAL_BYTES + 64 * PAGE_SIZE as u64,
+        "WAL grew to {} bytes; checkpoint did not run",
+        max_wal
+    );
+    crash(db);
+
+    let db = open_db(&path);
+    assert_eq!(ids(&db), (0..commits).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_commits_after_torn_tail_recovery_survive_next_crash() {
+    // A torn record left in the WAL must not strand later commits behind it:
+    // recovery resets the WAL, so commits made afterwards are recoverable.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("torn_then_commit.db");
+    {
+        let db = open_db(&path);
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO u VALUES (1, 'a')").unwrap();
+        // Clean close: checkpointed, WAL empty.
+    }
+    assert_eq!(wal_len(&path), 0);
+    {
+        // The WAL now holds nothing but a torn record (a crash mid-append).
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(wal_path_for(&path))
+            .unwrap();
+        f.write_all(&[1u8, 99, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff])
+            .unwrap();
+    }
+    {
+        let db = open_db(&path);
+        assert_eq!(ids(&db), vec![1]);
+        db.execute("INSERT INTO u VALUES (2, 'b')").unwrap();
+        db.execute("INSERT INTO u VALUES (3, 'c')").unwrap();
+        crash(db);
+    }
+    let db = open_db(&path);
+    assert_eq!(ids(&db), vec![1, 2, 3]);
+}
+
+#[test]
+fn test_repeated_crashes_between_commits() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("many_crashes.db");
+    {
+        let db = open_db(&path);
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        crash(db);
+    }
+    for round in 0..5i64 {
+        let db = open_db(&path);
+        assert_eq!(ids(&db), (0..round * 20).collect::<Vec<_>>());
+        for i in round * 20..(round + 1) * 20 {
+            db.execute(&format!("INSERT INTO u VALUES ({}, 'r{}')", i, round))
+                .unwrap();
+        }
+        crash(db);
+    }
+    let db = open_db(&path);
+    assert_eq!(ids(&db), (0..100).collect::<Vec<_>>());
 }

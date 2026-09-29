@@ -13,7 +13,10 @@ an interactive REPL.
 
 - **[Quick Start](docs/quickstart.md)**
 - **[Architecture](docs/architecture.md)**
+- **[Performance](docs/performance.md)** — measured baseline and tuning advice
 - **[REPL Usage](docs/repl_usage.md)**
+- **[Experimental modules](docs/experimental.md)**
+- **[Roadmap](ROADMAP.md)** · **[Changelog](CHANGELOG.md)**
 - **[Contributing](docs/contributing.md)**
 
 ## Quick Start
@@ -25,7 +28,7 @@ cargo run --release
 ```
 
 ```
-VelociDB v0.1.0
+VelociDB v0.3.0
 Database: veloci.db
 Type '.help' for help, '.exit' to quit. Statements end with ';'.
 
@@ -143,8 +146,10 @@ Storage and durability
 
 - 4 KB page-based storage on a single data file.
 - **Write-ahead log** (`<db>-wal`) with CRC32-checked records. Each write
-  statement runs as one atomic group: the WAL is fsynced on commit, then the
-  modified pages are applied to the data file, fsynced, and the WAL truncated.
+  statement — or each explicit `BEGIN` … `COMMIT` transaction — runs as one
+  atomic group: modified pages are buffered in memory, then appended to the
+  WAL with a single fsync on commit. Checkpoints copy committed pages into
+  the data file when the WAL reaches 4 MiB and on close.
 - Crash recovery on open: committed groups in the WAL are replayed; partial
   / torn / uncommitted records are discarded.
 - DashMap-backed read cache with bounded capacity.
@@ -157,7 +162,8 @@ Indexing
 SQL surface
 
 - `CREATE TABLE` (INTEGER / REAL / TEXT / BLOB / `F32_BLOB(n)` / `VECTOR(n)`
-  columns; `PRIMARY KEY`, `NOT NULL`, `UNIQUE` constraints)
+  columns; `PRIMARY KEY`, `NOT NULL`, `UNIQUE` constraints — `UNIQUE` is
+  enforced on INSERT and UPDATE, NULLs never conflict)
 - `DROP TABLE`
 - `ALTER TABLE t RENAME TO new | RENAME COLUMN a TO b | ADD COLUMN c type
   | DROP COLUMN c`
@@ -168,7 +174,9 @@ SQL surface
 - `UPDATE t SET col = val [, ...] [WHERE ...]`
 - `DELETE FROM t [WHERE ...]`
 - `WHERE` supports `=`, `!=`, `<>`, `>`, `<`, `>=`, `<=`, `LIKE`, with `AND`
-- `BEGIN` / `COMMIT` / `ROLLBACK` (see limitations below)
+- `BEGIN` / `COMMIT` / `ROLLBACK`: an explicit transaction commits
+  atomically, `ROLLBACK` undoes every change (rows and schema), and a failed
+  statement inside a transaction undoes only itself
 
 Vector search (Turso-inspired)
 
@@ -201,11 +209,17 @@ Concurrency
 - **Single-writer.** All write statements take a global writer mutex. Reads
   can be concurrent with each other but a single in-flight write blocks
   other writes for its duration.
-- **Multi-statement transaction rollback is incomplete.** `BEGIN` and
-  `COMMIT` release/acquire locks correctly, but `ROLLBACK` does not undo
-  storage mutations made by earlier statements in the transaction. (Each
-  statement is its own WAL group; a future change can fold an explicit
-  transaction into a single WAL group.)
+- **One transaction per `Database`.** An explicit transaction is
+  database-wide: statements from any thread join it, and concurrent readers
+  see its uncommitted writes (no isolation between threads). Its dirty pages
+  are held in memory until COMMIT.
+- **`UNIQUE` checks scan the table.** Without secondary indexes, inserting
+  into or updating a `UNIQUE` column is O(rows).
+- **Auto-commit writes are fsync-bound.** Each commit does one full fsync
+  (a few hundred commits per second on macOS). Batch writes in
+  `BEGIN` … `COMMIT` — see [docs/performance.md](docs/performance.md).
+- **Only primary-key equality uses the index.** `WHERE pk = <integer>` is a
+  B-tree lookup; every other `WHERE` scans the table (no secondary indexes).
 - **No `JOIN`, `GROUP BY`, sub-queries**, no indexes other than the primary
   key.
 - **Single primary key column.** Composite primary keys are not supported.
@@ -219,19 +233,11 @@ Concurrency
 
 ## Experimental modules (not on the active path)
 
-The crate exports several modules that explore advanced storage and
-concurrency techniques. They are **not** used by the SQL engine today and
-are exported only so the experimentation is visible:
-
-- `mvcc` — Multi-version concurrency control
-- `async_io` — Tokio / `io_uring` page I/O
-- `lockfree` — Lock-free page cache and queues
-- `simd` — Vectorized filter / aggregation kernels
-- `btree_optimized` — Cache-conscious B-tree node layout
-- `crdt` — CRDT synchronization primitives
-- `cloud_vfs` — S3 / Azure / GCS-backed VFS
-- `hybrid_storage` — Row/columnar hybrid table layout
-- `pmem` — Persistent-memory / DAX VFS
+The source tree also contains research modules — `mvcc`, `async_io`,
+`lockfree`, `simd`, `btree_optimized`, `crdt`, `cloud_vfs`,
+`hybrid_storage`, `pmem`. They are **not** used by the SQL engine, have no
+measured performance impact, and are compiled only with
+`--features experimental`. See [docs/experimental.md](docs/experimental.md).
 
 ## Installation
 
