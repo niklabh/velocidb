@@ -156,8 +156,9 @@ Storage and durability
 
 Indexing
 
-- B-tree primary key index with full split + merge + redistribute paths for
-  both leaf and internal nodes (proptest covers random insert/delete sequences).
+- B-tree primary key index; inserts split and deletes merge / rebalance
+  along the root-to-leaf path. Property tests check the tree's invariants
+  over random insert/delete sequences with mixed row sizes.
 
 SQL surface
 

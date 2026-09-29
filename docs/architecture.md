@@ -126,12 +126,20 @@ Lock ordering and the full commit protocol are documented in
 
 ## B-tree
 
-Each table is a B-tree keyed by its single `INTEGER PRIMARY KEY`
-(`BTREE_ORDER = 64` keys per node). Leaves hold serialized rows; internal
-nodes hold separator keys and child page ids. Inserts split leaves and
-internal nodes; deletes merge or redistribute on underflow and collapse the
-root when it empties. A proptest checks the invariants over random
-insert/delete sequences.
+Each table is a B-tree keyed by its single `INTEGER PRIMARY KEY`. Leaves
+hold serialized rows and are sized in bytes (a leaf is full when its cells
+fill the 4 KB page); internal nodes hold up to `BTREE_ORDER = 64` separator
+keys and child page ids.
+
+Insert and delete record the root-to-leaf path while descending and fix
+the tree along that path: inserts split upward, deletes merge or rebalance
+an underfull node with its sibling (leaves when under a quarter full,
+internal nodes under `MIN_KEYS = 32` keys) and collapse a single-child root.
+The `parent` field in node headers is not read (files from older versions
+may hold stale values there). `BTree::range` scans a key interval, visiting
+only overlapping subtrees. Property tests check structural invariants
+(`check_invariants`) over random insert/delete sequences with row sizes
+from a few bytes to 1.5 KB.
 
 A `WHERE` containing `<pk> = <integer>` is answered by `BTree::search`
 (`candidate_rows` in `src/executor.rs`) for SELECT, UPDATE and DELETE; the

@@ -412,3 +412,63 @@ fn test_repeated_crashes_between_commits() {
     let db = open_db(&path);
     assert_eq!(ids(&db), (0..100).collect::<Vec<_>>());
 }
+
+/// Regression for B-tree delete bugs: random deletes over rows with ~40-byte
+/// text failed after ~165 statements, and inserts after the tree shrank
+/// could lose rows. Deletes and reinserts, then checks every row after a
+/// reopen.
+#[test]
+fn test_random_deletes_and_reinserts_survive_reopen() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    let mut keys: Vec<i64> = (0..600).collect();
+    let mut state = 12345u64;
+    for i in (1..keys.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        keys.swap(i, (state % (i as u64 + 1)) as usize);
+    }
+    {
+        let db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)")
+            .unwrap();
+        db.begin().unwrap();
+        for k in 0..600 {
+            db.execute(&format!(
+                "INSERT INTO t VALUES ({}, '{}')",
+                k,
+                "x".repeat(40)
+            ))
+            .unwrap();
+        }
+        // Delete two thirds in random order, then reinsert half of those.
+        for &k in &keys[..400] {
+            db.execute(&format!("DELETE FROM t WHERE id = {}", k))
+                .unwrap();
+        }
+        for &k in &keys[..200] {
+            db.execute(&format!("INSERT INTO t VALUES ({}, 'back')", k))
+                .unwrap();
+        }
+        db.commit().unwrap();
+        db.close().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let rows = db.query("SELECT * FROM t ORDER BY id").unwrap().rows;
+    let mut expected: Vec<(i64, String)> = keys[..200]
+        .iter()
+        .map(|&k| (k, "back".to_string()))
+        .chain(keys[400..].iter().map(|&k| (k, "x".repeat(40))))
+        .collect();
+    expected.sort();
+    let actual: Vec<(i64, String)> = rows
+        .iter()
+        .map(|r| match (&r.values[0], &r.values[1]) {
+            (Value::Integer(k), Value::Text(s)) => (*k, s.clone()),
+            other => panic!("unexpected row {:?}", other),
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}

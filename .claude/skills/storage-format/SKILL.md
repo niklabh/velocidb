@@ -44,8 +44,15 @@ Every node starts with an 8-byte `NodeHeader`:
 [node_type: u8 (0=internal, 1=leaf)] [num_keys: u16] [parent: u32] [pad: u8]
 ```
 
-`BTREE_ORDER = 64` max keys, `MIN_KEYS = 32`. Keys are `i64` primary keys.
-Leaf cells hold serialized rows.
+`parent` is legacy: it is written as whatever the node had (0 for new
+nodes) and never read — insert/delete navigate by the path recorded from
+the root. Files written before 0.4 may hold stale parent values.
+
+Internal nodes: `[child_0: u64] ([key_i: i64][child_{i+1}: u64])*`, at most
+`BTREE_ORDER = 64` keys; child_i holds keys in `[key_{i-1}, key_i)`.
+Leaves: cells `[key: i64][len: u32][row bytes]` in key order, limited by
+bytes (`LEAF_CAPACITY = PAGE_SIZE - 8`); a row larger than a page is
+rejected with "Row too large". Keys are `i64` primary keys.
 
 ## Row serialization type tags (`serialize_row` / `deserialize_row` in `src/btree.rs`)
 

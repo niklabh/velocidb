@@ -4,6 +4,26 @@ All notable changes to VelociDB are documented in this file.
 
 ## [Unreleased]
 
+### Fixed (B-tree data loss)
+
+- **Deletes failed on ordinary tables.** Leaf underflow was decided by key
+  count while leaves fill by bytes, so with rows of a few dozen bytes
+  random deletes soon failed with "Cannot merge: target page full" or
+  "Parent-child link corruption" (a 600-row table with 40-character text
+  failed after ~165 deletes), leaving the row undeletable.
+- **Inserts could lose rows after the tree shrank.** When a delete
+  collapsed the root, the new root kept a stale parent pointer; a later
+  split of that node linked the new sibling into the dead page, making its
+  rows unreachable.
+- Insert and delete now navigate by the root-to-leaf path recorded while
+  descending and never read the on-disk `parent` field, so existing files
+  with stale parent pointers are handled correctly. Leaves split, merge and
+  rebalance by bytes; a row larger than a page is rejected ("Row too
+  large") instead of corrupting the leaf.
+- New `BTree::range(lo, hi)` scan. Property tests now check structural
+  invariants (key order, separator bounds, uniform depth, node sizes) over
+  random insert/delete sequences with row sizes up to 1.5 KB.
+
 ### Changed (P1 parser)
 
 - **The regex parser is replaced by a lexer and recursive-descent parser**
