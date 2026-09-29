@@ -54,11 +54,17 @@ impl Default for Page {
 /// The pager owns the on-disk data file and the WAL.
 ///
 /// All page mutations flow through `write_page`. If a "write group" is active
-/// (started by `begin_group`), the page is appended to the WAL and buffered in
-/// `pending` until `commit_group` fsyncs the WAL and applies the buffered
-/// pages to the data file. With no active group, `write_page` opens an
-/// implicit single-write group, giving every standalone write its own atomic
-/// WAL transaction.
+/// (started by `begin_group`), the page is buffered in `pending` until
+/// `commit_group` appends every buffered page to the WAL, fsyncs it, and
+/// applies the pages to the data file. With no active group, `write_page`
+/// opens an implicit single-write group, giving every standalone write its own
+/// atomic WAL transaction.
+///
+/// Because nothing reaches the WAL before commit, a group can span several
+/// statements (an explicit `BEGIN` … `COMMIT`) and be discarded wholesale by
+/// `abort_group`. Within a group, a savepoint (`begin_savepoint`) records the
+/// pre-image of every page a statement touches so a failed statement can be
+/// undone with `rollback_to_savepoint` without aborting the whole group.
 ///
 /// Reads consult `pending` first (so writes within the active group are
 /// visible to subsequent reads), then the page cache, then the data file.
@@ -71,6 +77,16 @@ pub struct Pager {
     wal: WalManager,
     active_group: Option<u64>,
     pending: HashMap<PageId, Page>,
+    /// `num_pages` when the active group began; restored on abort.
+    group_start_pages: u64,
+    /// Active savepoint: prior `pending` entry of every page written since
+    /// the savepoint began (`None` = page was not pending), plus `num_pages`.
+    savepoint: Option<Savepoint>,
+}
+
+struct Savepoint {
+    undo: HashMap<PageId, Option<Page>>,
+    num_pages: u64,
 }
 
 impl Pager {
@@ -100,6 +116,8 @@ impl Pager {
             wal,
             active_group: None,
             pending: HashMap::new(),
+            group_start_pages: num_pages,
+            savepoint: None,
         };
 
         pager.recover()?;
@@ -153,23 +171,46 @@ impl Pager {
         }
         let id = self.wal.allocate_group_id();
         self.active_group = Some(id);
+        self.group_start_pages = self.num_pages;
         Ok(id)
     }
 
-    /// Commits the active write group: fsyncs the WAL (durability of the
-    /// COMMIT marker), applies buffered pages to the data file, fsyncs the
-    /// data file, then truncates the WAL.
+    /// Whether a write group is currently active.
+    pub fn in_group(&self) -> bool {
+        self.active_group.is_some()
+    }
+
+    /// Commits the active write group: appends every buffered page and a
+    /// COMMIT record to the WAL, fsyncs it (the durability point), applies
+    /// the pages to the data file, fsyncs the data file, then truncates the
+    /// WAL. If writing the WAL fails the group is aborted.
     pub fn commit_group(&mut self) -> Result<()> {
-        let group_id = self.active_group.take().ok_or_else(|| {
+        let group_id = self.active_group.ok_or_else(|| {
             VelociError::TransactionError("No active write group to commit".to_string())
         })?;
+        self.savepoint = None;
 
-        // Empty group: nothing to commit, no WAL records were written.
+        // Empty group: nothing to commit.
         if self.pending.is_empty() {
+            self.active_group = None;
             return Ok(());
         }
 
-        self.wal.log_commit(group_id)?;
+        let logged = (|| -> Result<()> {
+            let mut page_ids: Vec<PageId> = self.pending.keys().copied().collect();
+            page_ids.sort_unstable();
+            for page_id in page_ids {
+                self.wal
+                    .log_page_write(group_id, page_id, self.pending[&page_id].data())?;
+            }
+            self.wal.log_commit(group_id)
+        })();
+        if let Err(e) = logged {
+            // No COMMIT record is durable, so recovery ignores what was logged.
+            let _ = self.abort_group();
+            return Err(e);
+        }
+        self.active_group = None;
 
         let pending = std::mem::take(&mut self.pending);
         for (page_id, page) in &pending {
@@ -190,13 +231,66 @@ impl Pager {
                 "No active write group to abort".to_string(),
             ));
         }
-        for page_id in self.pending.keys() {
-            if self.cache.remove(page_id).is_some() {
-                self.cache_size.fetch_sub(1, Ordering::Relaxed);
-            }
+        self.savepoint = None;
+        let pending = std::mem::take(&mut self.pending);
+        for page_id in pending.keys() {
+            self.evict(*page_id);
         }
-        self.pending.clear();
+        self.num_pages = self.group_start_pages;
         Ok(())
+    }
+
+    /// Starts a statement-level savepoint inside the active group. Every page
+    /// written until `release_savepoint` / `rollback_to_savepoint` has its
+    /// prior buffered state recorded.
+    pub fn begin_savepoint(&mut self) -> Result<()> {
+        if self.active_group.is_none() {
+            return Err(VelociError::TransactionError(
+                "Savepoint requires an active write group".to_string(),
+            ));
+        }
+        if self.savepoint.is_some() {
+            return Err(VelociError::TransactionError(
+                "Savepoint already active".to_string(),
+            ));
+        }
+        self.savepoint = Some(Savepoint {
+            undo: HashMap::new(),
+            num_pages: self.num_pages,
+        });
+        Ok(())
+    }
+
+    /// Keeps every write made since the savepoint began.
+    pub fn release_savepoint(&mut self) {
+        self.savepoint = None;
+    }
+
+    /// Restores `pending` (and `num_pages`) to their state when the savepoint
+    /// began, undoing the writes of the failed statement only.
+    pub fn rollback_to_savepoint(&mut self) -> Result<()> {
+        let sp = self.savepoint.take().ok_or_else(|| {
+            VelociError::TransactionError("No active savepoint".to_string())
+        })?;
+        for (page_id, prior) in sp.undo {
+            match prior {
+                Some(page) => {
+                    self.pending.insert(page_id, page);
+                }
+                None => {
+                    self.pending.remove(&page_id);
+                }
+            }
+            self.evict(page_id);
+        }
+        self.num_pages = sp.num_pages;
+        Ok(())
+    }
+
+    fn evict(&self, page_id: PageId) {
+        if self.cache.remove(&page_id).is_some() {
+            self.cache_size.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     pub fn read_page(&mut self, page_id: PageId) -> Result<Arc<RwLock<Page>>> {
@@ -248,11 +342,13 @@ impl Pager {
         if auto_group {
             self.begin_group()?;
         }
-        let group_id = self.active_group.expect("group active after begin_group");
+        if let Some(sp) = self.savepoint.as_mut() {
+            if !sp.undo.contains_key(&page_id) {
+                sp.undo.insert(page_id, self.pending.get(&page_id).cloned());
+            }
+        }
 
-        self.wal.log_page_write(group_id, page_id, page.data())?;
-
-        // Update pending buffer.
+        // Update pending buffer; the WAL is written at commit.
         self.pending.insert(page_id, page.clone());
 
         // Update cache (overwrites any older version).
@@ -585,7 +681,12 @@ impl Database {
                 // A schema entry without a valid root page indicates a bug or
                 // partial recovery. Allocate a fresh leaf root for it.
                 let mut pager = self.pager.write();
-                pager.begin_group()?;
+                // Inside an active group (reload after a rollback) the repair
+                // joins that group; otherwise it gets one of its own.
+                let own_group = !pager.in_group();
+                if own_group {
+                    pager.begin_group()?;
+                }
                 let res = (|| -> Result<u64> {
                     let new_root_page = pager.allocate_page()?;
                     let mut page = crate::storage::Page::new();
@@ -596,11 +697,15 @@ impl Database {
                 })();
                 match res {
                     Ok(p) => {
-                        pager.commit_group()?;
+                        if own_group {
+                            pager.commit_group()?;
+                        }
                         p
                     }
                     Err(e) => {
-                        let _ = pager.abort_group();
+                        if own_group {
+                            let _ = pager.abort_group();
+                        }
                         return Err(e);
                     }
                 }
@@ -622,6 +727,18 @@ impl Database {
         Ok(())
     }
 
+    /// Discards the in-memory schema and B-tree handles and rebuilds them from
+    /// the pager's current view (the data file plus any pending pages). Called
+    /// after a rollback so in-memory roots and columns match storage again.
+    fn reload_schema(&self) -> Result<()> {
+        *self.schema.write() = Schema::new();
+        self.btrees.write().clear();
+        self.load_schema()
+    }
+
+    /// Serializes the schema into the schema page chain. Runs inside the
+    /// caller's active write group so the schema commits (or rolls back)
+    /// atomically with the statement that changed it.
     fn save_schema(&self) -> Result<()> {
         let schema = self.schema.read();
         let mut buffer = Vec::new();
@@ -690,39 +807,29 @@ impl Database {
             }
         }
 
-        // The entire schema serialization is one atomic WAL group: either all
-        // chained pages land or none do.
+        drop(schema);
+
         let mut pager = self.pager.write();
+        debug_assert!(pager.in_group(), "save_schema must run inside a write group");
         let usable_size = PAGE_SIZE - 4; // Reserve 4 bytes for chunk length header
         let num_pages_needed = if buffer.is_empty() { 1 } else { (buffer.len() + usable_size - 1) / usable_size };
 
-        pager.begin_group()?;
-        let res = (|| -> Result<()> {
-            while pager.num_pages() < 1 + num_pages_needed as u64 {
-                pager.allocate_page()?;
-            }
+        while pager.num_pages() < 1 + num_pages_needed as u64 {
+            pager.allocate_page()?;
+        }
 
-            for page_idx in 0..num_pages_needed {
-                let start = page_idx * usable_size;
-                let end = std::cmp::min(start + usable_size, buffer.len());
-                let chunk = &buffer[start..end];
+        for page_idx in 0..num_pages_needed {
+            let start = page_idx * usable_size;
+            let end = std::cmp::min(start + usable_size, buffer.len());
+            let chunk = &buffer[start..end];
 
-                let mut page = crate::storage::Page::new();
-                let chunk_len = chunk.len() as u32;
-                page.data_mut()[0..4].copy_from_slice(&chunk_len.to_le_bytes());
-                page.data_mut()[4..4 + chunk.len()].copy_from_slice(chunk);
+            let mut page = crate::storage::Page::new();
+            let chunk_len = chunk.len() as u32;
+            page.data_mut()[0..4].copy_from_slice(&chunk_len.to_le_bytes());
+            page.data_mut()[4..4 + chunk.len()].copy_from_slice(chunk);
 
-                let schema_page_id = 1 + page_idx as u64;
-                pager.write_page(schema_page_id, &page)?;
-            }
-            Ok(())
-        })();
-        match res {
-            Ok(()) => pager.commit_group()?,
-            Err(e) => {
-                let _ = pager.abort_group();
-                return Err(e);
-            }
+            let schema_page_id = 1 + page_idx as u64;
+            pager.write_page(schema_page_id, &page)?;
         }
 
         Ok(())
@@ -764,6 +871,13 @@ impl Database {
         let parser = Parser::new();
         let statement = parser.parse(sql)?;
 
+        match statement {
+            Statement::BeginTransaction => return self.begin(),
+            Statement::CommitTransaction => return self.commit(),
+            Statement::RollbackTransaction => return self.rollback(),
+            _ => {}
+        }
+
         let executor = self.get_or_create_executor();
 
         // Serialize writers so the pager only ever has a single active WAL
@@ -773,6 +887,11 @@ impl Database {
         // Pager persists across lock releases, so `write_page` calls from the
         // executor still see the group and buffer correctly.
         let _writer = self.writer.lock();
+
+        // Inside an explicit transaction the WAL group opened by `begin` stays
+        // open; the statement runs under a savepoint so a failure undoes only
+        // this statement. Otherwise the statement is its own group.
+        let in_txn = executor.in_transaction();
 
         let needs_schema_save = matches!(
             statement,
@@ -786,23 +905,52 @@ impl Database {
         // underflow). If a root changed, the schema page must be re-saved
         // so a subsequent open finds the correct root.
         let roots_before = self.snapshot_roots();
+        let cdc_mark = self.cdc.staged_mark();
 
-        self.pager.write().begin_group()?;
-        let result = executor.execute_statement(statement);
-        match &result {
-            Ok(()) => self.pager.write().commit_group()?,
-            Err(_) => {
-                let _ = self.pager.write().abort_group();
+        if in_txn {
+            self.pager.write().begin_savepoint()?;
+        } else {
+            self.pager.write().begin_group()?;
+        }
+
+        // The schema is saved inside the same group so DDL and root changes
+        // commit atomically with the rows they describe.
+        let result = executor.execute_statement(statement).and_then(|()| {
+            if needs_schema_save || roots_before != self.snapshot_roots() {
+                self.save_schema()?;
+            }
+            Ok(())
+        });
+
+        match result {
+            Ok(()) => {
+                if in_txn {
+                    self.pager.write().release_savepoint();
+                } else {
+                    let committed = self.pager.write().commit_group();
+                    if let Err(e) = committed {
+                        // commit_group already aborted the group.
+                        self.cdc.discard_staged_from(cdc_mark);
+                        self.reload_schema()?;
+                        return Err(e);
+                    }
+                    self.cdc.publish_staged();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if in_txn {
+                    self.pager.write().rollback_to_savepoint()?;
+                } else {
+                    self.pager.write().abort_group()?;
+                }
+                self.cdc.discard_staged_from(cdc_mark);
+                // The statement may have changed in-memory roots or columns
+                // before failing; rebuild them from storage.
+                self.reload_schema()?;
+                Err(e)
             }
         }
-        result?;
-
-        let roots_after = self.snapshot_roots();
-        if needs_schema_save || roots_before != roots_after {
-            self.save_schema()?;
-        }
-
-        Ok(())
     }
 
     fn snapshot_roots(&self) -> HashMap<String, PageId> {
@@ -844,20 +992,58 @@ impl Database {
     }
 
     /// Begins an explicit transaction.
+    ///
+    /// Every statement until [`Database::commit`] or [`Database::rollback`]
+    /// joins a single WAL group: nothing is durable until COMMIT, and ROLLBACK
+    /// discards all of it. The transaction is database-wide (a `Database` is
+    /// one session): statements from any thread join it, and readers see its
+    /// uncommitted writes.
     pub fn begin(&self) -> Result<()> {
         let executor = self.get_or_create_executor();
-        executor.begin_transaction()
+        let _writer = self.writer.lock();
+        executor.begin_transaction()?;
+        if let Err(e) = self.pager.write().begin_group() {
+            let _ = executor.rollback_transaction();
+            return Err(e);
+        }
+        Ok(())
     }
 
-    /// Commits the current explicit transaction.
+    /// Commits the current explicit transaction, making all of its writes
+    /// durable atomically. If the commit fails, the transaction is rolled back.
     pub fn commit(&self) -> Result<()> {
         let executor = self.get_or_create_executor();
+        let _writer = self.writer.lock();
+        if !executor.in_transaction() {
+            return Err(VelociError::TransactionError(
+                "No active transaction to commit".to_string(),
+            ));
+        }
+        let committed = self.pager.write().commit_group();
+        if let Err(e) = committed {
+            // commit_group already aborted the group.
+            self.cdc.discard_staged_from(0);
+            let _ = executor.rollback_transaction();
+            self.reload_schema()?;
+            return Err(e);
+        }
+        self.cdc.publish_staged();
         executor.commit_transaction()
     }
 
-    /// Rolls back the current explicit transaction.
+    /// Rolls back the current explicit transaction, discarding every change
+    /// made since [`Database::begin`], including schema changes.
     pub fn rollback(&self) -> Result<()> {
         let executor = self.get_or_create_executor();
+        let _writer = self.writer.lock();
+        if !executor.in_transaction() {
+            return Err(VelociError::TransactionError(
+                "No active transaction to rollback".to_string(),
+            ));
+        }
+        self.pager.write().abort_group()?;
+        self.cdc.discard_staged_from(0);
+        self.reload_schema()?;
         executor.rollback_transaction()
     }
 

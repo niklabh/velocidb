@@ -14,10 +14,10 @@ items land; update README Limitations and CHANGELOG in the same change.
 
 Ship before expanding the SQL surface or advertising full ACID.
 
-- [ ] **Real multi-statement `ROLLBACK`** — fold an explicit `BEGIN`…`COMMIT`
+- [x] **Real multi-statement `ROLLBACK`** — fold an explicit `BEGIN`…`COMMIT`
       into a single WAL group (or track undo) so `ROLLBACK` undoes storage
       mutations, not only locks
-- [ ] **Enforce `UNIQUE`** on non-primary-key columns (INSERT / UPDATE); add
+- [x] **Enforce `UNIQUE`** on non-primary-key columns (INSERT / UPDATE); add
       regression tests; keep `.schema` / README in sync
 - [ ] **CI on every PR** — `cargo test --all-targets`, `cargo clippy` on the
       active path (docs workflow alone is not enough)
@@ -120,7 +120,7 @@ CHANGELOG.
 - [x] WAL with CRC32, group commit, torn-tail-tolerant recovery
 - [x] B-tree primary index (leaf + internal split / merge / redistribute)
 - [x] Core SQL: CREATE / DROP / ALTER TABLE, INSERT / SELECT / UPDATE / DELETE
-- [x] `BEGIN` / `COMMIT` (locks); `ROLLBACK` locks only — see P0
+- [x] `BEGIN` / `COMMIT` / `ROLLBACK` as one WAL group; statement savepoints
 - [x] Parallel WHERE / ORDER BY / vector distance (rayon, ≥ 1024 rows)
 - [x] Vector columns + exact KNN
 - [x] In-memory CDC + REPL `.cdc` / `.changes`

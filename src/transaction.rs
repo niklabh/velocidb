@@ -277,9 +277,8 @@ impl LockManager {
                         break;
                     }
                     (LockType::Exclusive, LockType::Shared) => {
-                        return Err(VelociError::ConstraintViolation(
-                            "Cannot downgrade exclusive lock to shared".to_string()
-                        ));
+                        // An exclusive lock already covers shared access.
+                        return Ok(());
                     }
                     (LockType::Shared, LockType::Shared) | (LockType::Exclusive, LockType::Exclusive) => {
                         // Same lock type, already held

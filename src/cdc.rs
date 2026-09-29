@@ -9,9 +9,16 @@
 //! The log is kept in memory with a bounded capacity; when the capacity is
 //! exceeded the oldest events are dropped (consumers that fall too far behind
 //! can detect the gap by comparing sequence numbers).
+//!
+//! The executor does not publish directly: it [`CdcManager::stage`]s events,
+//! and `Database` publishes them with [`CdcManager::publish_staged`] once the
+//! enclosing WAL group commits, or drops them with
+//! [`CdcManager::discard_staged_from`] when a statement or transaction rolls
+//! back. Sequence numbers are assigned at publish time, so consumers never
+//! see gaps or events for changes that were undone.
 
 use crate::types::Row;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -59,6 +66,16 @@ pub struct CdcManager {
     next_seq: AtomicU64,
     capacity: usize,
     log: RwLock<VecDeque<ChangeEvent>>,
+    /// Changes made by the in-flight write group, awaiting commit.
+    staged: Mutex<Vec<StagedChange>>,
+}
+
+struct StagedChange {
+    table: String,
+    op: ChangeOp,
+    rowid: i64,
+    before: Option<Row>,
+    after: Option<Row>,
 }
 
 impl CdcManager {
@@ -72,6 +89,7 @@ impl CdcManager {
             next_seq: AtomicU64::new(1),
             capacity,
             log: RwLock::new(VecDeque::new()),
+            staged: Mutex::new(Vec::new()),
         }
     }
 
@@ -84,6 +102,7 @@ impl CdcManager {
     pub fn disable(&self) {
         self.enabled.store(false, Ordering::SeqCst);
         self.log.write().clear();
+        self.staged.lock().clear();
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -116,6 +135,47 @@ impl CdcManager {
             log.pop_front();
         }
         log.push_back(event);
+    }
+
+    /// Stages a change made by an uncommitted write group. No-op when capture
+    /// is disabled.
+    pub fn stage(
+        &self,
+        table: &str,
+        op: ChangeOp,
+        rowid: i64,
+        before: Option<Row>,
+        after: Option<Row>,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        self.staged.lock().push(StagedChange {
+            table: table.to_string(),
+            op,
+            rowid,
+            before,
+            after,
+        });
+    }
+
+    /// Current number of staged changes; pass to `discard_staged_from` to
+    /// drop only the changes staged after this point.
+    pub fn staged_mark(&self) -> usize {
+        self.staged.lock().len()
+    }
+
+    /// Drops staged changes from position `mark` onward.
+    pub fn discard_staged_from(&self, mark: usize) {
+        self.staged.lock().truncate(mark);
+    }
+
+    /// Publishes every staged change to the log, assigning sequence numbers.
+    pub fn publish_staged(&self) {
+        let staged = std::mem::take(&mut *self.staged.lock());
+        for c in staged {
+            self.record(&c.table, c.op, c.rowid, c.before, c.after);
+        }
     }
 
     /// Returns all changes with `seq > since`, in order.

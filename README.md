@@ -142,9 +142,11 @@ replication, cache invalidation, or audit trails. In the REPL: `.cdc on`,
 Storage and durability
 
 - 4 KB page-based storage on a single data file.
-- **Write-ahead log** (`<db>-wal`) with CRC32-checked records. Each write
-  statement runs as one atomic group: the WAL is fsynced on commit, then the
-  modified pages are applied to the data file, fsynced, and the WAL truncated.
+- **Write-ahead log** (`<db>.wal`) with CRC32-checked records. Each write
+  statement — or each explicit `BEGIN` … `COMMIT` transaction — runs as one
+  atomic group: modified pages are buffered in memory, written to the WAL and
+  fsynced on commit, then applied to the data file, fsynced, and the WAL
+  truncated.
 - Crash recovery on open: committed groups in the WAL are replayed; partial
   / torn / uncommitted records are discarded.
 - DashMap-backed read cache with bounded capacity.
@@ -157,7 +159,8 @@ Indexing
 SQL surface
 
 - `CREATE TABLE` (INTEGER / REAL / TEXT / BLOB / `F32_BLOB(n)` / `VECTOR(n)`
-  columns; `PRIMARY KEY`, `NOT NULL`, `UNIQUE` constraints)
+  columns; `PRIMARY KEY`, `NOT NULL`, `UNIQUE` constraints — `UNIQUE` is
+  enforced on INSERT and UPDATE, NULLs never conflict)
 - `DROP TABLE`
 - `ALTER TABLE t RENAME TO new | RENAME COLUMN a TO b | ADD COLUMN c type
   | DROP COLUMN c`
@@ -168,7 +171,9 @@ SQL surface
 - `UPDATE t SET col = val [, ...] [WHERE ...]`
 - `DELETE FROM t [WHERE ...]`
 - `WHERE` supports `=`, `!=`, `<>`, `>`, `<`, `>=`, `<=`, `LIKE`, with `AND`
-- `BEGIN` / `COMMIT` / `ROLLBACK` (see limitations below)
+- `BEGIN` / `COMMIT` / `ROLLBACK`: an explicit transaction commits
+  atomically, `ROLLBACK` undoes every change (rows and schema), and a failed
+  statement inside a transaction undoes only itself
 
 Vector search (Turso-inspired)
 
@@ -201,11 +206,12 @@ Concurrency
 - **Single-writer.** All write statements take a global writer mutex. Reads
   can be concurrent with each other but a single in-flight write blocks
   other writes for its duration.
-- **Multi-statement transaction rollback is incomplete.** `BEGIN` and
-  `COMMIT` release/acquire locks correctly, but `ROLLBACK` does not undo
-  storage mutations made by earlier statements in the transaction. (Each
-  statement is its own WAL group; a future change can fold an explicit
-  transaction into a single WAL group.)
+- **One transaction per `Database`.** An explicit transaction is
+  database-wide: statements from any thread join it, and concurrent readers
+  see its uncommitted writes (no isolation between threads). Its dirty pages
+  are held in memory until COMMIT.
+- **`UNIQUE` checks scan the table.** Without secondary indexes, inserting
+  into or updating a `UNIQUE` column is O(rows).
 - **No `JOIN`, `GROUP BY`, sub-queries**, no indexes other than the primary
   key.
 - **Single primary key column.** Composite primary keys are not supported.

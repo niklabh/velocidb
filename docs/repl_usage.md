@@ -46,7 +46,7 @@ CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)
 **Supported constraints:**
 - `PRIMARY KEY` - Marks column as primary key
 - `NOT NULL` - Column cannot be null (planned)
-- `UNIQUE` - Column values must be unique (planned)
+- `UNIQUE` - Column values must be unique (NULLs never conflict)
 
 ### INSERT INTO
 
@@ -240,13 +240,13 @@ Current REPL limitations:
 
 Planned enhancements:
 
-- [ ] Multi-line statement editing
-- [ ] Command history with arrow keys
+- [x] Multi-line statement editing
+- [x] Command history with arrow keys
 - [ ] Tab completion for tables/columns
-- [ ] `.schema` command to show table structures
-- [ ] `.tables` implementation
+- [x] `.schema` command to show table structures
+- [x] `.tables` implementation
 - [ ] Syntax highlighting
-- [ ] Transaction control (BEGIN, COMMIT, ROLLBACK)
+- [x] Transaction control (BEGIN, COMMIT, ROLLBACK)
 - [ ] `.import` and `.export` commands
 - [ ] Query result formatting options
 

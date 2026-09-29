@@ -4,6 +4,42 @@ All notable changes to VelociDB are documented in this file.
 
 ## [Unreleased]
 
+### Fixed (P0 correctness)
+
+- **`ROLLBACK` now undoes storage.** `BEGIN` opens a single WAL group that
+  spans every statement until `COMMIT`; `ROLLBACK` (or closing the database
+  without committing) discards all of it, including schema changes. Pages
+  are written to the WAL only at commit, so an uncommitted transaction never
+  reaches disk.
+- **Statement-level atomicity inside transactions.** Each statement runs
+  under a pager savepoint; a failing statement undoes only its own writes
+  and the transaction continues (previously the failure aborted the
+  transaction object and released its locks mid-transaction).
+- **Schema writes are atomic with the statement.** DDL and B-tree root
+  changes are saved inside the statement's WAL group instead of a separate
+  group afterwards. After any rollback the in-memory schema and B-tree roots
+  are rebuilt from storage.
+- **`UNIQUE` is enforced** on non-primary-key columns for INSERT and
+  UPDATE (including several rows updated to the same value). NULLs never
+  conflict.
+- **CDC only publishes committed changes.** Events are staged per write
+  group and published on commit; rolled-back or failed statements emit
+  nothing, and sequence numbers have no gaps.
+- **Table locks no longer leak on errors.** A failing auto-commit statement
+  (e.g. `ORDER BY` an unknown column, missing primary key value) used to
+  keep its table lock, stalling the next conflicting statement for the 30 s
+  lock timeout. Lock/transaction lifecycle now lives in one wrapper.
+- `SELECT` after a write inside an explicit transaction no longer fails
+  with "Cannot downgrade exclusive lock to shared".
+- An aborted write group now restores the pager's page count, so pages
+  allocated by the aborted group are not left referenced past end-of-file.
+
+### Added
+
+- `tests/transaction_tests.rs` (12 tests): rollback of DML and DDL, commit
+  and reopen, uncommitted-on-close, rollback across B-tree splits,
+  savepoints, CDC publication, `UNIQUE` on insert/update/reopen.
+
 ### Added (Turso-inspired features)
 
 - **Vector search** (`src/vector.rs`). Vector columns via `F32_BLOB(n)` /
@@ -101,9 +137,6 @@ All notable changes to VelociDB are documented in this file.
 ### Known limitations
 
 - All writers serialize on a `Database`-level mutex.
-- Explicit-transaction `ROLLBACK` only releases locks; storage mutations
-  made by previous statements in the transaction are not undone (each
-  statement is its own WAL group).
 - No `JOIN`, `GROUP BY`, sub-queries, or composite primary keys.
 - Vector search is exact (brute-force, parallel); approximate indexing
   (HNSW/DiskANN-style) is future work, mirroring Turso's roadmap.

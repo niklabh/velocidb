@@ -54,9 +54,18 @@ impl Executor {
             Statement::CreateTable { name, columns } => self.execute_create_table(&name, columns),
             Statement::DropTable { name } => self.execute_drop_table(&name),
             Statement::AlterTable { table, action } => self.execute_alter_table(&table, action),
-            Statement::Insert { table, columns, values } => self.execute_insert(&table, columns, values),
-            Statement::Update { table, assignments, where_clause } => self.execute_update(&table, assignments, where_clause),
-            Statement::Delete { table, where_clause } => self.execute_delete(&table, where_clause),
+            Statement::Insert { table, columns, values } => self
+                .with_table_lock(&table, LockType::Exclusive, || {
+                    self.execute_insert(&table, columns, values)
+                }),
+            Statement::Update { table, assignments, where_clause } => self
+                .with_table_lock(&table, LockType::Exclusive, || {
+                    self.execute_update(&table, assignments, where_clause)
+                }),
+            Statement::Delete { table, where_clause } => self
+                .with_table_lock(&table, LockType::Exclusive, || {
+                    self.execute_delete(&table, where_clause)
+                }),
             Statement::BeginTransaction => self.begin_transaction(),
             Statement::CommitTransaction => self.commit_transaction(),
             Statement::RollbackTransaction => self.rollback_transaction(),
@@ -66,11 +75,51 @@ impl Executor {
 
     pub fn query_statement(&self, statement: Statement) -> Result<QueryResult> {
         match statement {
-            Statement::Select { table, columns, where_clause, order_by, limit } => {
-                self.execute_select(&table, columns, where_clause, order_by, limit)
-            }
+            Statement::Select { table, columns, where_clause, order_by, limit } => self
+                .with_table_lock(&table, LockType::Shared, || {
+                    self.execute_select(&table, columns, where_clause, order_by, limit)
+                }),
             _ => Err(VelociError::ParseError("Statement is not a query".to_string())),
         }
+    }
+
+    /// Runs `f` holding a `lock` on `table`.
+    ///
+    /// Inside an explicit transaction the lock is taken on behalf of that
+    /// transaction and held until COMMIT / ROLLBACK, even if `f` fails (the
+    /// caller undoes the failed statement's storage writes). Otherwise a
+    /// single-statement transaction is started and always ended — committed
+    /// on success, aborted on error — with its lock released on every path.
+    fn with_table_lock<T>(
+        &self,
+        table: &str,
+        lock: LockType,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if let Some(txn) = self.active_transaction.read().clone() {
+            self.lock_manager.acquire_lock(table, txn.id(), lock)?;
+            return f();
+        }
+
+        let txn = self.transaction_manager.begin();
+        if let Err(e) = self.lock_manager.acquire_lock(table, txn.id(), lock) {
+            let _ = self.transaction_manager.abort(&txn);
+            return Err(e);
+        }
+        let result = f();
+        let ended = match result {
+            Ok(_) => self.transaction_manager.commit(&txn),
+            Err(_) => self.transaction_manager.abort(&txn),
+        };
+        self.lock_manager.release_all_locks(txn.id());
+        let value = result?;
+        ended?;
+        Ok(value)
+    }
+
+    /// Whether an explicit transaction is in progress.
+    pub fn in_transaction(&self) -> bool {
+        self.active_transaction.read().is_some()
     }
 
     pub fn begin_transaction(&self) -> Result<()> {
@@ -100,10 +149,9 @@ impl Executor {
     }
 
     pub fn rollback_transaction(&self) -> Result<()> {
-        // NOTE: Until WAL undo is wired in, rolling back an explicit
-        // transaction only releases locks. Any storage mutations the
-        // transaction performed remain on disk. The WAL milestone will close
-        // this gap.
+        // Storage is undone by the caller (`Database::rollback` aborts the
+        // transaction's WAL group); this only ends the transaction and
+        // releases its locks.
         let mut active = self.active_transaction.write();
         match active.take() {
             Some(txn) => {
@@ -293,27 +341,6 @@ impl Executor {
         columns: Option<Vec<String>>,
         values: Vec<Value>,
     ) -> Result<()> {
-        // Check if we're in an explicit transaction; if not, auto-commit
-        let explicit_txn = self.active_transaction.read().clone();
-        let txn: Arc<Transaction>;
-        let auto_commit: bool;
-
-        if let Some(ref active) = explicit_txn {
-            txn = Arc::clone(active);
-            auto_commit = false;
-        } else {
-            txn = self.transaction_manager.begin();
-            auto_commit = true;
-        }
-
-        if !auto_commit {
-            self.lock_manager
-                .acquire_lock(table, txn.id(), LockType::Exclusive)?;
-        } else {
-            self.lock_manager
-                .acquire_lock(table, txn.id(), LockType::Exclusive)?;
-        }
-
         // Get table schema and immediately clone to release lock
         let table_schema = {
             let schema = self.schema.read();
@@ -332,7 +359,6 @@ impl Executor {
         };
 
         if column_names.len() != values.len() {
-            self.lock_manager.release_lock(table, txn.id())?;
             return Err(VelociError::ConstraintViolation(
                 "Column count doesn't match value count".to_string(),
             ));
@@ -361,7 +387,6 @@ impl Executor {
             let col_name = &column_names[i];
             if let Some(col) = table_schema.columns.iter().find(|c| &c.name == col_name) {
                 if col.not_null && matches!(value, Value::Null) {
-                    self.lock_manager.release_lock(table, txn.id())?;
                     return Err(VelociError::ConstraintViolation(format!(
                         "Column '{}' cannot be NULL", col_name
                     )));
@@ -371,14 +396,12 @@ impl Executor {
                         Value::Null => {}
                         Value::Vector(v) if v.len() == dim as usize => {}
                         Value::Vector(v) => {
-                            self.lock_manager.release_lock(table, txn.id())?;
                             return Err(VelociError::ConstraintViolation(format!(
                                 "Column '{}' expects a vector of dimension {}, got {}",
                                 col_name, dim, v.len()
                             )));
                         }
                         other => {
-                            self.lock_manager.release_lock(table, txn.id())?;
                             return Err(VelociError::TypeMismatch {
                                 expected: format!("Vector({})", dim),
                                 actual: format!("{:?}", other),
@@ -415,6 +438,8 @@ impl Executor {
                     "Primary key {} already exists in table '{}'",
                     pk_value, table
                 )))
+            } else if let Err(e) = check_insert_unique(&table_schema, &btree, &row) {
+                Err(e)
             } else {
                 // Insert into B-Tree for persistence
                 btree.insert(pk_value, &row)?;
@@ -424,19 +449,13 @@ impl Executor {
 
         // Handle result
         if let Err(e) = result {
-            self.lock_manager.release_lock(table, txn.id())?;
-            self.transaction_manager.abort(&txn)?;
             return Err(e);
         }
 
         self.cdc
-            .record(table, ChangeOp::Insert, pk_value, None, Some(row));
+            .stage(table, ChangeOp::Insert, pk_value, None, Some(row));
 
         // Only commit/release lock for auto-commit mode
-        if auto_commit {
-            self.transaction_manager.commit(&txn)?;
-            self.lock_manager.release_lock(table, txn.id())?;
-        }
 
         Ok(())
     }
@@ -449,21 +468,6 @@ impl Executor {
         order_by: Option<OrderBy>,
         limit: Option<u64>,
     ) -> Result<QueryResult> {
-        let explicit_txn = self.active_transaction.read().clone();
-        let txn: Arc<Transaction>;
-        let auto_commit: bool;
-
-        if let Some(ref active) = explicit_txn {
-            txn = Arc::clone(active);
-            auto_commit = false;
-        } else {
-            txn = self.transaction_manager.begin();
-            auto_commit = true;
-        }
-
-        self.lock_manager
-            .acquire_lock(table, txn.id(), LockType::Shared)?;
-
         // Get table schema and release lock immediately
         let table_schema = {
             let schema = self.schema.read();
@@ -604,10 +608,6 @@ impl Executor {
             }];
             let result_rows = vec![Row::new(vec![Value::Integer(count)])];
 
-            if auto_commit {
-                self.transaction_manager.commit(&txn)?;
-                self.lock_manager.release_lock(table, txn.id())?;
-            }
 
             return Ok(QueryResult::new(result_columns, result_rows));
         }
@@ -705,10 +705,6 @@ impl Executor {
             })
             .collect();
 
-        if auto_commit {
-            self.transaction_manager.commit(&txn)?;
-            self.lock_manager.release_lock(table, txn.id())?;
-        }
 
         Ok(QueryResult::new(result_columns, result_rows))
     }
@@ -719,19 +715,6 @@ impl Executor {
         assignments: HashMap<String, Value>,
         where_clause: Option<WhereClause>,
     ) -> Result<()> {
-        let explicit_txn = self.active_transaction.read().clone();
-        let txn: Arc<Transaction>;
-        let auto_commit: bool;
-        if let Some(ref active) = explicit_txn {
-            txn = Arc::clone(active);
-            auto_commit = false;
-        } else {
-            txn = self.transaction_manager.begin();
-            auto_commit = true;
-        }
-        self.lock_manager
-            .acquire_lock(table, txn.id(), LockType::Exclusive)?;
-
         // Get table schema and release lock
         let table_schema = {
             let schema = self.schema.read();
@@ -770,7 +753,9 @@ impl Executor {
                 .position(|c| c.primary_key)
                 .ok_or_else(|| VelociError::ConstraintViolation("No primary key defined".to_string()))?;
 
-            // Update each row
+            // Compute every updated row first so UNIQUE can be checked
+            // against the table's final state before anything is mutated.
+            let mut updates: Vec<(i64, i64, Row, Row)> = Vec::with_capacity(rows_to_update.len());
             for (key, row) in &rows_to_update {
                 let mut updated_row = row.clone();
                 let mut new_pk_value = *key; // Default to existing key
@@ -807,12 +792,33 @@ impl Executor {
                     }
                 }
 
-                // Delete old row and insert updated row
-                btree.delete(*key)?;
+                updates.push((*key, new_pk_value, row.clone(), updated_row));
+            }
+
+            let touched_unique: Vec<usize> = unique_columns(&table_schema)
+                .into_iter()
+                .filter(|&ci| assignments.contains_key(&table_schema.columns[ci].name))
+                .collect();
+            if !touched_unique.is_empty() && !updates.is_empty() {
+                let updated_keys: std::collections::HashSet<i64> =
+                    updates.iter().map(|(key, ..)| *key).collect();
+                let untouched = btree.scan()?;
+                let final_rows: Vec<&Row> = untouched
+                    .iter()
+                    .filter(|(key, _)| !updated_keys.contains(key))
+                    .map(|(_, row)| row)
+                    .chain(updates.iter().map(|(_, _, _, updated)| updated))
+                    .collect();
+                check_unique(&table_schema, &touched_unique, &final_rows)?;
+            }
+
+            // Delete old row and insert updated row
+            for (key, new_pk_value, row, updated_row) in updates {
+                btree.delete(key)?;
                 btree.insert(new_pk_value, &updated_row)?;
 
                 if self.cdc.is_enabled() {
-                    cdc_events.push((*key, row.clone(), updated_row));
+                    cdc_events.push((key, row, updated_row));
                 }
             }
             
@@ -821,39 +827,20 @@ impl Executor {
 
         // Handle errors
         if let Err(e) = result {
-            self.lock_manager.release_lock(table, txn.id())?;
-            self.transaction_manager.abort(&txn)?;
             return Err(e);
         }
 
         for (key, before, after) in cdc_events {
             self.cdc
-                .record(table, ChangeOp::Update, key, Some(before), Some(after));
+                .stage(table, ChangeOp::Update, key, Some(before), Some(after));
         }
 
-        if auto_commit {
-            self.transaction_manager.commit(&txn)?;
-            self.lock_manager.release_lock(table, txn.id())?;
-        }
 
         Ok(())
     }
 
     #[allow(clippy::let_and_return)]
     fn execute_delete(&self, table: &str, where_clause: Option<WhereClause>) -> Result<()> {
-        let explicit_txn = self.active_transaction.read().clone();
-        let txn: Arc<Transaction>;
-        let auto_commit: bool;
-        if let Some(ref active) = explicit_txn {
-            txn = Arc::clone(active);
-            auto_commit = false;
-        } else {
-            txn = self.transaction_manager.begin();
-            auto_commit = true;
-        }
-        self.lock_manager
-            .acquire_lock(table, txn.id(), LockType::Exclusive)?;
-
         // Get table schema and release lock
         let table_schema = {
             let schema = self.schema.read();
@@ -889,20 +876,14 @@ impl Executor {
         };
 
         if let Err(e) = result {
-            self.lock_manager.release_lock(table, txn.id())?;
-            self.transaction_manager.abort(&txn)?;
             return Err(e);
         }
 
         for (key, before) in cdc_events {
             self.cdc
-                .record(table, ChangeOp::Delete, key, Some(before), None);
+                .stage(table, ChangeOp::Delete, key, Some(before), None);
         }
 
-        if auto_commit {
-            self.transaction_manager.commit(&txn)?;
-            self.lock_manager.release_lock(table, txn.id())?;
-        }
 
         Ok(())
     }
@@ -961,6 +942,70 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         // the sort is at least total and deterministic.
         _ => format!("{:?}", a).cmp(&format!("{:?}", b)),
     }
+}
+
+/// Indices of `UNIQUE` columns other than the primary key (the B-tree
+/// enforces primary-key uniqueness itself).
+fn unique_columns(table: &TableSchema) -> Vec<usize> {
+    table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.unique && !c.primary_key)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn unique_violation(table: &TableSchema, col_index: usize, value: &Value) -> VelociError {
+    VelociError::ConstraintViolation(format!(
+        "UNIQUE constraint failed: {}.{} (duplicate value {})",
+        table.name, table.columns[col_index].name, value
+    ))
+}
+
+/// Rejects `row` if a UNIQUE column's non-NULL value already exists in the
+/// table. Without secondary indexes this is a full scan, done only when the
+/// table has UNIQUE columns.
+fn check_insert_unique(table: &TableSchema, btree: &BTree, row: &Row) -> Result<()> {
+    let cols: Vec<usize> = unique_columns(table)
+        .into_iter()
+        .filter(|&ci| !matches!(row.values.get(ci), None | Some(Value::Null)))
+        .collect();
+    if cols.is_empty() {
+        return Ok(());
+    }
+    for (_, existing) in btree.scan()? {
+        for &ci in &cols {
+            if let Some(v) = existing.values.get(ci) {
+                if !matches!(v, Value::Null)
+                    && compare_values(v, &row.values[ci]) == std::cmp::Ordering::Equal
+                {
+                    return Err(unique_violation(table, ci, v));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rejects `rows` (a table's complete final contents) if any column in
+/// `cols` holds the same non-NULL value twice. NULLs never conflict.
+fn check_unique(table: &TableSchema, cols: &[usize], rows: &[&Row]) -> Result<()> {
+    for &ci in cols {
+        let mut values: Vec<&Value> = rows
+            .iter()
+            .filter_map(|r| r.values.get(ci))
+            .filter(|v| !matches!(v, Value::Null))
+            .collect();
+        values.sort_by(|a, b| compare_values(a, b));
+        if let Some(pair) = values
+            .windows(2)
+            .find(|w| compare_values(w[0], w[1]) == std::cmp::Ordering::Equal)
+        {
+            return Err(unique_violation(table, ci, pair[0]));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
