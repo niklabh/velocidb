@@ -55,7 +55,8 @@ un-gated in `src/lib.rs` and documented in the README and
 
 ## Warnings
 
-The active path is clippy-clean and CI enforces
+CI enforces `cargo fmt --check` on the whole tree. The active path is
+clippy-clean and CI enforces
 `cargo clippy --all-targets -- -D warnings` (default features, i.e. without
 experimental modules). Keep it that way; prefer fixing a lint over
 `#[allow]`, and justify any `#[allow]` in a comment. Experimental-module

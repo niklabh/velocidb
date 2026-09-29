@@ -30,14 +30,16 @@ jobs:
         run: cargo test --doc
 
   lint:
-    name: Clippy
+    name: Clippy and rustfmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --check
       # Default features = the active SQL path. Experimental modules are
       # excluded and must not add warnings here.
       - name: Clippy (active path)

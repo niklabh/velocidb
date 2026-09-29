@@ -97,6 +97,7 @@ For feature requests:
    ```bash
    cargo test --all-targets && cargo test --doc
    cargo clippy --all-targets -- -D warnings
+   cargo fmt --check
    cargo test --lib --features experimental   # if you touched experimental modules
    ```
 
@@ -120,8 +121,10 @@ For feature requests:
 ## Code Style
 
 ### Formatting
-- Use `rustfmt` on code you write. The tree is not fully formatted yet, so
-  don't reformat files you aren't otherwise changing
+- Run `cargo fmt` before committing (CI checks it). The tree-wide
+  formatting commit is listed in `.git-blame-ignore-revs`; run
+  `git config blame.ignoreRevsFile .git-blame-ignore-revs` to skip it in
+  `git blame`
 
 ### Linting
 - Use `clippy` to catch common mistakes

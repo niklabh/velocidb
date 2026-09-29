@@ -71,11 +71,13 @@ All notable changes to VelociDB are documented in this file.
 - REPL / `--version` print the crate version instead of a hard-coded
   `v0.1.0`.
 - Active-path code is clippy-clean (`cargo clippy --all-targets -- -D warnings`).
+- The whole tree is rustfmt-formatted (one formatting-only commit, listed in
+  `.git-blame-ignore-revs`); CI checks `cargo fmt --check`.
 
 ### Added
 
 - CI (`.github/workflows/ci.yml`): tests on Linux and macOS, doc tests,
-  clippy with `-D warnings`, and a build + unit-test job for
+  clippy with `-D warnings`, `cargo fmt --check`, and a build + unit-test job for
   `--features experimental`.
 - Five crash tests in `tests/recovery_tests.rs` (simulated with
   `mem::forget`): uncheckpointed commits survive, uncommitted transactions
