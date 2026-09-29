@@ -159,7 +159,9 @@ mod tests {
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
             .await
             .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'Alice')").await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'Alice')")
+            .await
+            .unwrap();
 
         let result = conn.query("SELECT * FROM t").await.unwrap();
         assert_eq!(result.rows.len(), 1);

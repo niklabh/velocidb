@@ -131,15 +131,23 @@ impl Operator {
             (Operator::LessThanOrEqual, Value::Integer(a), Value::Integer(b)) => Ok(a <= b),
 
             // Float/Real comparisons (at least one operand is Float/Real)
-            (op, left, right) if matches!((left, right),
-                (Value::Float(_) | Value::Real(_) | Value::Integer(_),
-                 Value::Float(_) | Value::Real(_) | Value::Integer(_))
-            ) && (!matches!(left, Value::Integer(_)) || !matches!(right, Value::Integer(_))) => {
+            (op, left, right)
+                if matches!(
+                    (left, right),
+                    (
+                        Value::Float(_) | Value::Real(_) | Value::Integer(_),
+                        Value::Float(_) | Value::Real(_) | Value::Integer(_)
+                    )
+                ) && (!matches!(left, Value::Integer(_))
+                    || !matches!(right, Value::Integer(_))) =>
+            {
                 let a = left.as_float().map_err(|_| VelociError::TypeMismatch {
-                    expected: "numeric".to_string(), actual: format!("{:?}", left),
+                    expected: "numeric".to_string(),
+                    actual: format!("{:?}", left),
                 })?;
                 let b = right.as_float().map_err(|_| VelociError::TypeMismatch {
-                    expected: "numeric".to_string(), actual: format!("{:?}", right),
+                    expected: "numeric".to_string(),
+                    actual: format!("{:?}", right),
                 })?;
                 match op {
                     Operator::Equal => Ok(a == b),
@@ -148,7 +156,9 @@ impl Operator {
                     Operator::LessThan => Ok(a < b),
                     Operator::GreaterThanOrEqual => Ok(a >= b),
                     Operator::LessThanOrEqual => Ok(a <= b),
-                    Operator::Like => Err(VelociError::ParseError("LIKE not supported for numeric types".to_string())),
+                    Operator::Like => Err(VelociError::ParseError(
+                        "LIKE not supported for numeric types".to_string(),
+                    )),
                 }
             }
 
@@ -167,8 +177,8 @@ impl Operator {
                         '%' => regex_pattern.push_str(".*"),
                         '_' => regex_pattern.push('.'),
                         // Escape regex metacharacters
-                        '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']'
-                        | '{' | '}' | '|' | '^' | '$' | '\\' => {
+                        '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^'
+                        | '$' | '\\' => {
                             regex_pattern.push('\\');
                             regex_pattern.push(ch);
                         }
@@ -220,10 +230,17 @@ fn find_order_by(s: &str) -> Option<usize> {
         {
             let rest = &s[i..];
             let upper: String = rest.chars().take(9).collect::<String>().to_uppercase();
-            if upper.starts_with("ORDER ") || upper.starts_with("ORDER\t") || upper.starts_with("ORDER\n") {
+            if upper.starts_with("ORDER ")
+                || upper.starts_with("ORDER\t")
+                || upper.starts_with("ORDER\n")
+            {
                 // Confirm "BY" follows the whitespace run.
                 let after_order = rest[5..].trim_start();
-                let upper_after: String = after_order.chars().take(3).collect::<String>().to_uppercase();
+                let upper_after: String = after_order
+                    .chars()
+                    .take(3)
+                    .collect::<String>()
+                    .to_uppercase();
                 if upper_after.starts_with("BY")
                     && after_order[2..]
                         .chars()
@@ -388,8 +405,7 @@ impl Parser {
                 primary_key = true;
                 not_null = true;
             }
-            if upper_parts.contains(&"NOT".to_string())
-                && upper_parts.contains(&"NULL".to_string())
+            if upper_parts.contains(&"NOT".to_string()) && upper_parts.contains(&"NULL".to_string())
             {
                 not_null = true;
             }
@@ -516,17 +532,18 @@ impl Parser {
     fn parse_insert(&self, sql: &str) -> Result<Statement> {
         // INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)
         // INSERT INTO users VALUES (1, 'Alice', 30)
-        
+
         // The VALUES capture is greedy up to the final ')' so nested function
         // calls like vector32('[1, 2]') survive intact.
-        let re = regex!(r"(?i)INSERT\s+INTO\s+(\w+)(?:\s*\(([^)]+)\))?\s+VALUES\s*\((.+)\)\s*;?\s*$");
+        let re =
+            regex!(r"(?i)INSERT\s+INTO\s+(\w+)(?:\s*\(([^)]+)\))?\s+VALUES\s*\((.+)\)\s*;?\s*$");
 
         let captures = re
             .captures(sql)
             .ok_or_else(|| VelociError::ParseError("Invalid INSERT syntax".to_string()))?;
 
         let table_name = captures.get(1).unwrap().as_str().to_string();
-        
+
         let columns = captures.get(2).map(|m| {
             m.as_str()
                 .split(',')
@@ -555,18 +572,17 @@ impl Parser {
         let mut remaining = sql.trim().to_string();
 
         let limit_re = regex!(r"(?i)\s+LIMIT\s+(\d+)\s*;?\s*$");
-        let limit = if let Some(caps) = limit_re.captures(&remaining) {
-            let n = caps
-                .get(1)
-                .unwrap()
-                .as_str()
-                .parse::<u64>()
-                .map_err(|e| VelociError::ParseError(format!("Invalid LIMIT value: {}", e)))?;
-            remaining = limit_re.replace(&remaining, "").to_string();
-            Some(n)
-        } else {
-            None
-        };
+        let limit =
+            if let Some(caps) = limit_re.captures(&remaining) {
+                let n =
+                    caps.get(1).unwrap().as_str().parse::<u64>().map_err(|e| {
+                        VelociError::ParseError(format!("Invalid LIMIT value: {}", e))
+                    })?;
+                remaining = limit_re.replace(&remaining, "").to_string();
+                Some(n)
+            } else {
+                None
+            };
 
         // ORDER BY accepts either a column name or an arbitrary expression
         // (e.g. a vector distance function containing commas and parens), so
@@ -580,7 +596,11 @@ impl Parser {
                     .map(|m| m.end())
                     .ok_or_else(|| VelociError::ParseError("Invalid ORDER BY".to_string()))?
             };
-            let mut expr = clause[expr_start..].trim().trim_end_matches(';').trim().to_string();
+            let mut expr = clause[expr_start..]
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .to_string();
 
             let mut ascending = true;
             let upper_expr = expr.to_uppercase();
@@ -592,11 +612,16 @@ impl Parser {
             }
             let expr = expr.trim().to_string();
             if expr.is_empty() {
-                return Err(VelociError::ParseError("Empty ORDER BY expression".to_string()));
+                return Err(VelociError::ParseError(
+                    "Empty ORDER BY expression".to_string(),
+                ));
             }
 
             remaining = remaining[..idx].trim_end().to_string();
-            Some(OrderBy { column: expr, ascending })
+            Some(OrderBy {
+                column: expr,
+                ascending,
+            })
         } else {
             None
         };
@@ -640,7 +665,7 @@ impl Parser {
 
     fn parse_update(&self, sql: &str) -> Result<Statement> {
         // UPDATE users SET age = 31 WHERE name = 'Alice'
-        
+
         let re = regex!(r"(?i)UPDATE\s+(\w+)\s+SET\s+(.+?)(?:\s+WHERE\s+(.+))?$");
 
         let captures = re
@@ -680,7 +705,7 @@ impl Parser {
 
     fn parse_delete(&self, sql: &str) -> Result<Statement> {
         // DELETE FROM users WHERE id = 2
-        
+
         let re = regex!(r"(?i)DELETE\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?");
 
         let captures = re
@@ -710,9 +735,9 @@ impl Parser {
 
         for part in &parts {
             let part = part.trim();
-            let captures = re
-                .captures(part)
-                .ok_or_else(|| VelociError::ParseError(format!("Invalid WHERE condition: {}", part)))?;
+            let captures = re.captures(part).ok_or_else(|| {
+                VelociError::ParseError(format!("Invalid WHERE condition: {}", part))
+            })?;
 
             let column = captures.get(1).unwrap().as_str().to_string();
             let operator_str = captures.get(2).unwrap().as_str();
@@ -727,7 +752,10 @@ impl Parser {
         }
 
         if conditions.is_empty() {
-            return Err(VelociError::ParseError(format!("Empty WHERE clause: {}", clause)));
+            return Err(VelociError::ParseError(format!(
+                "Empty WHERE clause: {}",
+                clause
+            )));
         }
 
         Ok(WhereClause { conditions })
@@ -837,15 +865,14 @@ impl Parser {
         }
 
         // String (quoted) - handle escaped quotes
-        if (s.starts_with('\'') && s.ends_with('\''))
-            || (s.starts_with('"') && s.ends_with('"'))
-        {
+        if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
             let quote_char = s.chars().next().unwrap();
             let content = &s[1..s.len() - 1];
 
             // Handle escaped quotes
-            let unescaped = content.replace(&format!("\\{}", quote_char), &quote_char.to_string())
-                                   .replace("\\\\", "\\");
+            let unescaped = content
+                .replace(&format!("\\{}", quote_char), &quote_char.to_string())
+                .replace("\\\\", "\\");
 
             return Ok(Value::Text(unescaped));
         }
@@ -864,7 +891,9 @@ impl Parser {
         if s.len() >= 3 && (s.starts_with("X'") || s.starts_with("x'")) && s.ends_with('\'') {
             let hex_part = &s[2..s.len() - 1];
             if hex_part.len() % 2 != 0 {
-                return Err(VelociError::ParseError("Invalid BLOB literal: odd number of hex digits".to_string()));
+                return Err(VelociError::ParseError(
+                    "Invalid BLOB literal: odd number of hex digits".to_string(),
+                ));
             }
 
             let mut blob = Vec::new();
@@ -872,7 +901,12 @@ impl Parser {
                 let byte_str = &hex_part[i..i + 2];
                 match u8::from_str_radix(byte_str, 16) {
                     Ok(byte) => blob.push(byte),
-                    Err(_) => return Err(VelociError::ParseError(format!("Invalid hex digit in BLOB: {}", byte_str))),
+                    Err(_) => {
+                        return Err(VelociError::ParseError(format!(
+                            "Invalid hex digit in BLOB: {}",
+                            byte_str
+                        )))
+                    }
                 }
             }
             return Ok(Value::Blob(blob));
@@ -892,7 +926,11 @@ impl Parser {
                 '"' => '"',
                 '`' => '`',
                 '[' => ']',
-                _ => return Err(VelociError::ParseError("Invalid quote character".to_string())),
+                _ => {
+                    return Err(VelociError::ParseError(
+                        "Invalid quote character".to_string(),
+                    ))
+                }
             };
 
             let mut identifier = String::new();
@@ -900,7 +938,7 @@ impl Parser {
 
             // Iterate over chars with their byte positions
             let mut chars_iter = s.char_indices();
-            
+
             // Skip the opening quote
             chars_iter.next();
 
@@ -919,7 +957,9 @@ impl Parser {
                 }
             }
 
-            return Err(VelociError::ParseError("Unterminated quoted identifier".to_string()));
+            return Err(VelociError::ParseError(
+                "Unterminated quoted identifier".to_string(),
+            ));
         }
 
         // Unquoted identifier (stops at first whitespace)
@@ -1016,9 +1056,7 @@ mod tests {
     #[test]
     fn test_parse_select() {
         let parser = Parser::new();
-        let stmt = parser
-            .parse("SELECT * FROM users WHERE age > 25")
-            .unwrap();
+        let stmt = parser.parse("SELECT * FROM users WHERE age > 25").unwrap();
 
         match stmt {
             Statement::Select {
@@ -1069,7 +1107,12 @@ mod tests {
         let parser = Parser::new();
         let stmt = parser.parse("SELECT * FROM t ORDER BY id").unwrap();
         match stmt {
-            Statement::Select { order_by, limit, where_clause, .. } => {
+            Statement::Select {
+                order_by,
+                limit,
+                where_clause,
+                ..
+            } => {
                 let order = order_by.unwrap();
                 assert_eq!(order.column, "id");
                 assert!(order.ascending);
@@ -1085,7 +1128,12 @@ mod tests {
         let parser = Parser::new();
         let stmt = parser.parse("SELECT * FROM t LIMIT 3").unwrap();
         match stmt {
-            Statement::Select { limit, order_by, where_clause, .. } => {
+            Statement::Select {
+                limit,
+                order_by,
+                where_clause,
+                ..
+            } => {
                 assert_eq!(limit, Some(3));
                 assert!(order_by.is_none());
                 assert!(where_clause.is_none());
@@ -1132,4 +1180,3 @@ mod tests {
         }
     }
 }
-

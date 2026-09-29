@@ -32,7 +32,8 @@ fn test_data_survives_clean_reopen() {
 
     {
         let db = open_db(&path);
-        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO u VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO u VALUES (2, 'Bob')").unwrap();
         db.execute("INSERT INTO u VALUES (3, 'Charlie')").unwrap();
@@ -58,9 +59,11 @@ fn test_wal_is_truncated_after_clean_commits() {
 
     {
         let db = open_db(&path);
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         for i in 0..50 {
-            db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap();
+            db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+                .unwrap();
         }
         db.close().unwrap();
     }
@@ -81,9 +84,11 @@ fn test_torn_wal_tail_is_discarded() {
     // contains the schema.
     {
         let db = open_db(&path);
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         for i in 0..3 {
-            db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10)).unwrap();
+            db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10))
+                .unwrap();
         }
         db.close().unwrap(); // truncates WAL after each commit
     }
@@ -142,7 +147,8 @@ fn test_uncommitted_group_in_wal_is_skipped() {
     // Phase A: clean DB with some data.
     {
         let db = open_db(&path);
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
         db.close().unwrap();
     }
@@ -218,9 +224,11 @@ fn test_persistence_strong_assertions() {
 
     {
         let db = open_db(&path);
-        db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         for i in 0..500 {
-            db.execute(&format!("INSERT INTO big VALUES ({}, {})", i, i * 7)).unwrap();
+            db.execute(&format!("INSERT INTO big VALUES ({}, {})", i, i * 7))
+                .unwrap();
         }
         db.close().unwrap();
     }
@@ -250,7 +258,9 @@ fn crash(db: std::sync::Arc<Database>) {
 }
 
 fn wal_len(path: &std::path::Path) -> u64 {
-    std::fs::metadata(wal_path_for(path)).map(|m| m.len()).unwrap_or(0)
+    std::fs::metadata(wal_path_for(path))
+        .map(|m| m.len())
+        .unwrap_or(0)
 }
 
 fn ids(db: &Database) -> Vec<i64> {
@@ -272,9 +282,11 @@ fn test_committed_but_not_checkpointed_survives_crash() {
     let data_len_before;
     {
         let db = open_db(&path);
-        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
         for i in 0..50 {
-            db.execute(&format!("INSERT INTO u VALUES ({}, 'n{}')", i, i)).unwrap();
+            db.execute(&format!("INSERT INTO u VALUES ({}, 'n{}')", i, i))
+                .unwrap();
         }
         db.execute("DELETE FROM u WHERE id = 7").unwrap();
         db.execute("UPDATE u SET name = 'x' WHERE id = 8").unwrap();
@@ -301,11 +313,13 @@ fn test_uncommitted_transaction_lost_on_crash() {
     let path = dir.path().join("txn_crash.db");
     {
         let db = open_db(&path);
-        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO u VALUES (1, 'a')").unwrap();
         db.begin().unwrap();
         for i in 2..200 {
-            db.execute(&format!("INSERT INTO u VALUES ({}, 'n')", i)).unwrap();
+            db.execute(&format!("INSERT INTO u VALUES ({}, 'n')", i))
+                .unwrap();
         }
         crash(db);
     }
@@ -321,12 +335,14 @@ fn test_wal_is_checkpointed_when_large() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("ckpt_size.db");
     let db = open_db(&path);
-    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
     let per_commit = (PAGE_SIZE + 64) as u64; // at least one page image each
     let commits = (3 * CHECKPOINT_WAL_BYTES / per_commit) as i64;
     let mut max_wal = 0;
     for i in 0..commits {
-        db.execute(&format!("INSERT INTO u VALUES ({}, 'row{}')", i, i)).unwrap();
+        db.execute(&format!("INSERT INTO u VALUES ({}, 'row{}')", i, i))
+            .unwrap();
         max_wal = max_wal.max(wal_len(&path));
     }
     assert!(
@@ -348,15 +364,20 @@ fn test_commits_after_torn_tail_recovery_survive_next_crash() {
     let path = dir.path().join("torn_then_commit.db");
     {
         let db = open_db(&path);
-        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO u VALUES (1, 'a')").unwrap();
         // Clean close: checkpointed, WAL empty.
     }
     assert_eq!(wal_len(&path), 0);
     {
         // The WAL now holds nothing but a torn record (a crash mid-append).
-        let mut f = OpenOptions::new().append(true).open(wal_path_for(&path)).unwrap();
-        f.write_all(&[1u8, 99, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]).unwrap();
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(wal_path_for(&path))
+            .unwrap();
+        f.write_all(&[1u8, 99, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff])
+            .unwrap();
     }
     {
         let db = open_db(&path);
@@ -375,14 +396,16 @@ fn test_repeated_crashes_between_commits() {
     let path = dir.path().join("many_crashes.db");
     {
         let db = open_db(&path);
-        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
         crash(db);
     }
     for round in 0..5i64 {
         let db = open_db(&path);
         assert_eq!(ids(&db), (0..round * 20).collect::<Vec<_>>());
         for i in round * 20..(round + 1) * 20 {
-            db.execute(&format!("INSERT INTO u VALUES ({}, 'r{}')", i, round)).unwrap();
+            db.execute(&format!("INSERT INTO u VALUES ({}, 'r{}')", i, round))
+                .unwrap();
         }
         crash(db);
     }

@@ -51,7 +51,9 @@ impl NodeHeader {
     pub fn deserialize(buffer: &[u8]) -> Result<Self> {
         if buffer.len() < Self::SIZE {
             return Err(VelociError::Corruption(format!(
-                "Buffer too small for NodeHeader: {} < {}", buffer.len(), Self::SIZE
+                "Buffer too small for NodeHeader: {} < {}",
+                buffer.len(),
+                Self::SIZE
             )));
         }
 
@@ -82,11 +84,17 @@ impl BTree {
 
         drop(pager_lock);
 
-        Ok(Self { root_page: Arc::new(RwLock::new(root_page)), pager })
+        Ok(Self {
+            root_page: Arc::new(RwLock::new(root_page)),
+            pager,
+        })
     }
 
     pub fn from_root(root_page: PageId, pager: Arc<RwLock<Pager>>) -> Self {
-        Self { root_page: Arc::new(RwLock::new(root_page)), pager }
+        Self {
+            root_page: Arc::new(RwLock::new(root_page)),
+            pager,
+        }
     }
 
     pub fn insert(&mut self, key: i64, row: &Row) -> Result<()> {
@@ -117,10 +125,10 @@ impl BTree {
         let leaf_page_id = self.find_leaf(&mut pager, root_page, key)?;
         let page_arc = pager.read_page(leaf_page_id)?;
         let page = page_arc.read();
-        
+
         let header = NodeHeader::deserialize(page.data())?;
         let num_keys = header.num_keys as usize;
-        
+
         // Binary search for the key
         let mut offset = NodeHeader::SIZE;
         for _ in 0..num_keys {
@@ -129,23 +137,23 @@ impl BTree {
                     .try_into()
                     .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
             );
-            
+
             let size = u32::from_le_bytes(
                 page.data()[offset + 8..offset + 12]
                     .try_into()
                     .map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
             ) as usize;
-            
+
             if stored_key == key {
                 let data_start = offset + 12;
                 let data_end = data_start + size;
                 let data = &page.data()[data_start..data_end];
                 return Ok(Some(self.deserialize_row(data)?));
             }
-            
+
             offset += 12 + size;
         }
-        
+
         Ok(None)
     }
 
@@ -212,11 +220,10 @@ impl BTree {
                 // Skip the key (8 bytes)
                 offset += 8;
 
-                let child = u64::from_le_bytes(
-                    page_data[offset..offset + 8]
-                        .try_into()
-                        .map_err(|_| VelociError::Corruption("Invalid child pointer".to_string()))?,
-                ) as PageId;
+                let child =
+                    u64::from_le_bytes(page_data[offset..offset + 8].try_into().map_err(|_| {
+                        VelociError::Corruption("Invalid child pointer".to_string())
+                    })?) as PageId;
                 offset += 8;
 
                 self.scan_node(child, results)?;
@@ -232,58 +239,58 @@ impl BTree {
 
         let leaf_page_id = self.find_leaf(&mut pager, root_page, key)?;
         let page_arc = pager.read_page(leaf_page_id)?;
-        
+
         // Clone the page data to work with
         let mut page_clone = {
             let page = page_arc.read();
             page.clone()
         };
-        
+
         let mut header = NodeHeader::deserialize(page_clone.data())?;
-        
+
         // Find and remove the key
         let mut offset = NodeHeader::SIZE;
         let mut found = false;
         let mut delete_offset = 0;
         let mut delete_size = 0;
-        
+
         for _ in 0..header.num_keys {
             let stored_key = i64::from_le_bytes(
                 page_clone.data()[offset..offset + 8]
                     .try_into()
                     .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
             );
-            
+
             let size = u32::from_le_bytes(
                 page_clone.data()[offset + 8..offset + 12]
                     .try_into()
                     .map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
             ) as usize;
-            
+
             if stored_key == key {
                 found = true;
                 delete_offset = offset;
                 delete_size = 12 + size;
                 break;
             }
-            
+
             offset += 12 + size;
         }
-        
+
         if !found {
             return Ok(false);
         }
-        
+
         // Shift remaining data
         let data = page_clone.data_mut();
         let end_offset = self.find_data_end(&header, data)?;
         if delete_offset + delete_size < end_offset {
             data.copy_within(delete_offset + delete_size..end_offset, delete_offset);
         }
-        
+
         header.num_keys -= 1;
         header.serialize(data);
-        
+
         // Write back
         pager.write_page(leaf_page_id, &page_clone)?;
 
@@ -292,11 +299,16 @@ impl BTree {
             drop(page_arc);
             self.handle_leaf_underflow(&mut pager, leaf_page_id, root_page)?;
         }
-        
+
         Ok(true)
     }
 
-    fn handle_leaf_underflow(&self, pager: &mut Pager, page_id: PageId, root_page: PageId) -> Result<()> {
+    fn handle_leaf_underflow(
+        &self,
+        pager: &mut Pager,
+        page_id: PageId,
+        root_page: PageId,
+    ) -> Result<()> {
         let page_arc = pager.read_page(page_id)?;
         let header = {
             let page = page_arc.read();
@@ -336,29 +348,55 @@ impl BTree {
         };
 
         if sibling_count > MIN_KEYS {
-            self.redistribute_from_sibling(pager, page_id, sibling_id, parent_id, separator_key, sibling_is_left)?;
+            self.redistribute_from_sibling(
+                pager,
+                page_id,
+                sibling_id,
+                parent_id,
+                separator_key,
+                sibling_is_left,
+            )?;
         } else {
-            self.merge_leaves(pager, page_id, sibling_id, parent_id, separator_key, root_page, sibling_is_left)?;
+            self.merge_leaves(
+                pager,
+                page_id,
+                sibling_id,
+                parent_id,
+                separator_key,
+                root_page,
+                sibling_is_left,
+            )?;
         }
 
         Ok(())
     }
 
-    fn find_sibling_info(&self, parent_page: &Page, parent_header: &NodeHeader, child_id: PageId) -> Result<(PageId, i64, bool)> {
+    fn find_sibling_info(
+        &self,
+        parent_page: &Page,
+        parent_header: &NodeHeader,
+        child_id: PageId,
+    ) -> Result<(PageId, i64, bool)> {
         let data = parent_page.data();
 
         let mut offset = NodeHeader::SIZE;
         let first_child = u64::from_le_bytes(
-            data[offset..offset + 8].try_into().map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
+            data[offset..offset + 8]
+                .try_into()
+                .map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
         ) as PageId;
         offset += 8;
 
         if first_child == child_id {
             let separator = i64::from_le_bytes(
-                data[offset..offset + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+                data[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
             );
             let sibling = u64::from_le_bytes(
-                data[offset + 8..offset + 16].try_into().map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
+                data[offset + 8..offset + 16]
+                    .try_into()
+                    .map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
             ) as PageId;
             // child is first, sibling is to the right
             return Ok((sibling, separator, false));
@@ -367,10 +405,14 @@ impl BTree {
         let mut prev_child = first_child;
         for _ in 0..parent_header.num_keys {
             let key = i64::from_le_bytes(
-                data[offset..offset + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+                data[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
             );
             let next_child = u64::from_le_bytes(
-                data[offset + 8..offset + 16].try_into().map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
+                data[offset + 8..offset + 16]
+                    .try_into()
+                    .map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
             ) as PageId;
 
             if next_child == child_id {
@@ -385,7 +427,15 @@ impl BTree {
         Ok((0, 0, false))
     }
 
-    fn redistribute_from_sibling(&self, pager: &mut Pager, page_id: PageId, sibling_id: PageId, parent_id: PageId, separator_key: i64, sibling_is_left: bool) -> Result<()> {
+    fn redistribute_from_sibling(
+        &self,
+        pager: &mut Pager,
+        page_id: PageId,
+        sibling_id: PageId,
+        parent_id: PageId,
+        separator_key: i64,
+        sibling_is_left: bool,
+    ) -> Result<()> {
         let sibling_arc = pager.read_page(sibling_id)?;
         let (stolen_key, stolen_data) = {
             let sibling_page = sibling_arc.read();
@@ -401,10 +451,14 @@ impl BTree {
             } else {
                 // Steal the first entry from right sibling
                 let key = i64::from_le_bytes(
-                    data[NodeHeader::SIZE..NodeHeader::SIZE + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+                    data[NodeHeader::SIZE..NodeHeader::SIZE + 8]
+                        .try_into()
+                        .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
                 );
                 let size = u32::from_le_bytes(
-                    data[NodeHeader::SIZE + 8..NodeHeader::SIZE + 12].try_into().map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
+                    data[NodeHeader::SIZE + 8..NodeHeader::SIZE + 12]
+                        .try_into()
+                        .map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
                 ) as usize;
                 let entry_data = data[NodeHeader::SIZE + 12..NodeHeader::SIZE + 12 + size].to_vec();
                 (NodeHeader::SIZE, key, size, entry_data)
@@ -433,24 +487,34 @@ impl BTree {
             let end_offset = self.find_data_end(&header, page_clone.data())?;
             let entry_size = 12 + stolen_data.len();
             if end_offset + entry_size > PAGE_SIZE {
-                return Err(VelociError::StorageError("Cannot redistribute: target page full".to_string()));
+                return Err(VelociError::StorageError(
+                    "Cannot redistribute: target page full".to_string(),
+                ));
             }
 
             if sibling_is_left {
                 // Prepend: shift existing data right to make room at the beginning
                 let existing_start = NodeHeader::SIZE;
                 let existing_end = end_offset;
-                page_clone.data_mut().copy_within(existing_start..existing_end, existing_start + entry_size);
+                page_clone
+                    .data_mut()
+                    .copy_within(existing_start..existing_end, existing_start + entry_size);
                 let offset = existing_start;
-                page_clone.data_mut()[offset..offset + 8].copy_from_slice(&stolen_key.to_le_bytes());
-                page_clone.data_mut()[offset + 8..offset + 12].copy_from_slice(&(stolen_data.len() as u32).to_le_bytes());
-                page_clone.data_mut()[offset + 12..offset + 12 + stolen_data.len()].copy_from_slice(&stolen_data);
+                page_clone.data_mut()[offset..offset + 8]
+                    .copy_from_slice(&stolen_key.to_le_bytes());
+                page_clone.data_mut()[offset + 8..offset + 12]
+                    .copy_from_slice(&(stolen_data.len() as u32).to_le_bytes());
+                page_clone.data_mut()[offset + 12..offset + 12 + stolen_data.len()]
+                    .copy_from_slice(&stolen_data);
             } else {
                 // Append at end (current behavior)
                 let offset = end_offset;
-                page_clone.data_mut()[offset..offset + 8].copy_from_slice(&stolen_key.to_le_bytes());
-                page_clone.data_mut()[offset + 8..offset + 12].copy_from_slice(&(stolen_data.len() as u32).to_le_bytes());
-                page_clone.data_mut()[offset + 12..offset + 12 + stolen_data.len()].copy_from_slice(&stolen_data);
+                page_clone.data_mut()[offset..offset + 8]
+                    .copy_from_slice(&stolen_key.to_le_bytes());
+                page_clone.data_mut()[offset + 8..offset + 12]
+                    .copy_from_slice(&(stolen_data.len() as u32).to_le_bytes());
+                page_clone.data_mut()[offset + 12..offset + 12 + stolen_data.len()]
+                    .copy_from_slice(&stolen_data);
             }
 
             let mut new_header = header;
@@ -466,7 +530,9 @@ impl BTree {
             let page_header = NodeHeader::deserialize(page_arc.read().data())?;
             if page_header.num_keys > 0 {
                 let new_first = i64::from_le_bytes(
-                    page_arc.read().data()[NodeHeader::SIZE..NodeHeader::SIZE + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+                    page_arc.read().data()[NodeHeader::SIZE..NodeHeader::SIZE + 8]
+                        .try_into()
+                        .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
                 );
                 self.update_parent_key(pager, parent_id, separator_key, new_first)?;
             }
@@ -476,7 +542,9 @@ impl BTree {
             let sibling_header = NodeHeader::deserialize(sibling_arc.read().data())?;
             if sibling_header.num_keys > 0 {
                 let new_separator = i64::from_le_bytes(
-                    sibling_arc.read().data()[NodeHeader::SIZE..NodeHeader::SIZE + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+                    sibling_arc.read().data()[NodeHeader::SIZE..NodeHeader::SIZE + 8]
+                        .try_into()
+                        .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
                 );
                 self.update_parent_key(pager, parent_id, separator_key, new_separator)?;
             }
@@ -485,14 +553,23 @@ impl BTree {
         Ok(())
     }
 
-    fn read_entry_at_index(&self, data: &[u8], start_offset: usize, index: usize) -> Result<(i64, usize, Vec<u8>, usize)> {
+    fn read_entry_at_index(
+        &self,
+        data: &[u8],
+        start_offset: usize,
+        index: usize,
+    ) -> Result<(i64, usize, Vec<u8>, usize)> {
         let mut offset = start_offset;
         for i in 0..=index {
             let key = i64::from_le_bytes(
-                data[offset..offset + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+                data[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
             );
             let size = u32::from_le_bytes(
-                data[offset + 8..offset + 12].try_into().map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
+                data[offset + 8..offset + 12]
+                    .try_into()
+                    .map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
             ) as usize;
             if i == index {
                 let entry_data = data[offset + 12..offset + 12 + size].to_vec();
@@ -500,10 +577,18 @@ impl BTree {
             }
             offset += 12 + size;
         }
-        Err(VelociError::Corruption("Entry index out of bounds".to_string()))
+        Err(VelociError::Corruption(
+            "Entry index out of bounds".to_string(),
+        ))
     }
 
-    fn update_parent_key(&self, pager: &mut Pager, parent_id: PageId, old_key: i64, new_key: i64) -> Result<()> {
+    fn update_parent_key(
+        &self,
+        pager: &mut Pager,
+        parent_id: PageId,
+        old_key: i64,
+        new_key: i64,
+    ) -> Result<()> {
         let parent_arc = pager.read_page(parent_id)?;
         let mut parent_clone = parent_arc.read().clone();
         let parent_header = NodeHeader::deserialize(parent_clone.data())?;
@@ -511,7 +596,11 @@ impl BTree {
         let mut offset = NodeHeader::SIZE + 8; // skip first child
         for _ in 0..parent_header.num_keys {
             let key_bytes = &mut parent_clone.data_mut()[offset..offset + 8];
-            let current = i64::from_le_bytes(key_bytes.try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?);
+            let current = i64::from_le_bytes(
+                key_bytes
+                    .try_into()
+                    .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+            );
             if current == old_key {
                 key_bytes.copy_from_slice(&new_key.to_le_bytes());
                 break;
@@ -524,7 +613,16 @@ impl BTree {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn merge_leaves(&self, pager: &mut Pager, page_id: PageId, sibling_id: PageId, parent_id: PageId, _separator_key: i64, root_page: PageId, sibling_is_left: bool) -> Result<()> {
+    fn merge_leaves(
+        &self,
+        pager: &mut Pager,
+        page_id: PageId,
+        sibling_id: PageId,
+        parent_id: PageId,
+        _separator_key: i64,
+        root_page: PageId,
+        sibling_is_left: bool,
+    ) -> Result<()> {
         // Canonical merge: always merge right page into left page
         let (left_id, right_id) = if sibling_is_left {
             (sibling_id, page_id)
@@ -541,10 +639,14 @@ impl BTree {
             let mut offset = NodeHeader::SIZE;
             for _ in 0..right_header.num_keys {
                 let key = i64::from_le_bytes(
-                    right_page.data()[offset..offset + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
+                    right_page.data()[offset..offset + 8]
+                        .try_into()
+                        .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
                 );
                 let size = u32::from_le_bytes(
-                    right_page.data()[offset + 8..offset + 12].try_into().map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
+                    right_page.data()[offset + 8..offset + 12]
+                        .try_into()
+                        .map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
                 ) as usize;
                 let data = right_page.data()[offset + 12..offset + 12 + size].to_vec();
                 entries.push((key, data));
@@ -563,11 +665,16 @@ impl BTree {
                 let end_offset = self.find_data_end(&header, left_clone.data())?;
                 let entry_size = 12 + data.len();
                 if end_offset + entry_size > PAGE_SIZE {
-                    return Err(VelociError::StorageError("Cannot merge: target page full".to_string()));
+                    return Err(VelociError::StorageError(
+                        "Cannot merge: target page full".to_string(),
+                    ));
                 }
-                left_clone.data_mut()[end_offset..end_offset + 8].copy_from_slice(&key.to_le_bytes());
-                left_clone.data_mut()[end_offset + 8..end_offset + 12].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                left_clone.data_mut()[end_offset + 12..end_offset + 12 + data.len()].copy_from_slice(data);
+                left_clone.data_mut()[end_offset..end_offset + 8]
+                    .copy_from_slice(&key.to_le_bytes());
+                left_clone.data_mut()[end_offset + 8..end_offset + 12]
+                    .copy_from_slice(&(data.len() as u32).to_le_bytes());
+                left_clone.data_mut()[end_offset + 12..end_offset + 12 + data.len()]
+                    .copy_from_slice(data);
                 header.num_keys += 1;
             }
             header.serialize(left_clone.data_mut());
@@ -580,30 +687,42 @@ impl BTree {
         Ok(())
     }
 
-    fn remove_child_from_parent(&self, pager: &mut Pager, parent_id: PageId, child_id: PageId, root_page: PageId) -> Result<()> {
+    fn remove_child_from_parent(
+        &self,
+        pager: &mut Pager,
+        parent_id: PageId,
+        child_id: PageId,
+        root_page: PageId,
+    ) -> Result<()> {
         let parent_arc = pager.read_page(parent_id)?;
         let mut parent_clone = parent_arc.read().clone();
         let parent_header = NodeHeader::deserialize(parent_clone.data())?;
 
         let mut offset = NodeHeader::SIZE;
         let first_child = u64::from_le_bytes(
-            parent_clone.data()[offset..offset + 8].try_into().map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
+            parent_clone.data()[offset..offset + 8]
+                .try_into()
+                .map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
         ) as PageId;
         offset += 8;
 
         if first_child == child_id {
             // Remove first child + first key
             let end = NodeHeader::SIZE + 8 + (parent_header.num_keys as usize * 16);
-            parent_clone.data_mut().copy_within(NodeHeader::SIZE + 16..end, NodeHeader::SIZE);
+            parent_clone
+                .data_mut()
+                .copy_within(NodeHeader::SIZE + 16..end, NodeHeader::SIZE);
             let mut new_header = parent_header.clone();
             new_header.num_keys -= 1;
             new_header.serialize(parent_clone.data_mut());
             pager.write_page(parent_id, &parent_clone)?;
-        
+
             // If parent becomes the root and has no keys, promote the remaining child
             if parent_id == root_page && new_header.num_keys == 0 {
                 let new_root = u64::from_le_bytes(
-                    parent_clone.data()[NodeHeader::SIZE..NodeHeader::SIZE + 8].try_into().map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
+                    parent_clone.data()[NodeHeader::SIZE..NodeHeader::SIZE + 8]
+                        .try_into()
+                        .map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
                 ) as PageId;
                 *self.root_page.write() = new_root;
             }
@@ -612,13 +731,17 @@ impl BTree {
 
         for _ in 0..parent_header.num_keys {
             let next_child = u64::from_le_bytes(
-                parent_clone.data()[offset + 8..offset + 16].try_into().map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
+                parent_clone.data()[offset + 8..offset + 16]
+                    .try_into()
+                    .map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
             ) as PageId;
 
             if next_child == child_id {
                 // Remove key at `i` and child at `i+1` (at offset + 8)
                 let end = NodeHeader::SIZE + 8 + (parent_header.num_keys as usize * 16);
-                parent_clone.data_mut().copy_within(offset + 16..end, offset);
+                parent_clone
+                    .data_mut()
+                    .copy_within(offset + 16..end, offset);
                 let mut new_header = parent_header.clone();
                 new_header.num_keys -= 1;
                 new_header.serialize(parent_clone.data_mut());
@@ -627,7 +750,9 @@ impl BTree {
                 // Handle root with no keys
                 if parent_id == root_page && new_header.num_keys == 0 {
                     let new_root = u64::from_le_bytes(
-                        parent_clone.data()[NodeHeader::SIZE..NodeHeader::SIZE + 8].try_into().map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
+                        parent_clone.data()[NodeHeader::SIZE..NodeHeader::SIZE + 8]
+                            .try_into()
+                            .map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
                     ) as PageId;
                     *self.root_page.write() = new_root;
                 } else if parent_id != root_page && (new_header.num_keys as usize) < MIN_KEYS {
@@ -641,7 +766,12 @@ impl BTree {
         Ok(())
     }
 
-    fn handle_internal_underflow(&self, pager: &mut Pager, page_id: PageId, root_page: PageId) -> Result<()> {
+    fn handle_internal_underflow(
+        &self,
+        pager: &mut Pager,
+        page_id: PageId,
+        root_page: PageId,
+    ) -> Result<()> {
         let page_arc = pager.read_page(page_id)?;
         let header = {
             let page = page_arc.read();
@@ -677,9 +807,24 @@ impl BTree {
         };
 
         if sibling_keys > MIN_KEYS {
-            self.redistribute_internal(pager, page_id, sibling_id, parent_id, separator_key, sibling_is_left)?;
+            self.redistribute_internal(
+                pager,
+                page_id,
+                sibling_id,
+                parent_id,
+                separator_key,
+                sibling_is_left,
+            )?;
         } else {
-            self.merge_internal(pager, page_id, sibling_id, parent_id, separator_key, root_page, sibling_is_left)?;
+            self.merge_internal(
+                pager,
+                page_id,
+                sibling_id,
+                parent_id,
+                separator_key,
+                root_page,
+                sibling_is_left,
+            )?;
         }
 
         Ok(())
@@ -687,7 +832,11 @@ impl BTree {
 
     /// Reads an internal node's keys and child pointers into vectors for easier
     /// manipulation during merge/redistribute.
-    fn parse_internal_node(&self, data: &[u8], header: &NodeHeader) -> Result<(Vec<i64>, Vec<PageId>)> {
+    fn parse_internal_node(
+        &self,
+        data: &[u8],
+        header: &NodeHeader,
+    ) -> Result<(Vec<i64>, Vec<PageId>)> {
         let mut keys = Vec::with_capacity(header.num_keys as usize);
         let mut children = Vec::with_capacity(header.num_keys as usize + 1);
         let mut offset = NodeHeader::SIZE;
@@ -721,7 +870,12 @@ impl BTree {
 
     /// Writes the body of an internal node (children + interleaved keys). The
     /// caller is responsible for writing the `NodeHeader`.
-    fn write_internal_body(&self, page: &mut Page, keys: &[i64], children: &[PageId]) -> Result<()> {
+    fn write_internal_body(
+        &self,
+        page: &mut Page,
+        keys: &[i64],
+        children: &[PageId],
+    ) -> Result<()> {
         if children.len() != keys.len() + 1 {
             return Err(VelociError::Corruption(format!(
                 "Internal node invariant violated: {} keys but {} children",
@@ -777,9 +931,9 @@ impl BTree {
             let stolen_child = new_sibling_children.pop().ok_or_else(|| {
                 VelociError::Corruption("Left sibling has no children".to_string())
             })?;
-            let new_separator = new_sibling_keys.pop().ok_or_else(|| {
-                VelociError::Corruption("Left sibling has no keys".to_string())
-            })?;
+            let new_separator = new_sibling_keys
+                .pop()
+                .ok_or_else(|| VelociError::Corruption("Left sibling has no keys".to_string()))?;
             // The old parent separator descends into this node as the new
             // leftmost key, and the borrowed child becomes the leftmost child.
             node_keys.insert(0, separator_key);
@@ -896,16 +1050,16 @@ impl BTree {
 
     fn find_leaf(&self, pager: &mut Pager, root_page: PageId, key: i64) -> Result<PageId> {
         let mut page_id = root_page;
-        
+
         loop {
             let page_arc = pager.read_page(page_id)?;
             let page = page_arc.read();
             let header = NodeHeader::deserialize(page.data())?;
-            
+
             if header.node_type == NodeType::Leaf as u8 {
                 return Ok(page_id);
             }
-            
+
             // Internal node - find the child to descend to
             // Format: [child (8 bytes)][key (8 bytes)][child (8 bytes)][key (8 bytes)]...
             let mut offset = NodeHeader::SIZE;
@@ -914,71 +1068,76 @@ impl BTree {
                     .try_into()
                     .map_err(|_| VelociError::Corruption("Invalid child pointer".to_string()))?,
             ) as PageId;
-            
+
             offset += 8;
-            
+
             for _ in 0..header.num_keys {
                 let stored_key = i64::from_le_bytes(
                     page.data()[offset..offset + 8]
                         .try_into()
                         .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
                 );
-                
-                let next_child = u64::from_le_bytes(
-                    page.data()[offset + 8..offset + 16]
-                        .try_into()
-                        .map_err(|_| VelociError::Corruption("Invalid child pointer".to_string()))?,
-                ) as PageId;
-                
+
+                let next_child =
+                    u64::from_le_bytes(page.data()[offset + 8..offset + 16].try_into().map_err(
+                        |_| VelociError::Corruption("Invalid child pointer".to_string()),
+                    )?) as PageId;
+
                 if key < stored_key {
                     break;
                 }
-                
+
                 child_page = next_child;
                 offset += 16;
             }
-            
+
             page_id = child_page;
         }
     }
 
-    fn insert_into_leaf(&self, pager: &mut Pager, page_id: PageId, key: i64, data: &[u8]) -> Result<Option<PageId>> {
+    fn insert_into_leaf(
+        &self,
+        pager: &mut Pager,
+        page_id: PageId,
+        key: i64,
+        data: &[u8],
+    ) -> Result<Option<PageId>> {
         let page_arc = pager.read_page(page_id)?;
-        
+
         // Clone the page data to work with
         let mut page_clone = {
             let page = page_arc.read();
             page.clone()
         };
-        
+
         let mut header = NodeHeader::deserialize(page_clone.data())?;
-        
+
         // Find insertion point
         let mut insert_offset = NodeHeader::SIZE;
         let mut offset = NodeHeader::SIZE;
-        
+
         for _ in 0..header.num_keys {
             let stored_key = i64::from_le_bytes(
                 page_clone.data()[offset..offset + 8]
                     .try_into()
                     .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
             );
-            
+
             let size = u32::from_le_bytes(
                 page_clone.data()[offset + 8..offset + 12]
                     .try_into()
                     .map_err(|_| VelociError::Corruption("Invalid size".to_string()))?,
             ) as usize;
-            
+
             if key < stored_key {
                 insert_offset = offset;
                 break;
             }
-            
+
             offset += 12 + size;
             insert_offset = offset;
         }
-        
+
         // Check if we have space
         let required_space = 12 + data.len();
         let end_offset = self.find_data_end(&header, page_clone.data())?;
@@ -997,21 +1156,22 @@ impl BTree {
 
             return Ok(new_root);
         }
-        
+
         // Make room for new entry
         let page_data = page_clone.data_mut();
         if insert_offset < end_offset {
             page_data.copy_within(insert_offset..end_offset, insert_offset + required_space);
         }
-        
+
         // Write new entry
         page_data[insert_offset..insert_offset + 8].copy_from_slice(&key.to_le_bytes());
-        page_data[insert_offset + 8..insert_offset + 12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        page_data[insert_offset + 8..insert_offset + 12]
+            .copy_from_slice(&(data.len() as u32).to_le_bytes());
         page_data[insert_offset + 12..insert_offset + 12 + data.len()].copy_from_slice(data);
-        
+
         header.num_keys += 1;
         header.serialize(page_data);
-        
+
         // Write back
         pager.write_page(page_id, &page_clone)?;
 
@@ -1023,19 +1183,27 @@ impl BTree {
 
         for i in 0..header.num_keys {
             if offset + 12 > PAGE_SIZE {
-                return Err(VelociError::Corruption(format!("Invalid offset {} for key {}", offset, i)));
+                return Err(VelociError::Corruption(format!(
+                    "Invalid offset {} for key {}",
+                    offset, i
+                )));
             }
 
-            let size_bytes = data.get(offset + 8..offset + 12)
-                .ok_or_else(|| VelociError::Corruption(format!("Cannot read size for key {}", i)))?;
+            let size_bytes = data.get(offset + 8..offset + 12).ok_or_else(|| {
+                VelociError::Corruption(format!("Cannot read size for key {}", i))
+            })?;
 
-            let size = u32::from_le_bytes(size_bytes.try_into()
-                .map_err(|_| VelociError::Corruption(format!("Invalid size bytes for key {}", i)))?) as usize;
+            let size = u32::from_le_bytes(size_bytes.try_into().map_err(|_| {
+                VelociError::Corruption(format!("Invalid size bytes for key {}", i))
+            })?) as usize;
 
             offset += 12 + size;
 
             if offset > PAGE_SIZE {
-                return Err(VelociError::Corruption(format!("Data end offset {} exceeds page size", offset)));
+                return Err(VelociError::Corruption(format!(
+                    "Data end offset {} exceeds page size",
+                    offset
+                )));
             }
         }
 
@@ -1089,8 +1257,10 @@ impl BTree {
             let (key, data) = entry;
             let entry_size = 12 + data.len();
             left_page.data_mut()[left_offset..left_offset + 8].copy_from_slice(&key.to_le_bytes());
-            left_page.data_mut()[left_offset + 8..left_offset + 12].copy_from_slice(&(data.len() as u32).to_le_bytes());
-            left_page.data_mut()[left_offset + 12..left_offset + 12 + data.len()].copy_from_slice(data);
+            left_page.data_mut()[left_offset + 8..left_offset + 12]
+                .copy_from_slice(&(data.len() as u32).to_le_bytes());
+            left_page.data_mut()[left_offset + 12..left_offset + 12 + data.len()]
+                .copy_from_slice(data);
             left_offset += entry_size;
             left_keys += 1;
         }
@@ -1105,9 +1275,12 @@ impl BTree {
         for entry in entries.iter().skip(split_index) {
             let (key, data) = entry;
             let entry_size = 12 + data.len();
-            sibling_page.data_mut()[right_offset..right_offset + 8].copy_from_slice(&key.to_le_bytes());
-            sibling_page.data_mut()[right_offset + 8..right_offset + 12].copy_from_slice(&(data.len() as u32).to_le_bytes());
-            sibling_page.data_mut()[right_offset + 12..right_offset + 12 + data.len()].copy_from_slice(data);
+            sibling_page.data_mut()[right_offset..right_offset + 8]
+                .copy_from_slice(&key.to_le_bytes());
+            sibling_page.data_mut()[right_offset + 8..right_offset + 12]
+                .copy_from_slice(&(data.len() as u32).to_le_bytes());
+            sibling_page.data_mut()[right_offset + 12..right_offset + 12 + data.len()]
+                .copy_from_slice(data);
             right_offset += entry_size;
             right_keys += 1;
         }
@@ -1119,7 +1292,13 @@ impl BTree {
         Ok((sibling_page_id, split_key))
     }
 
-    fn insert_into_parent(&self, pager: &mut Pager, left_page: PageId, right_page: PageId, split_key: i64) -> Result<Option<PageId>> {
+    fn insert_into_parent(
+        &self,
+        pager: &mut Pager,
+        left_page: PageId,
+        right_page: PageId,
+        split_key: i64,
+    ) -> Result<Option<PageId>> {
         // Get parent of left page
         let left_page_data = pager.read_page(left_page)?;
         let left_header = NodeHeader::deserialize(left_page_data.read().data())?;
@@ -1129,13 +1308,25 @@ impl BTree {
             Some(self.create_new_root(pager, left_page, right_page, split_key)?)
         } else {
             // Insert into existing parent (may cause recursive splits and new root)
-            self.insert_into_internal(pager, left_header.parent as u64, left_page, right_page, split_key)?
+            self.insert_into_internal(
+                pager,
+                left_header.parent as u64,
+                left_page,
+                right_page,
+                split_key,
+            )?
         };
 
         Ok(new_root)
     }
 
-    fn create_new_root(&self, pager: &mut Pager, left_page: PageId, right_page: PageId, split_key: i64) -> Result<PageId> {
+    fn create_new_root(
+        &self,
+        pager: &mut Pager,
+        left_page: PageId,
+        right_page: PageId,
+        split_key: i64,
+    ) -> Result<PageId> {
         // Allocate new root page
         let root_page_id = pager.allocate_page()?;
         let mut root_page = Page::new();
@@ -1175,7 +1366,12 @@ impl BTree {
 
     /// Reads the page, updates its `parent` field, and writes it back through
     /// the pager so the change is durable (logged in the WAL).
-    fn set_parent_pointer(&self, pager: &mut Pager, page_id: PageId, new_parent: u32) -> Result<()> {
+    fn set_parent_pointer(
+        &self,
+        pager: &mut Pager,
+        page_id: PageId,
+        new_parent: u32,
+    ) -> Result<()> {
         let arc = pager.read_page(page_id)?;
         let mut page = arc.read().clone();
         let mut header = NodeHeader::deserialize(page.data())?;
@@ -1188,7 +1384,14 @@ impl BTree {
         Ok(())
     }
 
-    fn insert_into_internal(&self, pager: &mut Pager, page_id: PageId, left_page: PageId, right_page: PageId, key: i64) -> Result<Option<PageId>> {
+    fn insert_into_internal(
+        &self,
+        pager: &mut Pager,
+        page_id: PageId,
+        left_page: PageId,
+        right_page: PageId,
+        key: i64,
+    ) -> Result<Option<PageId>> {
         // Update right_page parent pointer to this page through write_page so
         // the change is durable. (Pre-WAL versions mutated the cache directly
         // and lost the update on eviction.)
@@ -1228,12 +1431,14 @@ impl BTree {
 
         // Make room for new entry (key + child pointer = 16 bytes)
         if insert_offset < end_offset {
-            page.data_mut().copy_within(insert_offset..end_offset, insert_offset + 16);
+            page.data_mut()
+                .copy_within(insert_offset..end_offset, insert_offset + 16);
         }
 
         // Insert new key and right child
         page.data_mut()[insert_offset..insert_offset + 8].copy_from_slice(&key.to_le_bytes());
-        page.data_mut()[insert_offset + 8..insert_offset + 16].copy_from_slice(&right_page.to_le_bytes());
+        page.data_mut()[insert_offset + 8..insert_offset + 16]
+            .copy_from_slice(&right_page.to_le_bytes());
 
         header.num_keys += 1;
         header.serialize(page.data_mut());
@@ -1243,7 +1448,14 @@ impl BTree {
         Ok(None)
     }
 
-    fn split_internal_node(&self, pager: &mut Pager, page_id: PageId, _left_page: PageId, right_page: PageId, key: i64) -> Result<Option<PageId>> {
+    fn split_internal_node(
+        &self,
+        pager: &mut Pager,
+        page_id: PageId,
+        _left_page: PageId,
+        right_page: PageId,
+        key: i64,
+    ) -> Result<Option<PageId>> {
         // Read the current page
         let page_arc = pager.read_page(page_id)?;
         let page = page_arc.read().clone();
@@ -1254,25 +1466,31 @@ impl BTree {
         let mut children = Vec::with_capacity(BTREE_ORDER + 2);
 
         let mut offset = NodeHeader::SIZE;
-        
+
         // First child
         let first_child = u64::from_le_bytes(
-            page.data()[offset..offset + 8].try_into().map_err(|_| VelociError::Corruption("Invalid child".to_string()))?
+            page.data()[offset..offset + 8]
+                .try_into()
+                .map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
         ) as PageId;
         children.push(first_child);
         offset += 8;
 
         for _ in 0..header.num_keys {
             let k = i64::from_le_bytes(
-                page.data()[offset..offset + 8].try_into().map_err(|_| VelociError::Corruption("Invalid key".to_string()))?
+                page.data()[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| VelociError::Corruption("Invalid key".to_string()))?,
             );
             keys.push(k);
-            
+
             let c = u64::from_le_bytes(
-                page.data()[offset + 8..offset + 16].try_into().map_err(|_| VelociError::Corruption("Invalid child".to_string()))?
+                page.data()[offset + 8..offset + 16]
+                    .try_into()
+                    .map_err(|_| VelociError::Corruption("Invalid child".to_string()))?,
             ) as PageId;
             children.push(c);
-            
+
             offset += 16;
         }
 
@@ -1303,12 +1521,15 @@ impl BTree {
         sibling_header.serialize(sibling_page.data_mut());
 
         let mut offset = NodeHeader::SIZE;
-        sibling_page.data_mut()[offset..offset + 8].copy_from_slice(&right_children[0].to_le_bytes());
+        sibling_page.data_mut()[offset..offset + 8]
+            .copy_from_slice(&right_children[0].to_le_bytes());
         offset += 8;
 
         for i in 0..right_keys.len() {
-            sibling_page.data_mut()[offset..offset + 8].copy_from_slice(&right_keys[i].to_le_bytes());
-            sibling_page.data_mut()[offset + 8..offset + 16].copy_from_slice(&right_children[i + 1].to_le_bytes());
+            sibling_page.data_mut()[offset..offset + 8]
+                .copy_from_slice(&right_keys[i].to_le_bytes());
+            sibling_page.data_mut()[offset + 8..offset + 16]
+                .copy_from_slice(&right_children[i + 1].to_le_bytes());
             offset += 16;
         }
 
@@ -1330,12 +1551,15 @@ impl BTree {
         new_left_header.serialize(new_left_page.data_mut());
 
         let mut offset = NodeHeader::SIZE;
-        new_left_page.data_mut()[offset..offset + 8].copy_from_slice(&left_children[0].to_le_bytes());
+        new_left_page.data_mut()[offset..offset + 8]
+            .copy_from_slice(&left_children[0].to_le_bytes());
         offset += 8;
 
         for i in 0..left_keys.len() {
-            new_left_page.data_mut()[offset..offset + 8].copy_from_slice(&left_keys[i].to_le_bytes());
-            new_left_page.data_mut()[offset + 8..offset + 16].copy_from_slice(&left_children[i + 1].to_le_bytes());
+            new_left_page.data_mut()[offset..offset + 8]
+                .copy_from_slice(&left_keys[i].to_le_bytes());
+            new_left_page.data_mut()[offset + 8..offset + 16]
+                .copy_from_slice(&left_children[i + 1].to_le_bytes());
             offset += 16;
         }
 
@@ -1347,10 +1571,10 @@ impl BTree {
 
     fn serialize_row(&self, row: &Row) -> Result<Vec<u8>> {
         let mut buffer = Vec::new();
-        
+
         // Number of values
         buffer.extend_from_slice(&(row.values.len() as u32).to_le_bytes());
-        
+
         for value in &row.values {
             match value {
                 Value::Null => {
@@ -1383,26 +1607,26 @@ impl BTree {
                 }
             }
         }
-        
+
         Ok(buffer)
     }
 
     fn deserialize_row(&self, data: &[u8]) -> Result<Row> {
         let mut offset = 0;
-        
+
         let num_values = u32::from_le_bytes(
             data[offset..offset + 4]
                 .try_into()
                 .map_err(|_| VelociError::Corruption("Invalid value count".to_string()))?,
         ) as usize;
         offset += 4;
-        
+
         let mut values = Vec::with_capacity(num_values);
-        
+
         for _ in 0..num_values {
             let type_tag = data[offset];
             offset += 1;
-            
+
             match type_tag {
                 0 => values.push(Value::Null),
                 1 => {
@@ -1424,11 +1648,10 @@ impl BTree {
                     values.push(Value::Float(f));
                 }
                 3 => {
-                    let len = u32::from_le_bytes(
-                        data[offset..offset + 4]
-                            .try_into()
-                            .map_err(|_| VelociError::Corruption("Invalid text length".to_string()))?,
-                    ) as usize;
+                    let len =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
+                            VelociError::Corruption("Invalid text length".to_string())
+                        })?) as usize;
                     offset += 4;
                     let s = String::from_utf8(data[offset..offset + len].to_vec())
                         .map_err(|_| VelociError::Corruption("Invalid UTF-8".to_string()))?;
@@ -1436,22 +1659,20 @@ impl BTree {
                     values.push(Value::Text(s));
                 }
                 4 => {
-                    let len = u32::from_le_bytes(
-                        data[offset..offset + 4]
-                            .try_into()
-                            .map_err(|_| VelociError::Corruption("Invalid blob length".to_string()))?,
-                    ) as usize;
+                    let len =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
+                            VelociError::Corruption("Invalid blob length".to_string())
+                        })?) as usize;
                     offset += 4;
                     let b = data[offset..offset + len].to_vec();
                     offset += len;
                     values.push(Value::Blob(b));
                 }
                 5 => {
-                    let dim = u32::from_le_bytes(
-                        data[offset..offset + 4]
-                            .try_into()
-                            .map_err(|_| VelociError::Corruption("Invalid vector dimension".to_string()))?,
-                    ) as usize;
+                    let dim =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
+                            VelociError::Corruption("Invalid vector dimension".to_string())
+                        })?) as usize;
                     offset += 4;
                     if offset + dim * 4 > data.len() {
                         return Err(VelociError::Corruption("Vector data truncated".to_string()));
@@ -1460,18 +1681,23 @@ impl BTree {
                     for i in 0..dim {
                         let start = offset + i * 4;
                         v.push(f32::from_le_bytes(
-                            data[start..start + 4]
-                                .try_into()
-                                .map_err(|_| VelociError::Corruption("Invalid vector component".to_string()))?,
+                            data[start..start + 4].try_into().map_err(|_| {
+                                VelociError::Corruption("Invalid vector component".to_string())
+                            })?,
                         ));
                     }
                     offset += dim * 4;
                     values.push(Value::Vector(v));
                 }
-                _ => return Err(VelociError::Corruption(format!("Invalid type tag: {}", type_tag))),
+                _ => {
+                    return Err(VelociError::Corruption(format!(
+                        "Invalid type tag: {}",
+                        type_tag
+                    )))
+                }
             }
         }
-        
+
         Ok(Row { values })
     }
 
@@ -1499,10 +1725,10 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let pager = Arc::new(RwLock::new(Pager::new(temp_file.path()).unwrap()));
         let mut btree = BTree::new(pager).unwrap();
-        
+
         let row = Row::new(vec![Value::Integer(1), Value::Text("Alice".to_string())]);
         btree.insert(1, &row).unwrap();
-        
+
         let result = btree.search(1).unwrap();
         assert!(result.is_some());
         let found_row = result.unwrap();
@@ -1514,13 +1740,13 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let pager = Arc::new(RwLock::new(Pager::new(temp_file.path()).unwrap()));
         let mut btree = BTree::new(pager).unwrap();
-        
+
         let row = Row::new(vec![Value::Integer(1), Value::Text("Alice".to_string())]);
         btree.insert(1, &row).unwrap();
-        
+
         let deleted = btree.delete(1).unwrap();
         assert!(deleted);
-        
+
         let result = btree.search(1).unwrap();
         assert!(result.is_none());
     }
@@ -1531,16 +1757,16 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let pager = Arc::new(RwLock::new(Pager::new(temp_file.path()).unwrap()));
         let mut btree = BTree::new(pager).unwrap();
-        
+
         // Insert 1000 records
         for i in 0..1000 {
             let row = Row::new(vec![
                 Value::Integer(i),
-                Value::Text(format!("Record {}", i))
+                Value::Text(format!("Record {}", i)),
             ]);
             btree.insert(i, &row).unwrap();
         }
-        
+
         // Verify all records can be retrieved
         for i in 0..1000 {
             let result = btree.search(i).unwrap();
@@ -1556,16 +1782,16 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let pager = Arc::new(RwLock::new(Pager::new(temp_file.path()).unwrap()));
         let mut btree = BTree::new(pager).unwrap();
-        
+
         // Insert 50 records - should be well within limits
         for i in 0..50 {
             let row = Row::new(vec![
                 Value::Integer(i),
-                Value::Text(format!("Record {}", i))
+                Value::Text(format!("Record {}", i)),
             ]);
             btree.insert(i, &row).unwrap();
         }
-        
+
         // Verify all records can be retrieved
         for i in 0..50 {
             let result = btree.search(i).unwrap();
@@ -1573,7 +1799,7 @@ mod tests {
             let row = result.unwrap();
             assert_eq!(row.values.len(), 2);
         }
-        
+
         // Test non-existent keys
         assert!(btree.search(100).unwrap().is_none());
     }
@@ -1617,9 +1843,22 @@ mod tests {
             let got = btree.search(*k).unwrap();
             assert!(got.is_some(), "missing key {}", k);
             let got = got.unwrap();
-            assert_eq!(got.values.len(), expected.values.len(), "value count mismatch at {}", k);
-            assert_eq!(got.values[0], expected.values[0], "pk value mismatch at {}", k);
-            assert_eq!(got.values[1], expected.values[1], "payload mismatch at {}", k);
+            assert_eq!(
+                got.values.len(),
+                expected.values.len(),
+                "value count mismatch at {}",
+                k
+            );
+            assert_eq!(
+                got.values[0], expected.values[0],
+                "pk value mismatch at {}",
+                k
+            );
+            assert_eq!(
+                got.values[1], expected.values[1],
+                "payload mismatch at {}",
+                k
+            );
         }
 
         // Full scan must contain exactly the model keys.
@@ -1667,4 +1906,3 @@ mod tests {
         }
     }
 }
-

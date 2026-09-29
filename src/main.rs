@@ -299,11 +299,12 @@ fn main() -> Result<()> {
         }
     }
 
-    tracing_subscriber::fmt()
-        .with_max_level(Level::WARN)
-        .init();
+    tracing_subscriber::fmt().with_max_level(Level::WARN).init();
 
-    info!("VelociDB v{} - Interactive SQL Shell", env!("CARGO_PKG_VERSION"));
+    info!(
+        "VelociDB v{} - Interactive SQL Shell",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("VelociDB v{}", env!("CARGO_PKG_VERSION"));
     println!("Database: {}", db_filename);
     println!("Type '.help' for help, '.exit' to quit. Statements end with ';'.");
@@ -368,7 +369,11 @@ fn main() -> Result<()> {
 
     let mut buffer = String::new();
     loop {
-        let prompt = if buffer.is_empty() { "velocidb> " } else { "      ...> " };
+        let prompt = if buffer.is_empty() {
+            "velocidb> "
+        } else {
+            "      ...> "
+        };
         match rl.readline(prompt) {
             Ok(line) => {
                 let line_trimmed = line.trim();
@@ -391,8 +396,15 @@ fn main() -> Result<()> {
                     let lower = line_trimmed.to_lowercase();
                     if matches!(
                         lower.as_str(),
-                        "exit" | "quit" | "help" | "begin" | "commit" | "rollback"
-                            | "begin transaction" | "commit transaction" | "rollback transaction"
+                        "exit"
+                            | "quit"
+                            | "help"
+                            | "begin"
+                            | "commit"
+                            | "rollback"
+                            | "begin transaction"
+                            | "commit transaction"
+                            | "rollback transaction"
                     ) {
                         match process_command(&db, line_trimmed) {
                             Ok(true) => continue,

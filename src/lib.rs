@@ -43,15 +43,15 @@
 //! # }
 //! ```
 
-pub mod storage;
 pub mod btree;
-pub mod parser;
+pub mod cdc;
 pub mod executor;
+pub mod parser;
+pub mod storage;
 pub mod transaction;
 pub mod types;
-pub mod wal;
-pub mod vector;   // Vector search: distance metrics, literals, parallel KNN
-pub mod cdc;      // Change Data Capture: real-time change tracking
+pub mod vector; // Vector search: distance metrics, literals, parallel KNN
+pub mod wal; // Change Data Capture: real-time change tracking
 
 #[cfg(feature = "async-io")]
 pub mod async_api; // Turso-style async API (Builder / AsyncDatabase / AsyncConnection)
@@ -63,29 +63,29 @@ pub mod async_api; // Turso-style async API (Builder / AsyncDatabase / AsyncConn
 // above — and are compiled only with `--features experimental`. See
 // ROADMAP.md (P4) for whether each one graduates, is archived, or is removed.
 #[cfg(feature = "experimental")]
-pub mod mvcc;            // Multi-Version Concurrency Control
-#[cfg(feature = "experimental")]
-pub mod async_io;        // Asynchronous I/O with Tokio/io_uring
-#[cfg(feature = "experimental")]
-pub mod lockfree;        // Lock-free data structures
-#[cfg(feature = "experimental")]
-pub mod simd;            // Vectorized execution with SIMD
+pub mod async_io; // Asynchronous I/O with Tokio/io_uring
 #[cfg(feature = "experimental")]
 pub mod btree_optimized; // Cache-conscious B-tree
 #[cfg(feature = "experimental")]
-pub mod crdt;            // CRDT-based synchronization
+pub mod cloud_vfs; // Cloud storage VFS
 #[cfg(feature = "experimental")]
-pub mod cloud_vfs;       // Cloud storage VFS
+pub mod crdt; // CRDT-based synchronization
 #[cfg(feature = "experimental")]
-pub mod hybrid_storage;  // Hybrid row/columnar storage
+pub mod hybrid_storage; // Hybrid row/columnar storage
 #[cfg(feature = "experimental")]
-pub mod pmem;            // Persistent memory (PMEM/DAX) support
+pub mod lockfree; // Lock-free data structures
+#[cfg(feature = "experimental")]
+pub mod mvcc; // Multi-Version Concurrency Control
+#[cfg(feature = "experimental")]
+pub mod pmem;
+#[cfg(feature = "experimental")]
+pub mod simd; // Vectorized execution with SIMD // Persistent memory (PMEM/DAX) support
 
 // Re-export commonly used types
-pub use storage::Database;
-pub use types::{QueryResult, Value, Row, Column};
-pub use vector::DistanceMetric;
 pub use cdc::{CdcManager, ChangeEvent, ChangeOp};
+pub use storage::Database;
+pub use types::{Column, QueryResult, Row, Value};
+pub use vector::DistanceMetric;
 
 #[cfg(feature = "async-io")]
 pub use async_api::{AsyncConnection, AsyncDatabase, Builder};

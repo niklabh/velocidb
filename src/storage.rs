@@ -308,9 +308,10 @@ impl Pager {
     /// Restores `pending` (and `num_pages`) to their state when the savepoint
     /// began, undoing the writes of the failed statement only.
     pub fn rollback_to_savepoint(&mut self) -> Result<()> {
-        let sp = self.savepoint.take().ok_or_else(|| {
-            VelociError::TransactionError("No active savepoint".to_string())
-        })?;
+        let sp = self
+            .savepoint
+            .take()
+            .ok_or_else(|| VelociError::TransactionError("No active savepoint".to_string()))?;
         for (page_id, prior) in sp.undo {
             match prior {
                 Some(page) => {
@@ -581,10 +582,10 @@ impl Database {
                 break;
             }
 
-            let chunk_len = u32::from_le_bytes(
-                page_data[0..4].try_into()
-                    .map_err(|_| VelociError::Corruption("Failed to read chunk length".to_string()))?
-            ) as usize;
+            let chunk_len =
+                u32::from_le_bytes(page_data[0..4].try_into().map_err(|_| {
+                    VelociError::Corruption("Failed to read chunk length".to_string())
+                })?) as usize;
 
             let chunk_end = std::cmp::min(4 + chunk_len, page_data.len());
             data_copy.extend_from_slice(&page_data[4..chunk_end]);
@@ -602,42 +603,52 @@ impl Database {
         let data = &data_copy[..];
 
         let num_tables = u32::from_le_bytes(
-            data[0..4].try_into()
-                .map_err(|_| VelociError::Corruption("Failed to read table count".to_string()))?
+            data[0..4]
+                .try_into()
+                .map_err(|_| VelociError::Corruption("Failed to read table count".to_string()))?,
         );
         let mut offset: usize = 4;
 
         for _ in 0..num_tables {
             if offset + 4 > data.len() {
-                return Err(VelociError::Corruption("Schema truncated at table name length".to_string()));
+                return Err(VelociError::Corruption(
+                    "Schema truncated at table name length".to_string(),
+                ));
             }
 
-            let name_len = u32::from_le_bytes(
-                data[offset..offset + 4].try_into()
-                    .map_err(|_| VelociError::Corruption("Failed to read table name length".to_string()))?
-            ) as usize;
+            let name_len =
+                u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
+                    VelociError::Corruption("Failed to read table name length".to_string())
+                })?) as usize;
             offset += 4;
 
             if offset + name_len > data.len() {
                 return Err(VelociError::Corruption(format!(
-                    "Schema truncated at table name (expected {} bytes)", name_len
+                    "Schema truncated at table name (expected {} bytes)",
+                    name_len
                 )));
             }
 
-            let table_name = String::from_utf8(data[offset..offset + name_len].to_vec())
-                .map_err(|_| VelociError::Corruption(format!("Invalid UTF-8 in table name at offset {}", offset)))?;
+            let table_name =
+                String::from_utf8(data[offset..offset + name_len].to_vec()).map_err(|_| {
+                    VelociError::Corruption(format!(
+                        "Invalid UTF-8 in table name at offset {}",
+                        offset
+                    ))
+                })?;
             offset += name_len;
 
             if offset + 4 > data.len() {
                 return Err(VelociError::Corruption(format!(
-                    "Schema truncated at column count for table '{}'", table_name
+                    "Schema truncated at column count for table '{}'",
+                    table_name
                 )));
             }
 
-            let num_cols = u32::from_le_bytes(
-                data[offset..offset + 4].try_into()
-                    .map_err(|_| VelociError::Corruption("Failed to read column count".to_string()))?
-            ) as usize;
+            let num_cols =
+                u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
+                    VelociError::Corruption("Failed to read column count".to_string())
+                })?) as usize;
             offset += 4;
 
             let mut columns = Vec::new();
@@ -645,24 +656,31 @@ impl Database {
             for _ in 0..num_cols {
                 if offset + 4 > data.len() {
                     return Err(VelociError::Corruption(format!(
-                        "Schema truncated at column name length in table '{}'", table_name
+                        "Schema truncated at column name length in table '{}'",
+                        table_name
                     )));
                 }
 
-                let col_name_len = u32::from_le_bytes(
-                    data[offset..offset + 4].try_into()
-                        .map_err(|_| VelociError::Corruption("Failed to read column name length".to_string()))?
-                ) as usize;
+                let col_name_len =
+                    u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
+                        VelociError::Corruption("Failed to read column name length".to_string())
+                    })?) as usize;
                 offset += 4;
 
                 if offset + col_name_len + 10 > data.len() {
                     return Err(VelociError::Corruption(format!(
-                        "Schema truncated at column data for table '{}'", table_name
+                        "Schema truncated at column data for table '{}'",
+                        table_name
                     )));
                 }
 
                 let col_name = String::from_utf8(data[offset..offset + col_name_len].to_vec())
-                    .map_err(|_| VelociError::Corruption(format!("Invalid UTF-8 in column name at offset {}", offset)))?;
+                    .map_err(|_| {
+                        VelociError::Corruption(format!(
+                            "Invalid UTF-8 in column name at offset {}",
+                            offset
+                        ))
+                    })?;
                 offset += col_name_len;
 
                 let data_type_byte = data[offset];
@@ -680,23 +698,28 @@ impl Database {
                                 col_name
                             )));
                         }
-                        let dim = u32::from_le_bytes(
-                            data[offset..offset + 4].try_into().map_err(|_| {
-                                VelociError::Corruption("Failed to read vector dimension".to_string())
-                            })?,
-                        );
+                        let dim = u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(
+                            |_| {
+                                VelociError::Corruption(
+                                    "Failed to read vector dimension".to_string(),
+                                )
+                            },
+                        )?);
                         offset += 4;
                         DataType::Vector(dim)
                     }
-                    _ => return Err(VelociError::Corruption(format!(
-                        "Unknown data type byte {} for column '{}' in table '{}'",
-                        data_type_byte, col_name, table_name
-                    ))),
+                    _ => {
+                        return Err(VelociError::Corruption(format!(
+                            "Unknown data type byte {} for column '{}' in table '{}'",
+                            data_type_byte, col_name, table_name
+                        )))
+                    }
                 };
 
                 if offset + 9 > data.len() {
                     return Err(VelociError::Corruption(format!(
-                        "Schema truncated at column flags for table '{}'", table_name
+                        "Schema truncated at column flags for table '{}'",
+                        table_name
                     )));
                 }
                 let flags = data[offset];
@@ -705,10 +728,10 @@ impl Database {
                 let unique = (flags & 4) != 0;
                 offset += 1;
 
-                let root_page = u64::from_le_bytes(
-                    data[offset..offset + 8].try_into()
-                        .map_err(|_| VelociError::Corruption("Failed to read root page".to_string()))?
-                );
+                let root_page =
+                    u64::from_le_bytes(data[offset..offset + 8].try_into().map_err(|_| {
+                        VelociError::Corruption("Failed to read root page".to_string())
+                    })?);
                 offset += 8;
 
                 if table_root_page == 0 && root_page != 0 {
@@ -761,7 +784,9 @@ impl Database {
             };
 
             let btree = crate::btree::BTree::from_root(btree_root, Arc::clone(&self.pager));
-            self.btrees.write().insert(table_name.clone(), Arc::new(RwLock::new(btree)));
+            self.btrees
+                .write()
+                .insert(table_name.clone(), Arc::new(RwLock::new(btree)));
 
             let table_schema = TableSchema {
                 name: table_name,
@@ -857,9 +882,16 @@ impl Database {
         drop(schema);
 
         let mut pager = self.pager.write();
-        debug_assert!(pager.in_group(), "save_schema must run inside a write group");
+        debug_assert!(
+            pager.in_group(),
+            "save_schema must run inside a write group"
+        );
         let usable_size = PAGE_SIZE - 4; // Reserve 4 bytes for chunk length header
-        let num_pages_needed = if buffer.is_empty() { 1 } else { (buffer.len() + usable_size - 1) / usable_size };
+        let num_pages_needed = if buffer.is_empty() {
+            1
+        } else {
+            (buffer.len() + usable_size - 1) / usable_size
+        };
 
         while pager.num_pages() < 1 + num_pages_needed as u64 {
             pager.allocate_page()?;
@@ -1032,9 +1064,9 @@ impl Database {
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
         let parser = Parser::new();
         let statement = parser.parse(sql)?;
-        
+
         let executor = self.get_or_create_executor();
-        
+
         executor.query_statement(statement)
     }
 
@@ -1321,7 +1353,7 @@ mod tests {
     fn test_page_allocation() {
         let temp_file = NamedTempFile::new().unwrap();
         let mut pager = Pager::new(temp_file.path()).unwrap();
-        
+
         let page_id = pager.allocate_page().unwrap();
         assert_eq!(page_id, 0);
         assert_eq!(pager.num_pages(), 1);
@@ -1331,14 +1363,14 @@ mod tests {
     fn test_read_write_page() {
         let temp_file = NamedTempFile::new().unwrap();
         let mut pager = Pager::new(temp_file.path()).unwrap();
-        
+
         let page_id = pager.allocate_page().unwrap();
-        
+
         let mut page = Page::new();
         page.data_mut()[0..4].copy_from_slice(&[1, 2, 3, 4]);
-        
+
         pager.write_page(page_id, &page).unwrap();
-        
+
         let read_page = pager.read_page(page_id).unwrap();
         let read_page_locked = read_page.read();
         assert_eq!(read_page_locked.data()[0..4], [1, 2, 3, 4]);
@@ -1351,4 +1383,3 @@ mod tests {
         assert!(db.pager.read().num_pages() >= 1);
     }
 }
-

@@ -11,8 +11,8 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::RwLock as TokioRwLock;
@@ -50,7 +50,7 @@ pub struct TokioVfs {
 impl TokioVfs {
     pub async fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        
+
         // Open or create the file
         let file = tokio::fs::OpenOptions::new()
             .read(true)
@@ -77,7 +77,7 @@ impl TokioVfs {
     /// Helper to get file handle
     async fn get_file(&self) -> Result<File> {
         let has_file = self.file.read().await.is_some();
-        
+
         if !has_file {
             // Reopen file if needed
             let file = tokio::fs::OpenOptions::new()
@@ -85,14 +85,19 @@ impl TokioVfs {
                 .write(true)
                 .open(&self.file_path)
                 .await?;
-            
+
             let file_clone = file.try_clone().await?;
             *self.file.write().await = Some(file);
             Ok(file_clone)
         } else {
             // Clone the file descriptor
             let guard = self.file.read().await;
-            guard.as_ref().unwrap().try_clone().await.map_err(|e| e.into())
+            guard
+                .as_ref()
+                .unwrap()
+                .try_clone()
+                .await
+                .map_err(|e| e.into())
         }
     }
 }
@@ -101,7 +106,7 @@ impl TokioVfs {
 impl AsyncVfs for TokioVfs {
     async fn read_page(&self, page_id: PageId) -> Result<Page> {
         let num_pages = *self.num_pages.read();
-        
+
         if page_id >= num_pages {
             return Err(VelociError::NotFound(format!(
                 "Page {} out of bounds",
@@ -340,7 +345,7 @@ impl BatchIoExecutor {
 
         for request in requests {
             let pager = Arc::clone(&self.pager);
-            
+
             let handle = tokio::spawn(async move {
                 match request {
                     IoRequest::Read { page_id } => {
@@ -435,23 +440,19 @@ mod tests {
         let executor = BatchIoExecutor::new(Arc::clone(&pager));
 
         // Allocate pages
-        let page_ids: Vec<PageId> = futures::future::join_all(
-            (0..5).map(|_| pager.allocate_page())
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
+        let page_ids: Vec<PageId> =
+            futures::future::join_all((0..5).map(|_| pager.allocate_page()))
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
 
         // Write pages
         let mut write_requests = Vec::new();
         for (i, &page_id) in page_ids.iter().enumerate() {
             let mut page = Page::new();
             page.data_mut()[0] = i as u8;
-            write_requests.push(IoRequest::Write {
-                page_id,
-                page,
-            });
+            write_requests.push(IoRequest::Write { page_id, page });
         }
 
         executor.execute_batch(write_requests).await.unwrap();
@@ -466,4 +467,3 @@ mod tests {
         }
     }
 }
-

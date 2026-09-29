@@ -9,7 +9,7 @@ use crate::btree::BTree;
 use crate::cdc::{CdcManager, ChangeOp};
 use crate::parser::{AlterAction, Operator, OrderBy, Statement, WhereClause};
 use crate::storage::{Pager, Schema, TableSchema};
-use crate::transaction::{LockManager, LockType, TransactionManager, Transaction};
+use crate::transaction::{LockManager, LockType, Transaction, TransactionManager};
 use crate::types::{Column, DataType, QueryResult, Result, Row, Value, VelociError};
 use crate::vector::{self, DistanceMetric};
 use parking_lot::RwLock;
@@ -54,32 +54,49 @@ impl Executor {
             Statement::CreateTable { name, columns } => self.execute_create_table(&name, columns),
             Statement::DropTable { name } => self.execute_drop_table(&name),
             Statement::AlterTable { table, action } => self.execute_alter_table(&table, action),
-            Statement::Insert { table, columns, values } => self
-                .with_table_lock(&table, LockType::Exclusive, || {
-                    self.execute_insert(&table, columns, values)
-                }),
-            Statement::Update { table, assignments, where_clause } => self
-                .with_table_lock(&table, LockType::Exclusive, || {
-                    self.execute_update(&table, assignments, where_clause)
-                }),
-            Statement::Delete { table, where_clause } => self
-                .with_table_lock(&table, LockType::Exclusive, || {
-                    self.execute_delete(&table, where_clause)
-                }),
+            Statement::Insert {
+                table,
+                columns,
+                values,
+            } => self.with_table_lock(&table, LockType::Exclusive, || {
+                self.execute_insert(&table, columns, values)
+            }),
+            Statement::Update {
+                table,
+                assignments,
+                where_clause,
+            } => self.with_table_lock(&table, LockType::Exclusive, || {
+                self.execute_update(&table, assignments, where_clause)
+            }),
+            Statement::Delete {
+                table,
+                where_clause,
+            } => self.with_table_lock(&table, LockType::Exclusive, || {
+                self.execute_delete(&table, where_clause)
+            }),
             Statement::BeginTransaction => self.begin_transaction(),
             Statement::CommitTransaction => self.commit_transaction(),
             Statement::RollbackTransaction => self.rollback_transaction(),
-            _ => Err(VelociError::ParseError("Statement should be executed with query()".to_string())),
+            _ => Err(VelociError::ParseError(
+                "Statement should be executed with query()".to_string(),
+            )),
         }
     }
 
     pub fn query_statement(&self, statement: Statement) -> Result<QueryResult> {
         match statement {
-            Statement::Select { table, columns, where_clause, order_by, limit } => self
-                .with_table_lock(&table, LockType::Shared, || {
-                    self.execute_select(&table, columns, where_clause, order_by, limit)
-                }),
-            _ => Err(VelociError::ParseError("Statement is not a query".to_string())),
+            Statement::Select {
+                table,
+                columns,
+                where_clause,
+                order_by,
+                limit,
+            } => self.with_table_lock(&table, LockType::Shared, || {
+                self.execute_select(&table, columns, where_clause, order_by, limit)
+            }),
+            _ => Err(VelociError::ParseError(
+                "Statement is not a query".to_string(),
+            )),
         }
     }
 
@@ -170,13 +187,13 @@ impl Executor {
         let root_page = {
             let mut pager = self.pager.write();
             let root_page = pager.allocate_page()?;
-            
+
             // Initialize as B-Tree leaf node
             let mut page = crate::storage::Page::new();
             let header = crate::btree::NodeHeader::new_leaf();
             header.serialize(page.data_mut());
             pager.write_page(root_page, &page)?;
-            
+
             root_page
         };
 
@@ -369,7 +386,9 @@ impl Executor {
             .columns
             .iter()
             .position(|c| c.primary_key)
-            .ok_or_else(|| VelociError::ConstraintViolation("No primary key defined".to_string()))?;
+            .ok_or_else(|| {
+                VelociError::ConstraintViolation("No primary key defined".to_string())
+            })?;
 
         let pk_col_name = &table_schema.columns[pk_index].name;
         let pk_value_index = column_names
@@ -388,7 +407,8 @@ impl Executor {
             if let Some(col) = table_schema.columns.iter().find(|c| &c.name == col_name) {
                 if col.not_null && matches!(value, Value::Null) {
                     return Err(VelociError::ConstraintViolation(format!(
-                        "Column '{}' cannot be NULL", col_name
+                        "Column '{}' cannot be NULL",
+                        col_name
                     )));
                 }
                 if let DataType::Vector(dim) = col.data_type {
@@ -398,7 +418,9 @@ impl Executor {
                         Value::Vector(v) => {
                             return Err(VelociError::ConstraintViolation(format!(
                                 "Column '{}' expects a vector of dimension {}, got {}",
-                                col_name, dim, v.len()
+                                col_name,
+                                dim,
+                                v.len()
                             )));
                         }
                         other => {
@@ -415,7 +437,11 @@ impl Executor {
         // Create row data
         let mut row_values = vec![Value::Null; table_schema.columns.len()];
         for (i, col_name) in column_names.iter().enumerate() {
-            if let Some(col_index) = table_schema.columns.iter().position(|c| &c.name == col_name) {
+            if let Some(col_index) = table_schema
+                .columns
+                .iter()
+                .position(|c| &c.name == col_name)
+            {
                 row_values[col_index] = values[i].clone();
             }
         }
@@ -527,17 +553,15 @@ impl Executor {
                 if order.ascending {
                     // Nearest-first with a LIMIT is the classic KNN shape:
                     // use top-k selection instead of a full sort.
-                    let k = limit.map(|n| n as usize).unwrap_or(usize::MAX).min(filtered_rows.len());
-                    filtered_rows = vector::knn(
-                        filtered_rows,
-                        col_index,
-                        &expr.query,
-                        expr.metric,
-                        k,
-                    )
-                    .into_iter()
-                    .map(|(_, key, row)| (key, row))
-                    .collect();
+                    let k = limit
+                        .map(|n| n as usize)
+                        .unwrap_or(usize::MAX)
+                        .min(filtered_rows.len());
+                    filtered_rows =
+                        vector::knn(filtered_rows, col_index, &expr.query, expr.metric, k)
+                            .into_iter()
+                            .map(|(_, key, row)| (key, row))
+                            .collect();
                 } else {
                     let distances = vector::compute_distances(
                         &filtered_rows,
@@ -575,7 +599,11 @@ impl Executor {
                     let primary = compare_values(av, bv);
                     let secondary = ak.cmp(bk);
                     let combined = primary.then(secondary);
-                    if order.ascending { combined } else { combined.reverse() }
+                    if order.ascending {
+                        combined
+                    } else {
+                        combined.reverse()
+                    }
                 };
 
                 if filtered_rows.len() >= PARALLEL_THRESHOLD {
@@ -592,8 +620,7 @@ impl Executor {
         }
 
         // Check for aggregate functions (COUNT)
-        let is_count = columns.len() == 1
-            && columns[0].to_uppercase().starts_with("COUNT(");
+        let is_count = columns.len() == 1 && columns[0].to_uppercase().starts_with("COUNT(");
 
         if is_count {
             let count = filtered_rows.len() as i64;
@@ -605,7 +632,6 @@ impl Executor {
                 unique: false,
             }];
             let result_rows = vec![Row::new(vec![Value::Integer(count)])];
-
 
             return Ok(QueryResult::new(result_columns, result_rows));
         }
@@ -626,7 +652,10 @@ impl Executor {
         for col_name in &columns {
             if col_name == "*" {
                 proj_items.push(("*".to_string(), ProjItem::Star));
-            } else if let Some(idx) = table_schema.columns.iter().position(|c| &c.name == col_name)
+            } else if let Some(idx) = table_schema
+                .columns
+                .iter()
+                .position(|c| &c.name == col_name)
             {
                 proj_items.push((col_name.clone(), ProjItem::Col(idx)));
             } else if let Some(parsed) = vector::parse_distance_expr(col_name) {
@@ -703,7 +732,6 @@ impl Executor {
             })
             .collect();
 
-
         Ok(QueryResult::new(result_columns, result_rows))
     }
 
@@ -737,7 +765,10 @@ impl Executor {
             let rows_to_update: Vec<(i64, Row)> = if let Some(ref where_clause) = where_clause {
                 all_rows
                     .into_iter()
-                    .filter(|(_, row)| self.evaluate_where_clause(row, where_clause, &table_schema).unwrap_or(false))
+                    .filter(|(_, row)| {
+                        self.evaluate_where_clause(row, where_clause, &table_schema)
+                            .unwrap_or(false)
+                    })
                     .collect()
             } else {
                 all_rows
@@ -748,7 +779,9 @@ impl Executor {
                 .columns
                 .iter()
                 .position(|c| c.primary_key)
-                .ok_or_else(|| VelociError::ConstraintViolation("No primary key defined".to_string()))?;
+                .ok_or_else(|| {
+                    VelociError::ConstraintViolation("No primary key defined".to_string())
+                })?;
 
             // Compute every updated row first so UNIQUE can be checked
             // against the table's final state before anything is mutated.
@@ -760,12 +793,17 @@ impl Executor {
 
                 // Apply updates to the row
                 for (col_name, new_value) in &assignments {
-                    if let Some(col_index) = table_schema.columns.iter().position(|c| &c.name == col_name) {
+                    if let Some(col_index) = table_schema
+                        .columns
+                        .iter()
+                        .position(|c| &c.name == col_name)
+                    {
                         // Check NOT NULL constraint
                         let col = &table_schema.columns[col_index];
                         if col.not_null && matches!(new_value, Value::Null) {
                             return Err(VelociError::ConstraintViolation(format!(
-                                "Column '{}' cannot be NULL", col_name
+                                "Column '{}' cannot be NULL",
+                                col_name
                             )));
                         }
 
@@ -780,9 +818,7 @@ impl Executor {
                 }
 
                 // If primary key is being updated, check for uniqueness
-                if pk_being_updated
-                    && new_pk_value != *key
-                    && btree.search(new_pk_value)?.is_some()
+                if pk_being_updated && new_pk_value != *key && btree.search(new_pk_value)?.is_some()
                 {
                     return Err(VelociError::ConstraintViolation(format!(
                         "Primary key {} already exists in table '{}'",
@@ -819,7 +855,7 @@ impl Executor {
                     cdc_events.push((key, row, updated_row));
                 }
             }
-            
+
             Ok::<(), VelociError>(())
         }; // btrees and btree locks released
 
@@ -830,7 +866,6 @@ impl Executor {
             self.cdc
                 .stage(table, ChangeOp::Update, key, Some(before), Some(after));
         }
-
 
         Ok(())
     }
@@ -856,7 +891,10 @@ impl Executor {
             let rows_to_delete: Vec<(i64, Row)> = if let Some(ref where_clause) = where_clause {
                 all_rows
                     .into_iter()
-                    .filter(|(_, row)| self.evaluate_where_clause(row, where_clause, &table_schema).unwrap_or(false))
+                    .filter(|(_, row)| {
+                        self.evaluate_where_clause(row, where_clause, &table_schema)
+                            .unwrap_or(false)
+                    })
                     .collect()
             } else {
                 all_rows
@@ -877,7 +915,6 @@ impl Executor {
             self.cdc
                 .stage(table, ChangeOp::Delete, key, Some(before), None);
         }
-
 
         Ok(())
     }
@@ -952,13 +989,19 @@ fn candidate_rows(
         .find(|c| c.primary_key)
         .map(|c| c.name.as_str());
     let pk_key = where_clause.zip(pk_name).and_then(|(wc, pk)| {
-        wc.conditions.iter().find_map(|c| match (&c.operator, &c.value) {
-            (Operator::Equal, Value::Integer(key)) if c.column == pk => Some(*key),
-            _ => None,
-        })
+        wc.conditions
+            .iter()
+            .find_map(|c| match (&c.operator, &c.value) {
+                (Operator::Equal, Value::Integer(key)) if c.column == pk => Some(*key),
+                _ => None,
+            })
     });
     match pk_key {
-        Some(key) => Ok(btree.search(key)?.map(|row| (key, row)).into_iter().collect()),
+        Some(key) => Ok(btree
+            .search(key)?
+            .map(|row| (key, row))
+            .into_iter()
+            .collect()),
         None => btree.scan(),
     }
 }
@@ -1057,4 +1100,3 @@ mod tests {
         assert_eq!(result.rows.len(), 1);
     }
 }
-

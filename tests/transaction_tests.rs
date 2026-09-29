@@ -17,7 +17,10 @@ fn open_db(p: &PathBuf) -> Arc<Database> {
 }
 
 fn count(db: &Database, table: &str) -> usize {
-    db.query(&format!("SELECT * FROM {}", table)).unwrap().rows.len()
+    db.query(&format!("SELECT * FROM {}", table))
+        .unwrap()
+        .rows
+        .len()
 }
 
 fn names(db: &Database) -> Vec<String> {
@@ -33,7 +36,8 @@ fn names(db: &Database) -> Vec<String> {
 }
 
 fn setup(db: &Database) {
-    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO u VALUES (1, 'Alice')").unwrap();
     db.execute("INSERT INTO u VALUES (2, 'Bob')").unwrap();
 }
@@ -47,7 +51,8 @@ fn test_rollback_undoes_insert_update_delete() {
 
     db.begin().unwrap();
     db.execute("INSERT INTO u VALUES (3, 'Carol')").unwrap();
-    db.execute("UPDATE u SET name = 'Alicia' WHERE id = 1").unwrap();
+    db.execute("UPDATE u SET name = 'Alicia' WHERE id = 1")
+        .unwrap();
     db.execute("DELETE FROM u WHERE id = 2").unwrap();
     // Reads inside the transaction see its own writes.
     assert_eq!(names(&db), vec!["Alicia", "Carol"]);
@@ -87,7 +92,8 @@ fn test_commit_persists_across_reopen() {
         setup(&db);
         db.begin().unwrap();
         db.execute("INSERT INTO u VALUES (3, 'Carol')").unwrap();
-        db.execute("UPDATE u SET name = 'Bobby' WHERE id = 2").unwrap();
+        db.execute("UPDATE u SET name = 'Bobby' WHERE id = 2")
+            .unwrap();
         db.commit().unwrap();
     }
     let db = open_db(&path);
@@ -118,7 +124,8 @@ fn test_rollback_undoes_schema_changes() {
     setup(&db);
 
     db.begin().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
     db.execute("ALTER TABLE u ADD COLUMN age INTEGER").unwrap();
     db.execute("ALTER TABLE u RENAME TO people").unwrap();
@@ -134,7 +141,8 @@ fn test_rollback_undoes_schema_changes() {
     assert_eq!(names(&db), vec!["Alice", "Bob"]);
 
     // The rolled-back table name is free again and the database is usable.
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (7)").unwrap();
     drop(db);
 
@@ -155,7 +163,8 @@ fn test_rollback_after_many_splits() {
 
     db.begin().unwrap();
     for i in 10..600 {
-        db.execute(&format!("INSERT INTO u VALUES ({}, 'name_{}')", i, i)).unwrap();
+        db.execute(&format!("INSERT INTO u VALUES ({}, 'name_{}')", i, i))
+            .unwrap();
     }
     assert_eq!(count(&db, "u"), 592);
     db.rollback().unwrap();
@@ -163,7 +172,8 @@ fn test_rollback_after_many_splits() {
 
     // The tree is still healthy: grow it for real and reopen.
     for i in 10..600 {
-        db.execute(&format!("INSERT INTO u VALUES ({}, 'n{}')", i, i)).unwrap();
+        db.execute(&format!("INSERT INTO u VALUES ({}, 'n{}')", i, i))
+            .unwrap();
     }
     drop(db);
     let db = open_db(&path);
@@ -213,7 +223,10 @@ fn test_cdc_publishes_only_committed_changes() {
 
     db.begin().unwrap();
     db.execute("INSERT INTO u VALUES (3, 'Carol')").unwrap();
-    assert!(db.changes_since(0).is_empty(), "uncommitted changes must not publish");
+    assert!(
+        db.changes_since(0).is_empty(),
+        "uncommitted changes must not publish"
+    );
     db.rollback().unwrap();
     assert!(db.changes_since(0).is_empty());
 
@@ -256,7 +269,9 @@ fn test_unique_rejects_duplicate_insert() {
     let db = open_db(&dir.path().join("uq1.db"));
     setup_unique(&db);
 
-    assert!(is_constraint(db.execute("INSERT INTO a VALUES (3, 'x@a', 3)")));
+    assert!(is_constraint(
+        db.execute("INSERT INTO a VALUES (3, 'x@a', 3)")
+    ));
     assert!(is_constraint(
         db.execute("INSERT INTO a (id, email) VALUES (4, 'y@a')")
     ));
@@ -282,8 +297,10 @@ fn test_unique_rejects_duplicate_update() {
     // Setting several rows to one value collides among themselves.
     assert!(is_constraint(db.execute("UPDATE a SET email = 'same@a'")));
     // Updating a row to its own value, or to a fresh one, is fine.
-    db.execute("UPDATE a SET email = 'x@a' WHERE id = 1").unwrap();
-    db.execute("UPDATE a SET email = 'w@a' WHERE id = 2").unwrap();
+    db.execute("UPDATE a SET email = 'x@a' WHERE id = 1")
+        .unwrap();
+    db.execute("UPDATE a SET email = 'w@a' WHERE id = 2")
+        .unwrap();
     // Updating other columns never trips UNIQUE.
     db.execute("UPDATE a SET n = 9").unwrap();
 
@@ -301,6 +318,8 @@ fn test_unique_enforced_after_reopen() {
         setup_unique(&db);
     }
     let db = open_db(&path);
-    assert!(is_constraint(db.execute("INSERT INTO a VALUES (3, 'x@a', 3)")));
+    assert!(is_constraint(
+        db.execute("INSERT INTO a VALUES (3, 'x@a', 3)")
+    ));
     assert_eq!(count(&db, "a"), 2);
 }

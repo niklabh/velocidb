@@ -47,8 +47,6 @@ impl VersionInfo {
             return false;
         }
 
-
-
         // Check transaction visibility
         if !snapshot.is_transaction_visible(self.xmin) {
             return false;
@@ -117,10 +115,7 @@ impl VersionedRecord {
     /// Get the visible version for the given snapshot
     pub fn get_visible_version(&self, snapshot: &Snapshot) -> Option<&RecordVersion> {
         // Iterate in reverse order to find the most recent visible version
-        self.versions
-            .iter()
-            .rev()
-            .find(|v| v.is_visible(snapshot))
+        self.versions.iter().rev().find(|v| v.is_visible(snapshot))
     }
 
     /// Mark the latest version as deleted
@@ -158,7 +153,11 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn new(timestamp: Timestamp, txn_id: TransactionId, active_transactions: Vec<TransactionId>) -> Self {
+    pub fn new(
+        timestamp: Timestamp,
+        txn_id: TransactionId,
+        active_transactions: Vec<TransactionId>,
+    ) -> Self {
         Self {
             timestamp,
             txn_id,
@@ -234,7 +233,9 @@ impl MvccManager {
         }; // Release read lock
 
         // Register this snapshot as active
-        self.active_snapshots.write().insert(txn_id, snapshot.clone());
+        self.active_snapshots
+            .write()
+            .insert(txn_id, snapshot.clone());
 
         snapshot
     }
@@ -245,7 +246,7 @@ impl MvccManager {
 
         // LOCK ORDERING: Level 1 (active_snapshots) → Level 2 (committed_transactions)
         // This is consistent and safe
-        
+
         // First update committed_transactions (Level 2)
         self.committed_transactions
             .write()
@@ -281,12 +282,15 @@ impl MvccManager {
 
         // LOCK ORDERING: Only acquire version_store (Level 3 - Data)
         // Per-table locking via DashMap reduces contention
-        let table_store = self.version_store
+        let table_store = self
+            .version_store
             .entry(table_name.to_string())
             .or_insert_with(|| Arc::new(RwLock::new(BTreeMap::new())));
-        
+
         let mut table_map = table_store.write();
-        let record = table_map.entry(key).or_insert_with(|| VersionedRecord::new(key));
+        let record = table_map
+            .entry(key)
+            .or_insert_with(|| VersionedRecord::new(key));
         record.add_version(version);
 
         Ok(())
@@ -313,12 +317,7 @@ impl MvccManager {
     }
 
     /// Delete a record (creates a new version marked as deleted)
-    pub fn delete_version(
-        &self,
-        table_name: &str,
-        key: i64,
-        snapshot: &Snapshot,
-    ) -> Result<()> {
+    pub fn delete_version(&self, table_name: &str, key: i64, snapshot: &Snapshot) -> Result<()> {
         let deleted_at = self.current_timestamp.fetch_add(1, Ordering::SeqCst);
 
         // LOCK ORDERING: Only acquire version_store (Level 3)
@@ -358,7 +357,7 @@ impl MvccManager {
 
     /// Vacuum old versions (garbage collection)
     /// Should be called periodically by a background thread
-    /// 
+    ///
     /// LOCK ORDERING (STRICT):
     /// 1. active_snapshots (read) - Level 1
     /// 2. committed_transactions (write) - Level 2  
@@ -453,7 +452,8 @@ mod tests {
             1,
             vec![Value::Integer(1), Value::Text("Alice".to_string())],
             &snapshot1,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Commit transaction 1
         mvcc.commit_transaction(&snapshot1).unwrap();
@@ -481,7 +481,8 @@ mod tests {
             1,
             vec![Value::Integer(1), Value::Text("Laptop".to_string())],
             &snapshot_setup,
-        ).unwrap();
+        )
+        .unwrap();
         mvcc.commit_transaction(&snapshot_setup).unwrap();
 
         // Start two concurrent read transactions
@@ -503,12 +504,8 @@ mod tests {
 
         // Transaction 1: Insert record
         let snapshot1 = mvcc.begin_transaction();
-        mvcc.insert_version(
-            "test",
-            1,
-            vec![Value::Integer(100)],
-            &snapshot1,
-        ).unwrap();
+        mvcc.insert_version("test", 1, vec![Value::Integer(100)], &snapshot1)
+            .unwrap();
 
         // Transaction 2 starts before T1 commits
         let snapshot2 = mvcc.begin_transaction();
@@ -534,15 +531,18 @@ mod tests {
 
         // Create multiple versions
         let snapshot1 = mvcc.begin_transaction();
-        mvcc.insert_version("test", 1, vec![Value::Integer(1)], &snapshot1).unwrap();
+        mvcc.insert_version("test", 1, vec![Value::Integer(1)], &snapshot1)
+            .unwrap();
         mvcc.commit_transaction(&snapshot1).unwrap();
 
         let snapshot2 = mvcc.begin_transaction();
-        mvcc.insert_version("test", 1, vec![Value::Integer(2)], &snapshot2).unwrap();
+        mvcc.insert_version("test", 1, vec![Value::Integer(2)], &snapshot2)
+            .unwrap();
         mvcc.commit_transaction(&snapshot2).unwrap();
 
         let snapshot3 = mvcc.begin_transaction();
-        mvcc.insert_version("test", 1, vec![Value::Integer(3)], &snapshot3).unwrap();
+        mvcc.insert_version("test", 1, vec![Value::Integer(3)], &snapshot3)
+            .unwrap();
         mvcc.commit_transaction(&snapshot3).unwrap();
 
         let stats_before = mvcc.get_stats();
@@ -562,7 +562,8 @@ mod tests {
 
         // Transaction 1: Insert record and commit
         let snapshot_setup = mvcc.begin_transaction();
-        mvcc.insert_version("test", 1, vec![Value::Integer(100)], &snapshot_setup).unwrap();
+        mvcc.insert_version("test", 1, vec![Value::Integer(100)], &snapshot_setup)
+            .unwrap();
         mvcc.commit_transaction(&snapshot_setup).unwrap();
 
         // Transaction 2: Begin transaction
@@ -576,7 +577,10 @@ mod tests {
 
         // T3 should STILL see the record because T2 has not committed!
         let result = mvcc.read_version("test", 1, &snapshot_reader).unwrap();
-        assert!(result.is_some(), "Active uncommitted delete was prematurely visible to concurrent transactions!");
+        assert!(
+            result.is_some(),
+            "Active uncommitted delete was prematurely visible to concurrent transactions!"
+        );
         assert_eq!(result.unwrap()[0], Value::Integer(100));
 
         // T2 commits
@@ -587,7 +591,9 @@ mod tests {
 
         // T4 should now see the record as deleted (None)
         let result_after = mvcc.read_version("test", 1, &snapshot_after).unwrap();
-        assert!(result_after.is_none(), "Committed delete should be visible!");
+        assert!(
+            result_after.is_none(),
+            "Committed delete should be visible!"
+        );
     }
 }
-

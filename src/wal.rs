@@ -216,8 +216,7 @@ impl WalManager {
             }
             let rec_type = buf[cursor];
             let group_id = u64::from_le_bytes(buf[cursor + 1..cursor + 9].try_into().unwrap());
-            let len =
-                u32::from_le_bytes(buf[cursor + 9..cursor + 13].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(buf[cursor + 9..cursor + 13].try_into().unwrap()) as usize;
 
             let payload_start = cursor + 13;
             let payload_end = payload_start + len;
@@ -408,7 +407,11 @@ mod tests {
 
         // Simulate a crash mid-record by truncating the file by 5 bytes.
         let path = wal_path_for(&db);
-        let f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         let len = f.metadata().unwrap().len();
         f.set_len(len - 5).unwrap();
         drop(f);
@@ -429,7 +432,8 @@ mod tests {
         assert_eq!(wal.size(), 0);
         let (a, b) = (make_page(1), make_page(2));
         let g1 = wal.allocate_group_id();
-        wal.append_group(g1, [(3, a.as_slice()), (4, b.as_slice())]).unwrap();
+        wal.append_group(g1, [(3, a.as_slice()), (4, b.as_slice())])
+            .unwrap();
         let after_first = wal.size();
         // Two PAGE_WRITE records + COMMIT, each with a 17-byte envelope.
         assert_eq!(after_first, 2 * (17 + 8 + PAGE_SIZE as u64) + 17);

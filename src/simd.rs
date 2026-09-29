@@ -6,10 +6,10 @@
 
 use crate::types::{Result, Value, VelociError};
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 /// Vectorized batch size - process this many elements at once
 pub const VECTOR_BATCH_SIZE: usize = 256;
@@ -24,7 +24,7 @@ impl VectorizedFilter {
     #[cfg(target_arch = "x86_64")]
     pub fn filter_integers_greater_than(values: &[i64], threshold: i64) -> Vec<bool> {
         let mut result = vec![false; values.len()];
-        
+
         // Check if AVX2 is available
         if is_x86_feature_detected!("avx2") {
             unsafe {
@@ -34,14 +34,18 @@ impl VectorizedFilter {
             // Fallback to scalar implementation
             Self::filter_integers_greater_than_scalar(values, threshold, &mut result);
         }
-        
+
         result
     }
 
     /// AVX2-optimized integer comparison
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    unsafe fn filter_integers_greater_than_avx2(values: &[i64], threshold: i64, result: &mut [bool]) {
+    unsafe fn filter_integers_greater_than_avx2(
+        values: &[i64],
+        threshold: i64,
+        result: &mut [bool],
+    ) {
         let threshold_vec = _mm256_set1_epi64x(threshold);
         let len = values.len();
         let chunk_size = 4; // AVX2 processes 4 x i64 at a time
@@ -58,13 +62,13 @@ impl VectorizedFilter {
 
             // Load 4 integers
             let values_vec = _mm256_loadu_si256(values[i..].as_ptr() as *const __m256i);
-            
+
             // Compare: values > threshold
             let cmp_result = _mm256_cmpgt_epi64(values_vec, threshold_vec);
-            
+
             // Extract comparison results
             let mask = _mm256_movemask_pd(_mm256_castsi256_pd(cmp_result));
-            
+
             result[i] = (mask & 1) != 0;
             result[i + 1] = (mask & 2) != 0;
             result[i + 2] = (mask & 4) != 0;
@@ -78,7 +82,7 @@ impl VectorizedFilter {
             result[i] = value > threshold;
         }
     }
-    
+
     /// Generic fallback for non-x86_64 architectures
     #[cfg(not(target_arch = "x86_64"))]
     pub fn filter_integers_greater_than(values: &[i64], threshold: i64) -> Vec<bool> {
@@ -90,7 +94,7 @@ impl VectorizedFilter {
     /// Filter for equality comparison
     pub fn filter_integers_equal(values: &[i64], target: i64) -> Vec<bool> {
         let mut result = vec![false; values.len()];
-        
+
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") {
@@ -100,12 +104,12 @@ impl VectorizedFilter {
                 return result;
             }
         }
-        
+
         // Scalar fallback
         for (i, &value) in values.iter().enumerate() {
             result[i] = value == target;
         }
-        
+
         result
     }
 
@@ -127,7 +131,7 @@ impl VectorizedFilter {
             let values_vec = _mm256_loadu_si256(values[i..].as_ptr() as *const __m256i);
             let cmp_result = _mm256_cmpeq_epi64(values_vec, target_vec);
             let mask = _mm256_movemask_pd(_mm256_castsi256_pd(cmp_result));
-            
+
             result[i] = (mask & 1) != 0;
             result[i + 1] = (mask & 2) != 0;
             result[i + 2] = (mask & 4) != 0;
@@ -148,7 +152,7 @@ impl VectorizedAggregation {
                 return unsafe { Self::sum_integers_avx2(values) };
             }
         }
-        
+
         // Scalar fallback
         values.iter().sum()
     }
@@ -168,7 +172,7 @@ impl VectorizedAggregation {
                 for j in i..len {
                     scalar_sum += values[j];
                 }
-                
+
                 // Extract vector sum
                 let mut temp = [0i64; 4];
                 _mm256_storeu_si256(temp.as_mut_ptr() as *mut __m256i, sum_vec);
@@ -195,7 +199,7 @@ impl VectorizedAggregation {
         if values.is_empty() {
             return 0.0;
         }
-        
+
         let sum = Self::sum_integers(values);
         sum as f64 / values.len() as f64
     }
@@ -232,7 +236,7 @@ impl VectorizedAggregation {
                 let mut temp = [0i64; 4];
                 _mm256_storeu_si256(temp.as_mut_ptr() as *mut __m256i, min_vec);
                 let mut scalar_min = temp.iter().copied().min().unwrap();
-                
+
                 for j in i..len {
                     scalar_min = scalar_min.min(values[j]);
                 }
@@ -281,7 +285,7 @@ impl VectorizedAggregation {
                 let mut temp = [0i64; 4];
                 _mm256_storeu_si256(temp.as_mut_ptr() as *mut __m256i, max_vec);
                 let mut scalar_max = temp.iter().copied().max().unwrap();
-                
+
                 for j in i..len {
                     scalar_max = scalar_max.max(values[j]);
                 }
@@ -340,31 +344,48 @@ impl VectorBatch {
     }
 
     /// Apply a vectorized filter to a column
-    pub fn filter_column(&self, column_idx: usize, predicate: FilterPredicate) -> Result<Vec<bool>> {
+    pub fn filter_column(
+        &self,
+        column_idx: usize,
+        predicate: FilterPredicate,
+    ) -> Result<Vec<bool>> {
         if column_idx >= self.columns.len() {
-            return Err(VelociError::NotFound(format!("Column {} not found", column_idx)));
+            return Err(VelociError::NotFound(format!(
+                "Column {} not found",
+                column_idx
+            )));
         }
 
         match (&self.columns[column_idx], predicate) {
-            (VectorColumn::Integer(values), FilterPredicate::GreaterThan(Value::Integer(threshold))) => {
-                Ok(VectorizedFilter::filter_integers_greater_than(values, threshold))
-            }
+            (
+                VectorColumn::Integer(values),
+                FilterPredicate::GreaterThan(Value::Integer(threshold)),
+            ) => Ok(VectorizedFilter::filter_integers_greater_than(
+                values, threshold,
+            )),
             (VectorColumn::Integer(values), FilterPredicate::Equal(Value::Integer(target))) => {
                 Ok(VectorizedFilter::filter_integers_equal(values, target))
             }
             _ => {
                 // Scalar fallback for unsupported operations
                 Err(VelociError::NotImplemented(
-                    "Predicate type not supported for vectorized execution".to_string()
+                    "Predicate type not supported for vectorized execution".to_string(),
                 ))
             }
         }
     }
 
     /// Aggregate a column
-    pub fn aggregate_column(&self, column_idx: usize, agg_func: AggregateFunction) -> Result<Value> {
+    pub fn aggregate_column(
+        &self,
+        column_idx: usize,
+        agg_func: AggregateFunction,
+    ) -> Result<Value> {
         if column_idx >= self.columns.len() {
-            return Err(VelociError::NotFound(format!("Column {} not found", column_idx)));
+            return Err(VelociError::NotFound(format!(
+                "Column {} not found",
+                column_idx
+            )));
         }
 
         match (&self.columns[column_idx], agg_func) {
@@ -377,14 +398,14 @@ impl VectorBatch {
             (VectorColumn::Integer(values), AggregateFunction::Avg) => {
                 Ok(Value::Real(VectorizedAggregation::average_integers(values)))
             }
-            (VectorColumn::Integer(values), AggregateFunction::Min) => {
-                Ok(Value::Integer(VectorizedAggregation::min_integers(values).unwrap_or(0)))
-            }
-            (VectorColumn::Integer(values), AggregateFunction::Max) => {
-                Ok(Value::Integer(VectorizedAggregation::max_integers(values).unwrap_or(0)))
-            }
+            (VectorColumn::Integer(values), AggregateFunction::Min) => Ok(Value::Integer(
+                VectorizedAggregation::min_integers(values).unwrap_or(0),
+            )),
+            (VectorColumn::Integer(values), AggregateFunction::Max) => Ok(Value::Integer(
+                VectorizedAggregation::max_integers(values).unwrap_or(0),
+            )),
             _ => Err(VelociError::NotImplemented(
-                "Aggregate function not supported".to_string()
+                "Aggregate function not supported".to_string(),
             )),
         }
     }
@@ -425,7 +446,7 @@ mod tests {
     fn test_vectorized_filter_greater_than() {
         let values = vec![1, 5, 10, 15, 20, 25];
         let result = VectorizedFilter::filter_integers_greater_than(&values, 10);
-        
+
         assert_eq!(result, vec![false, false, false, true, true, true]);
     }
 
@@ -433,7 +454,7 @@ mod tests {
     fn test_vectorized_filter_equal() {
         let values = vec![1, 5, 10, 15, 10, 25];
         let result = VectorizedFilter::filter_integers_equal(&values, 10);
-        
+
         assert_eq!(result, vec![false, false, true, false, true, false]);
     }
 
@@ -441,7 +462,7 @@ mod tests {
     fn test_vectorized_sum() {
         let values = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let sum = VectorizedAggregation::sum_integers(&values);
-        
+
         assert_eq!(sum, 55);
     }
 
@@ -449,17 +470,17 @@ mod tests {
     fn test_vectorized_average() {
         let values = vec![10, 20, 30, 40, 50];
         let avg = VectorizedAggregation::average_integers(&values);
-        
+
         assert_eq!(avg, 30.0);
     }
 
     #[test]
     fn test_vectorized_min_max() {
         let values = vec![5, 2, 8, 1, 9, 3];
-        
+
         let min = VectorizedAggregation::min_integers(&values);
         let max = VectorizedAggregation::max_integers(&values);
-        
+
         assert_eq!(min, Some(1));
         assert_eq!(max, Some(9));
     }
@@ -467,15 +488,15 @@ mod tests {
     #[test]
     fn test_vector_batch() {
         let mut batch = VectorBatch::new();
-        
+
         let column = VectorColumn::Integer(vec![1, 5, 10, 15, 20]);
         batch.add_column(column);
         batch.set_row_count(5);
-        
+
         // Test aggregation
         let sum = batch.aggregate_column(0, AggregateFunction::Sum).unwrap();
         assert_eq!(sum, Value::Integer(51));
-        
+
         let avg = batch.aggregate_column(0, AggregateFunction::Avg).unwrap();
         assert!(matches!(avg, Value::Real(x) if (x - 10.2).abs() < 0.01));
     }
@@ -485,9 +506,8 @@ mod tests {
         // Test with a larger dataset to ensure SIMD paths are exercised
         let values: Vec<i64> = (1..=1000).collect();
         let sum = VectorizedAggregation::sum_integers(&values);
-        
+
         // Sum of 1 to 1000 = 1000 * 1001 / 2 = 500500
         assert_eq!(sum, 500500);
     }
 }
-
