@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"enum":["AlterAction","Operator","Statement"],"fn":["find_order_by","split_top_level_commas"],"struct":["Condition","OrderBy","Parser","WhereClause"]};
+window.SIDEBAR_ITEMS = {"enum":["AlterAction","Operator","Statement"],"fn":["find_order_by","split_top_level_commas"],"macro":[["regex",1]],"struct":["Condition","OrderBy","Parser","WhereClause"]};

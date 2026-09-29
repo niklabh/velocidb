@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"mod":["async_api","async_io","btree","btree_optimized","cdc","cloud_vfs","crdt","executor","hybrid_storage","lockfree","mvcc","parser","pmem","simd","storage","transaction","types","vector","wal"]};
+window.SIDEBAR_ITEMS = {"mod":["async_api","btree","cdc","executor","parser","storage","transaction","types","vector","wal"]};

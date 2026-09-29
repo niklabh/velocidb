@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"constant":["DEFAULT_CDC_CAPACITY"],"enum":["ChangeOp"],"struct":["CdcManager","ChangeEvent"]};
+window.SIDEBAR_ITEMS = {"constant":["DEFAULT_CDC_CAPACITY"],"enum":["ChangeOp"],"struct":["CdcManager","ChangeEvent","StagedChange"]};

@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["VECTOR_BATCH_SIZE"],"enum":["AggregateFunction","FilterPredicate","VectorColumn"],"struct":["VectorBatch","VectorizedAggregation","VectorizedFilter"]};

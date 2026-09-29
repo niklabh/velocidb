@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["CrdtOperation"],"struct":["CrdtRecord","CrdtStats","CrdtStore","SyncProtocol"],"type":["LamportTimestamp","NodeId"]};

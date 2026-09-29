@@ -1,2 +1,2 @@
-createSrcSidebar('[["velocidb",["",[],["async_api.rs","async_io.rs","btree.rs","btree_optimized.rs","cdc.rs","cloud_vfs.rs","crdt.rs","executor.rs","hybrid_storage.rs","lib.rs","lockfree.rs","mvcc.rs","parser.rs","pmem.rs","simd.rs","storage.rs","transaction.rs","types.rs","vector.rs","wal.rs"]]]]');
-//{"start":19,"fragment_lengths":[278]}
+createSrcSidebar('[["velocidb",["",[],["async_api.rs","btree.rs","cdc.rs","executor.rs","lib.rs","parser.rs","storage.rs","transaction.rs","types.rs","vector.rs","wal.rs"]]]]');
+//{"start":19,"fragment_lengths":[154]}

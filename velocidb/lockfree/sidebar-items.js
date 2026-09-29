@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["current_timestamp"],"struct":["CacheStats","CachedPage","LockFreeCounter","LockFreeIoQueue","LockFreeMetrics","LockFreePageCache","LockFreeRingBuffer","MetricsSnapshot"]};

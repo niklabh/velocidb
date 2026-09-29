@@ -159,38 +159,40 @@
 <a href=#159 id=159 data-nosnippet>159</a>        conn.execute(<span class="string">"CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"</span>)
 <a href=#160 id=160 data-nosnippet>160</a>            .<span class="kw">await
 <a href=#161 id=161 data-nosnippet>161</a>            </span>.unwrap();
-<a href=#162 id=162 data-nosnippet>162</a>        conn.execute(<span class="string">"INSERT INTO t VALUES (1, 'Alice')"</span>).<span class="kw">await</span>.unwrap();
-<a href=#163 id=163 data-nosnippet>163</a>
-<a href=#164 id=164 data-nosnippet>164</a>        <span class="kw">let </span>result = conn.query(<span class="string">"SELECT * FROM t"</span>).<span class="kw">await</span>.unwrap();
-<a href=#165 id=165 data-nosnippet>165</a>        <span class="macro">assert_eq!</span>(result.rows.len(), <span class="number">1</span>);
-<a href=#166 id=166 data-nosnippet>166</a>    }
-<a href=#167 id=167 data-nosnippet>167</a>
-<a href=#168 id=168 data-nosnippet>168</a>    <span class="attr">#[tokio::test]
-<a href=#169 id=169 data-nosnippet>169</a>    </span><span class="kw">async fn </span>test_concurrent_async_readers() {
-<a href=#170 id=170 data-nosnippet>170</a>        <span class="kw">let </span>tmp = NamedTempFile::new().unwrap();
-<a href=#171 id=171 data-nosnippet>171</a>        <span class="kw">let </span>db = Builder::new_local(tmp.path()).build().<span class="kw">await</span>.unwrap();
-<a href=#172 id=172 data-nosnippet>172</a>        <span class="kw">let </span>conn = db.connect().unwrap();
-<a href=#173 id=173 data-nosnippet>173</a>
-<a href=#174 id=174 data-nosnippet>174</a>        conn.execute(<span class="string">"CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"</span>)
-<a href=#175 id=175 data-nosnippet>175</a>            .<span class="kw">await
-<a href=#176 id=176 data-nosnippet>176</a>            </span>.unwrap();
-<a href=#177 id=177 data-nosnippet>177</a>        <span class="kw">for </span>i <span class="kw">in </span><span class="number">0</span>..<span class="number">50 </span>{
-<a href=#178 id=178 data-nosnippet>178</a>            conn.execute(<span class="kw-2">&amp;</span><span class="macro">format!</span>(<span class="string">"INSERT INTO t VALUES ({}, {})"</span>, i, i * <span class="number">2</span>))
-<a href=#179 id=179 data-nosnippet>179</a>                .<span class="kw">await
-<a href=#180 id=180 data-nosnippet>180</a>                </span>.unwrap();
-<a href=#181 id=181 data-nosnippet>181</a>        }
-<a href=#182 id=182 data-nosnippet>182</a>
-<a href=#183 id=183 data-nosnippet>183</a>        <span class="comment">// Many concurrent read futures.
-<a href=#184 id=184 data-nosnippet>184</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>handles = Vec::new();
-<a href=#185 id=185 data-nosnippet>185</a>        <span class="kw">for _ in </span><span class="number">0</span>..<span class="number">8 </span>{
-<a href=#186 id=186 data-nosnippet>186</a>            <span class="kw">let </span>c = db.connect().unwrap();
-<a href=#187 id=187 data-nosnippet>187</a>            handles.push(tokio::spawn(<span class="kw">async move </span>{
-<a href=#188 id=188 data-nosnippet>188</a>                c.query(<span class="string">"SELECT * FROM t"</span>).<span class="kw">await</span>.unwrap().rows.len()
-<a href=#189 id=189 data-nosnippet>189</a>            }));
-<a href=#190 id=190 data-nosnippet>190</a>        }
-<a href=#191 id=191 data-nosnippet>191</a>        <span class="kw">for </span>h <span class="kw">in </span>handles {
-<a href=#192 id=192 data-nosnippet>192</a>            <span class="macro">assert_eq!</span>(h.<span class="kw">await</span>.unwrap(), <span class="number">50</span>);
-<a href=#193 id=193 data-nosnippet>193</a>        }
-<a href=#194 id=194 data-nosnippet>194</a>    }
-<a href=#195 id=195 data-nosnippet>195</a>}
+<a href=#162 id=162 data-nosnippet>162</a>        conn.execute(<span class="string">"INSERT INTO t VALUES (1, 'Alice')"</span>)
+<a href=#163 id=163 data-nosnippet>163</a>            .<span class="kw">await
+<a href=#164 id=164 data-nosnippet>164</a>            </span>.unwrap();
+<a href=#165 id=165 data-nosnippet>165</a>
+<a href=#166 id=166 data-nosnippet>166</a>        <span class="kw">let </span>result = conn.query(<span class="string">"SELECT * FROM t"</span>).<span class="kw">await</span>.unwrap();
+<a href=#167 id=167 data-nosnippet>167</a>        <span class="macro">assert_eq!</span>(result.rows.len(), <span class="number">1</span>);
+<a href=#168 id=168 data-nosnippet>168</a>    }
+<a href=#169 id=169 data-nosnippet>169</a>
+<a href=#170 id=170 data-nosnippet>170</a>    <span class="attr">#[tokio::test]
+<a href=#171 id=171 data-nosnippet>171</a>    </span><span class="kw">async fn </span>test_concurrent_async_readers() {
+<a href=#172 id=172 data-nosnippet>172</a>        <span class="kw">let </span>tmp = NamedTempFile::new().unwrap();
+<a href=#173 id=173 data-nosnippet>173</a>        <span class="kw">let </span>db = Builder::new_local(tmp.path()).build().<span class="kw">await</span>.unwrap();
+<a href=#174 id=174 data-nosnippet>174</a>        <span class="kw">let </span>conn = db.connect().unwrap();
+<a href=#175 id=175 data-nosnippet>175</a>
+<a href=#176 id=176 data-nosnippet>176</a>        conn.execute(<span class="string">"CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"</span>)
+<a href=#177 id=177 data-nosnippet>177</a>            .<span class="kw">await
+<a href=#178 id=178 data-nosnippet>178</a>            </span>.unwrap();
+<a href=#179 id=179 data-nosnippet>179</a>        <span class="kw">for </span>i <span class="kw">in </span><span class="number">0</span>..<span class="number">50 </span>{
+<a href=#180 id=180 data-nosnippet>180</a>            conn.execute(<span class="kw-2">&amp;</span><span class="macro">format!</span>(<span class="string">"INSERT INTO t VALUES ({}, {})"</span>, i, i * <span class="number">2</span>))
+<a href=#181 id=181 data-nosnippet>181</a>                .<span class="kw">await
+<a href=#182 id=182 data-nosnippet>182</a>                </span>.unwrap();
+<a href=#183 id=183 data-nosnippet>183</a>        }
+<a href=#184 id=184 data-nosnippet>184</a>
+<a href=#185 id=185 data-nosnippet>185</a>        <span class="comment">// Many concurrent read futures.
+<a href=#186 id=186 data-nosnippet>186</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>handles = Vec::new();
+<a href=#187 id=187 data-nosnippet>187</a>        <span class="kw">for _ in </span><span class="number">0</span>..<span class="number">8 </span>{
+<a href=#188 id=188 data-nosnippet>188</a>            <span class="kw">let </span>c = db.connect().unwrap();
+<a href=#189 id=189 data-nosnippet>189</a>            handles.push(tokio::spawn(<span class="kw">async move </span>{
+<a href=#190 id=190 data-nosnippet>190</a>                c.query(<span class="string">"SELECT * FROM t"</span>).<span class="kw">await</span>.unwrap().rows.len()
+<a href=#191 id=191 data-nosnippet>191</a>            }));
+<a href=#192 id=192 data-nosnippet>192</a>        }
+<a href=#193 id=193 data-nosnippet>193</a>        <span class="kw">for </span>h <span class="kw">in </span>handles {
+<a href=#194 id=194 data-nosnippet>194</a>            <span class="macro">assert_eq!</span>(h.<span class="kw">await</span>.unwrap(), <span class="number">50</span>);
+<a href=#195 id=195 data-nosnippet>195</a>        }
+<a href=#196 id=196 data-nosnippet>196</a>    }
+<a href=#197 id=197 data-nosnippet>197</a>}
 </code></pre></div></section></main></body></html>

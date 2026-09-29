@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["IoRequest"],"struct":["AsyncPageCache","AsyncPager","BatchIoExecutor","CacheStats","TokioVfs"],"trait":["AsyncVfs"]};
